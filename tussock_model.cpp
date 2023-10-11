@@ -1,27 +1,64 @@
 #include <iostream>
 #include <cstdlib>
-#include <ctime>  
+#include <ctime>
+#include <vector>
+#include <cmath>
+#include "tussock_model.h"
 
+// Function to check and resolve overlaps
+void resolveOverlaps(std::vector<Tiller>& tillers) {
+    bool overlaps = true;
+    while (overlaps) {
+        overlaps = false;
+        for (size_t i = 0; i < tillers.size(); ++i) {
+            for (size_t j = i + 1; j < tillers.size(); ++j) {
+                if (tillers[i].isOverlapping(tillers[j])) {
+                    overlaps = true;
+                    // Move the old Tiller
+                    tillers[i].move();
+                }
+            }
+        }
+    }
+}
 
 int main() {
-    int num_tillers, sim_time, kr, kd, event;
-    sim_time = 200;
-    num_tillers = 1;
-    kr = 50; //reproduction constant
-    kd = 10; //dying constant
+    int kr = 5;  // Tillering constant
+    int kd = 1;  // Death constant
+    int kg = 2;  // Growth constant
 
-    std::srand(std::time(0)); // Seed the random number generator
+    int sim_time = 200;
 
-    for (int time_step = 0; time_step < sim_time; time_step++) {
-        event = std::rand() % (kr + kd);
+    std::vector<Tiller> tillers;
+    std::vector<Tiller> newTillers;
 
-        if (event < kr) { // reproduce
-            num_tillers++;
-        } else if (event > kr && event < kr + kd) { // die
-            num_tillers -= 1;
+    Tiller initialTiller(1.0, 0.0, 0.0, 0.0, true);
+    tillers.push_back(initialTiller);
+
+    for (int time_step = 0; time_step <= sim_time; time_step++) {
+        std::cout << "Time Step " << time_step << " - Number of Tillers: " << tillers.size() << "\n";
+
+        for (Tiller& tiller : tillers) {
+            if (tiller.getStatus()) {
+                std::srand(static_cast<unsigned>(std::time(0)));
+                int event = std::rand() % (kr + kd + kg);
+
+                if (event < kr) { //daughter
+                    Tiller newTiller = tiller.makeDaughter();
+
+                    // Check and resolve overlaps with existing Tillers
+                    newTillers.push_back(newTiller);
+                    resolveOverlaps(newTillers);
+                }
+                else if (event > kr && event < kd + kg) { //die
+                    tiller.setStatus(false);
+                }
+            }
         }
 
-        std::cout << num_tillers << "\n";
+        // Append newTillers to the existing tillers
+        tillers.insert(tillers.end(), newTillers.begin(), newTillers.end());
+        newTillers.clear();
     }
 
     return 0;
