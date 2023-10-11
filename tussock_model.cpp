@@ -5,7 +5,10 @@
 #include <cmath>
 #include "tussock_model.h"
 
-// Function to check and resolve overlaps
+double calculateDistance(const Tiller& tiller) {
+    return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY() + tiller.getZ() * tiller.getZ());
+}
+
 void resolveOverlaps(std::vector<Tiller>& tillers) {
     bool overlaps = true;
     while (overlaps) {
@@ -23,40 +26,46 @@ void resolveOverlaps(std::vector<Tiller>& tillers) {
 }
 
 int main() {
-    int kr = 5;  // Tillering constant
-    int kd = 1;  // Death constant
-    int kg = 2;  // Growth constant
+    int kr = 10;  // Reproduction constant
+    int kd = 2.5;  // Death constant
+    int kg = 10;  // Growth constant
 
     int sim_time = 200;
 
     std::vector<Tiller> tillers;
     std::vector<Tiller> newTillers;
 
-    Tiller initialTiller(1.0, 0.0, 0.0, 0.0, true);
+    Tiller initialTiller(1.0, 0.001, 0.0, 0.0, true);
     tillers.push_back(initialTiller);
 
     for (int time_step = 0; time_step <= sim_time; time_step++) {
+        int aliveTillers = 0; // Counter for alive tillers
         std::cout << "Time Step " << time_step << " - Number of Tillers: " << tillers.size() << "\n";
 
         for (Tiller& tiller : tillers) {
             if (tiller.getStatus()) {
-                std::srand(static_cast<unsigned>(std::time(0)));
-                int event = std::rand() % (kr + kd + kg);
+                aliveTillers++;
 
-                if (event < kr) { //daughter
+                double distance = calculateDistance(tiller);
+
+                double totalProb = kr * distance + kd * distance + kg;
+                double reproProb = (kr / distance) / totalProb;
+                double dieProb = (kd * distance) / totalProb;
+
+                double eventProb = static_cast<double>(std::rand()) / RAND_MAX; // Random number between 0 and 1
+
+                if (eventProb < reproProb) { // Reproduction
                     Tiller newTiller = tiller.makeDaughter();
-
-                    // Check and resolve overlaps with existing Tillers
                     newTillers.push_back(newTiller);
                     resolveOverlaps(newTillers);
                 }
-                else if (event > kr && event < kd + kg) { //die
+                else if (eventProb < (reproProb + dieProb)) { // Death
                     tiller.setStatus(false);
                 }
             }
         }
 
-        // Append newTillers to the existing tillers
+        std::cout << "Number of Alive Tillers: " << aliveTillers << "\n"; 
         tillers.insert(tillers.end(), newTillers.begin(), newTillers.end());
         newTillers.clear();
     }
