@@ -8,6 +8,22 @@ double calculateDistance(const Tiller& tiller) {
     return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY() + tiller.getZ() * tiller.getZ());
 }
 
+void resolveOverlaps(std::vector<Tiller>& tillers) {
+    bool overlaps = true;
+    while (overlaps) {
+        overlaps = false;
+        for (size_t i = 0; i < tillers.size(); ++i) {
+            for (size_t j = i + 1; j < tillers.size(); ++j) {
+                if (tillers[i].isOverlapping(tillers[j])) {
+                    overlaps = true;
+                    // Move the old Tiller
+                    tillers[i].move();
+                }
+            }
+        }
+    }
+}
+
 int main() {
     //the "tiller" object contains the following:
     // tiller radius, leaf length, root length (assumed to be 0.5, 20, and 100)
@@ -23,8 +39,8 @@ int main() {
     tillers.push_back(initial_tiller);
 
     //define sim parameters
-    double kr = 2; //constant for creating a daughter tiller
-    double kd = 2; //constant for a tiller dying
+    double kr = 200; //constant for creating a daughter tiller
+    double kd = 1; //constant for a tiller dying
     double kg = 100; //constant for a tiller growing 
 
     int sim_time = 100; //total length of the sim in years
@@ -48,6 +64,7 @@ int main() {
 
                 if (eventProb < reproProb) {  // Reproducing
                     Tiller newTiller = tiller.makeDaughter();
+                    resolveOverlaps(tillers);
                     newTillers.push_back(newTiller); // Store new tiller separately
                 } else if (eventProb < (reproProb + dieProb)) {  // Dying
                     tiller.setStatus(false);
