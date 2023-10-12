@@ -1,9 +1,15 @@
 #include <iostream>
-#include <cstdlib>
-#include <ctime>
+#include <fstream>
 #include <vector>
 #include <cmath>
 #include "tussock_model.h"
+
+struct TillerData {
+    double x, y, z;
+    bool status;
+
+    TillerData(double x, double y, double z, bool status) : x(x), y(y), z(z), status(status) {}
+};
 
 double calculateDistance(const Tiller& tiller) {
     return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY() + tiller.getZ() * tiller.getZ());
@@ -26,49 +32,49 @@ void resolveOverlaps(std::vector<Tiller>& tillers) {
 }
 
 int main() {
-    int kr = 10;  // Reproduction constant
-    int kd = 2.5;  // Death constant
+    int kr = 2;  // Reproduction constant
+    int kd = 2;  // Death constant
     int kg = 10;  // Growth constant
 
     int sim_time = 200;
 
-    std::vector<Tiller> tillers;
-    std::vector<Tiller> newTillers;
+    std::ofstream outputFile("tiller_data.csv", std::ios::app);  // Open CSV file in append mode
 
     Tiller initialTiller(1.0, 0.001, 0.0, 0.0, true);
+    std::vector<Tiller> tillers;
     tillers.push_back(initialTiller);
 
     for (int time_step = 0; time_step <= sim_time; time_step++) {
-        int aliveTillers = 0; // Counter for alive tillers
-        std::cout << "Time Step " << time_step << " - Number of Tillers: " << tillers.size() << "\n";
+        std::vector<TillerData> stepData;
+        std::cout << "Time step: " << time_step << " Num of tillers: " << tillers.size() << "\n";
 
         for (Tiller& tiller : tillers) {
-            if (tiller.getStatus()) {
-                aliveTillers++;
+            double distance = calculateDistance(tiller);
 
-                double distance = calculateDistance(tiller);
+            double totalProb = kr * distance + kd * distance + kg;
+            double reproProb = (kr / distance) / totalProb;
+            double dieProb = (kd * distance) / totalProb;
 
-                double totalProb = kr * distance + kd * distance + kg;
-                double reproProb = (kr / distance) / totalProb;
-                double dieProb = (kd * distance) / totalProb;
+            double eventProb = static_cast<double>(std::rand()) / RAND_MAX; // Random number between 0 and 1
 
-                double eventProb = static_cast<double>(std::rand()) / RAND_MAX; // Random number between 0 and 1
-
-                if (eventProb < reproProb) { // Reproduction
-                    Tiller newTiller = tiller.makeDaughter();
-                    newTillers.push_back(newTiller);
-                    resolveOverlaps(newTillers);
-                }
-                else if (eventProb < (reproProb + dieProb)) { // Death
-                    tiller.setStatus(false);
-                }
+            if (eventProb < reproProb) { // Reproduction
+                Tiller newTiller = tiller.makeDaughter();
+                resolveOverlaps(tillers);
+                tillers.push_back(newTiller);
             }
+            else if (eventProb < (reproProb + dieProb)) { // Death
+                tiller.setStatus(false);
+            }
+            stepData.emplace_back(tiller.getX(), tiller.getY(), tiller.getZ(), tiller.getStatus());
         }
 
-        std::cout << "Number of Alive Tillers: " << aliveTillers << "\n"; 
-        tillers.insert(tillers.end(), newTillers.begin(), newTillers.end());
-        newTillers.clear();
+        // Write the data for this time step to the CSV file
+        for (const TillerData& data : stepData) {
+            outputFile << time_step << "," << data.x << "," << data.y << "," << data.z << "," << data.status << "\n";
+        }
     }
+
+    outputFile.close();  // Close the CSV file
 
     return 0;
 }
