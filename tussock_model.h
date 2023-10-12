@@ -6,79 +6,68 @@
 
 class Tiller {
     public:
-        Tiller(double radius, double x, double y, double z, bool status): radius(radius), x(x), y(y), z(z), status(status) {}
+        Tiller (double radius, double leaf_length, double root_length, double x, double y, double z, double quat_x, double quat_y, double quat_z, double quat_w, bool status) : radius(radius), leaf_length(leaf_length), root_length(root_length), x(x), y(y), z(z), status(status) {}
 
-        double getRadius() const { return radius; }
+        double getRadius() const {return radius;}
+        double getLeafLength() const {return leaf_length;}
+        double getRootLength() const {return root_length;}
 
-        double getX() const {return x; }
-        double getY() const {return y; }
+        double getX() const {return x;}
+        double getY() const {return y;}
         double getZ() const {return z;}
 
-        double getStatus() const {return status;}
+        double getQuatX() const {return quat_x;}
+        double getQuatY() const {return quat_y;}
+        double getQuatZ() const {return quat_z;}
+        double getQuatW() const {return quat_w;}
 
-        void move() {
+        bool getStatus() const {return status;}
 
-            std::srand(static_cast<double>(std::rand())); 
+        double volume() {  // volume is approximated by assuming the root and leaf are cones
+                         // the leaf extends straight out from the angle of the tiller
+                         // the root extends stauight down along the z axis no matter the angle of the tiller
+            double root_vol = (1.0 / 3.0) * 3.14 * root_length * radius * radius;
+            double leaf_vol = (1.0 / 3.0) * 3.14 * leaf_length * radius * radius;
+            return root_vol + leaf_vol;
 
-            double move_angle = (std::rand() % 360) * (3.141 / 180);
-            double move_radius = 0.5;
-            x += move_radius * std::cos(move_angle);
-            y += move_radius * std::sin(move_angle);
         }
 
-        bool isOverlapping(const Tiller& other) const {
-            double distance = std::sqrt(std::pow(x - other.getX(), 2) + std::pow(y - other.getY(), 2) + std::pow(z - other.getZ(),2));
-            return (distance < 0.1);
+        void setRadius(double dRadius){
+            radius += dRadius;
         }
 
-        void setStatus(bool newStatus) {
-            status = newStatus;
+        void setLeaf(double dLeaf){
+            leaf_length += dLeaf;
         }
 
-        void setRadius(double growth) {
-            radius += growth;
+        void setRoot(double dRoot){
+            root_length += dRoot;
         }
+
+        void setStatus(bool new_status) {
+            status = new_status;
+        }
+
 
         Tiller makeDaughter() {
-            std::srand(static_cast<double>(std::rand()));
+            std::srand(static_cast<unsigned>(std::rand()));
 
-            double radius = 0.5;  
-            double angle = (std::rand() % 360) * (3.141 / 180);
-            double distance = (std::rand() % 100) / 100.0 * radius;
+            double randomRadius = 1.0 * static_cast<double>(std::rand()) / RAND_MAX;
+            double randomAngle = 2.0 * 3.141 * static_cast<double>(std::rand()) / RAND_MAX;
+            double xOffset = randomRadius * std::cos(randomAngle);
+            double yOffset = randomRadius * std::sin(randomAngle);
 
-            double xOffset = distance * std::cos(angle);
-            double yOffset = distance * std::sin(angle);
-            double zOffset = static_cast<double>(std::rand()) / (2.0 * RAND_MAX);  // Random value between 0 and 0.5
+            double zOffset = 0.5 * static_cast<double>(std::rand()) / RAND_MAX;
 
             double newX = x + xOffset;
             double newY = y + yOffset;
             double newZ = z + zOffset;
 
-            return Tiller(radius, newX, newY, newZ, true);
+            return Tiller(0.5, 15, 100, newX, newY, newZ, 0, 0, 0, 1, true);
+
         }
 
     private:
-        double radius;
-
-        double x;
-        double y;
-        double z;
-
-        bool status;
-
-};
-
-class Leaf: public Tiller {
-    public:
-        Leaf(double length, double radius, double x, double y, double z, bool status)
-        : Tiller(radius, x, y, z, status) {}
-};
-
-
-class Root : public Tiller {
-public:
-    Root(double length, double radius, double x, double y, double z, bool status)
-        : Tiller(radius, x, y, z, status) {
-
-    }
+        double radius, leaf_length, root_length, x, y, z, quat_x, quat_y, quat_z, quat_w; // radius of tiller, length of leaf, length of root, x,y,z coords, quaternion representation of the angle of the tillers
+        bool status; // 1 for alive, 0 for dead
 };

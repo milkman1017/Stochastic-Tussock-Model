@@ -4,77 +4,68 @@
 #include <cmath>
 #include "tussock_model.h"
 
-struct TillerData {
-    double x, y, z;
-    bool status;
-
-    TillerData(double x, double y, double z, bool status) : x(x), y(y), z(z), status(status) {}
-};
-
 double calculateDistance(const Tiller& tiller) {
     return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY() + tiller.getZ() * tiller.getZ());
 }
 
-void resolveOverlaps(std::vector<Tiller>& tillers) {
-    bool overlaps = true;
-    while (overlaps) {
-        overlaps = false;
-        for (size_t i = 0; i < tillers.size(); ++i) {
-            for (size_t j = i + 1; j < tillers.size(); ++j) {
-                if (tillers[i].isOverlapping(tillers[j])) {
-                    overlaps = true;
-                    // Move the old Tiller
-                    tillers[i].move();
-                }
-            }
-        }
-    }
-}
-
 int main() {
-    int kr = 2;  // Reproduction constant
-    int kd = 2;  // Death constant
-    int kg = 10;  // Growth constant
-
-    int sim_time = 200;
+    //the "tiller" object contains the following:
+    // tiller radius, leaf length, root length (assumed to be 0.5, 20, and 100)
+    // x,y,z coordinates
+    // quaternion x,y,z,w
+    // boolean status, dead or alive
 
     std::ofstream outputFile("tiller_data.csv", std::ios::app);  // Open CSV file in append mode
+    outputFile << "TimeStep,Radius,LeafLength,RootLength,Volume,X,Y,Z\n";
 
-    Tiller initialTiller(1.0, 0.001, 0.0, 0.0, true);
+    Tiller initial_tiller(0.5,15,100,0.001,0,0,0,0,0,1,1); // initalize the first tiller at coords 0,0,0,0, and parallel with the z axis 
     std::vector<Tiller> tillers;
-    tillers.push_back(initialTiller);
+    tillers.push_back(initial_tiller);
+
+    //define sim parameters
+    double kr = 2; //constant for creating a daughter tiller
+    double kd = 2; //constant for a tiller dying
+    double kg = 100; //constant for a tiller growing 
+
+    int sim_time = 100; //total length of the sim in years
 
     for (int time_step = 0; time_step <= sim_time; time_step++) {
-        std::vector<TillerData> stepData;
-        std::cout << "Time step: " << time_step << " Num of tillers: " << tillers.size() << "\n";
+        std::vector<Tiller> step_data;
+        std::vector<Tiller> newTillers; // Store new tillers separately
+
+        std::cout << "Time Step: " << time_step <<" Number of Tillers: " << tillers.size() << '\n';
 
         for (Tiller& tiller : tillers) {
-            double distance = calculateDistance(tiller);
+            if (tiller.getStatus() == 1) { // Check if the tiller is alive
+                // Rest of your code for event probability and actions remains the same
+                double distance = calculateDistance(tiller);
+                double totalProb = kr * distance + kd * distance * distance + kg;
+                double reproProb = (kr / distance) / totalProb;
+                double dieProb = (kd * distance * distance) / totalProb;
+                double growProb = kg / totalProb;
 
-            double totalProb = kr * distance + kd * distance + kg;
-            double reproProb = (kr / distance) / totalProb;
-            double dieProb = (kd * distance) / totalProb;
+                double eventProb = static_cast<double>(std::rand()) / RAND_MAX;
 
-            double eventProb = static_cast<double>(std::rand()) / RAND_MAX; // Random number between 0 and 1
+                if (eventProb < reproProb) {  // Reproducing
+                    Tiller newTiller = tiller.makeDaughter();
+                    newTillers.push_back(newTiller); // Store new tiller separately
+                } else if (eventProb < (reproProb + dieProb)) {  // Dying
+                    tiller.setStatus(false);
+                } else {  // Growing
+                    tiller.setRadius(0.001);
+                }
 
-            if (eventProb < reproProb) { // Reproduction
-                Tiller newTiller = tiller.makeDaughter();
-                resolveOverlaps(tillers);
-                tillers.push_back(newTiller);
+                step_data.emplace_back(tiller.getRadius(), tiller.getLeafLength(), tiller.getRootLength(), tiller.getX(), tiller.getY(), tiller.getZ(), tiller.getQuatX(), tiller.getQuatY(), tiller.getQuatZ(), tiller.getQuatW(), tiller.getStatus());
             }
-            else if (eventProb < (reproProb + dieProb)) { // Death
-                tiller.setStatus(false);
-            }
-            stepData.emplace_back(tiller.getX(), tiller.getY(), tiller.getZ(), tiller.getStatus());
         }
 
-        // Write the data for this time step to the CSV file
-        for (const TillerData& data : stepData) {
-            outputFile << time_step << "," << data.x << "," << data.y << "," << data.z << "," << data.status << "\n";
+        // Append new tillers to the main vector after the loop
+        tillers.insert(tillers.end(), newTillers.begin(), newTillers.end());
+
+        for (Tiller& data : step_data) {
+            outputFile << time_step << "," << data.getRadius() <<','<<data.getLeafLength()<<','<<data.getRootLength()<< ',' << data.volume() << ',' <<data.getX()<<','<<data.getY()<<','<<data.getZ() << '\n';
         }
     }
-
-    outputFile.close();  // Close the CSV file
 
     return 0;
 }
