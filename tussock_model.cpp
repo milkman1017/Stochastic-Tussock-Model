@@ -53,7 +53,6 @@ int main() {
 
         for (Tiller& tiller : tillers) {
             if (tiller.getStatus() == 1) { // Check if the tiller is alive
-                // Rest of your code for event probability and actions remains the same
                 double distance = calculateDistance(tiller);
                 double totalProb = kr * distance + kd * distance * distance + kg;
                 double reproProb = (kr / distance) / totalProb;

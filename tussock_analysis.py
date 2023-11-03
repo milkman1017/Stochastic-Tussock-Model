@@ -27,7 +27,7 @@ def update(frame):
     ax.scatter(time_step_data['X'], time_step_data['Y'], time_step_data['Z'], s=time_step_data['Radius']*10, c='g', marker='o')
     
     # Save the frame as a PNG image
-    plt.savefig(f'model_gif_images/frame_{frame:04d}.png')
+    # plt.savefig(f'model_gif_images/frame_{frame:04d}.png')
 
 ani = FuncAnimation(fig, update, frames=data['TimeStep'], repeat=False)
 
