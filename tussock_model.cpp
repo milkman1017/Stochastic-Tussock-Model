@@ -62,19 +62,19 @@ int main() {
     outputFile << "TimeStep,Age,SizeClass,Radius,X,Y,Z,Status\n";
 
     Tiller initial_tiller(1,1, 0.5, 0.001, 0, 0, 1); // initalize the first tiller at coords 0,0,0,
-    std::vector<Tiller> tillers;
-    tillers.push_back(initial_tiller);
+    std::vector<Tiller> previous_step;
+    previous_step.push_back(initial_tiller);
 
 
-    int sim_time = 100; //total length of the sim in years
+    int sim_time = 500; //total length of the sim in years
 
     for (int time_step = 0; time_step <= sim_time; time_step++) {
         std::vector<Tiller> step_data;
         std::vector<Tiller> newTillers; // Store new tillers separately
 
-        std::cout << "Time Step: " << time_step <<" Number of Tillers: " << tillers.size() << '\n';
+        std::cout << "Time Step: " << time_step <<" Number of Tillers: " << previous_step.size() << '\n';
 
-        for (Tiller& tiller : tillers) {
+        for (Tiller& tiller : previous_step) {
             if (tiller.getStatus() == 1) { // Check if the tiller is alive
 
                 double distance = calculateDistance(tiller);
@@ -83,16 +83,15 @@ int main() {
                 double surviveEvent = static_cast<double>(std::rand()) / RAND_MAX;
 
                 //first determine if tiller lives or dies
-                if (surviveEvent < (survival_matrix[0][size_class-1] / (0.1*distance))) {  //if tiller lives, determine new size class from transition probabilities
+                if (surviveEvent < (survival_matrix[0][size_class-1] / (.5*distance))) {  //if tiller lives, determine new size class from transition probabilities
                 //for now just divide the survival matrix probabilities by the distance from the center
                 //will need to get actual data to validate that this is good enough
                 //also to see what kind of relationship between distance and survival there is (linear, exponentional, etc)
  
                 double tillerEvent = static_cast<double>(std::rand())/ RAND_MAX;
 
-                if (tillerEvent < tillering_matrix[0][size_class-1]) {
+                if (tillerEvent < tillering_matrix[0][size_class-1] / (0.5*distance)) {
                     Tiller newTiller = tiller.makeDaughter();
-                    resolveOverlaps(tillers);
                     newTillers.push_back(newTiller); //store new tiller separately, add into total data at the end of iterating through every current tiller
 
                 }
@@ -125,7 +124,7 @@ int main() {
             else { //now iterate through dead tillers
 
                 //simulate decay, only add tillers into the data which are not decayed
-                tiller.growRadius(-0.025);
+                tiller.growRadius(-0.05);
                 if (tiller.getRadius() >= 0.01) {
                     step_data.emplace_back(tiller.getAge(), tiller.getSizeClass(), tiller.getRadius(), tiller.getX(), tiller.getY(), tiller.getZ(), tiller.getStatus());
                 }
@@ -134,11 +133,15 @@ int main() {
         }
 
         // Append new tillers to the main vector after the loop
-        tillers.insert(tillers.end(), newTillers.begin(), newTillers.end());
+        step_data.insert(step_data.end(), newTillers.begin(), newTillers.end());
+
+        resolveOverlaps(step_data);
 
         for (Tiller& data : step_data) {
             outputFile << time_step << ',' << data.getAge() << ',' << data.getSizeClass() <<','<<data.getRadius() << ',' <<data.getX()<<','<<data.getY()<<','<<data.getZ() << "," <<data.getStatus()<<'\n';
         }
+
+        previous_step = step_data;
     }
 
     return 0;
