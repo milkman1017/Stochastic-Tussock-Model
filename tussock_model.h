@@ -62,7 +62,7 @@ class Tiller {
             double yOffset = randomRadius * std::sin(randomAngle);
 
             //0.1 is to ensure that the daughter tiller is made slightly above the parent
-            double zOffset = 0.2 * static_cast<double>(std::rand()) / RAND_MAX;
+            double zOffset = 0.05 * static_cast<double>(std::rand()) / RAND_MAX;
 
             double newX = x + xOffset;
             double newY = y + yOffset;

@@ -13,9 +13,11 @@ def main():
     print(data)
 
     # num_tillers(data)
-    avg_distance(data)
+    # avg_distance(data)
 
     # point_scatter_3d(data)
+
+    compute_volume(data)
 
 def avg_distance(data):
     data['distance'] = (data['X']**2 + data['Y']**2)**0.5
@@ -113,12 +115,88 @@ def point_scatter_3d(data):
         frames.append(Image.open(frame_filename))
 
     output_gif_filename = 'growth.gif'
-    frames[0].save(output_gif_filename, save_all=True, append_images=frames[1:], duration=100, loop=0)
+    frames[0].save(output_gif_filename, save_all=True, append_images=frames[1:], duration=50, loop=0)
 
     # Remove the temporary frame images
     for frame_filename in os.listdir(output_dir):
         os.remove(os.path.join(output_dir, frame_filename))
     os.rmdir(output_dir)
+
+def compute_volume(df, output_folder='frames'):
+
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+
+    alive_volumes = []  # List to store volumes for each timestep
+    dead_volumes = []
+
+    for timestep in range(df['TimeStep'].max() + 1):
+
+        timestep_data = df[df['TimeStep'] == timestep]
+
+        alive_tillers = timestep_data[timestep_data['Status'] == 1][['X', 'Y', 'Z']].values
+        dead_tillers = timestep_data[timestep_data['Status'] == 0][['X','Y','Z']].values
+
+        if len(alive_tillers) < 3:
+            continue
+
+        try:
+            alive_volume = ConvexHull(alive_tillers)
+            dead_volume = ConvexHull(dead_tillers)
+
+            fig = plt.figure(figsize=(12, 6))
+
+            # 3D plot
+            ax1 = fig.add_subplot(121, projection="3d")\
+            
+            ax1.set_xlim(-10, 10)
+            ax1.set_ylim(-10, 10)
+            ax1.set_zlim(0, 2)
+
+            ax1.plot_trisurf(*zip(*alive_tillers[alive_volume.vertices]), color='green', alpha=0.5, label='Alive')
+            ax1.plot_trisurf(*zip(*dead_tillers[dead_volume.vertices]), color='brown', alpha=0.5, label='Dead')
+
+            ax1.set_title(f'Time Step: {timestep}')
+
+            #volume graph
+            ax2 = fig.add_subplot(122)
+
+            alive_volumes.append(alive_volume.volume)
+            dead_volumes.append(dead_volume.volume - alive_volume.volume)
+
+            ax2.plot(range(len(alive_volumes)), alive_volumes, color='green', label='Alive')
+            ax2.plot(range(len(dead_volumes)), dead_volumes, color='brown', label='Dead')
+
+            ax2.set_title('Tussock Volume')
+            ax2.set_xlabel('Time Step')
+            ax2.set_ylabel('Volume')
+
+            # Save the frame as an image
+            frame_path = os.path.join(output_folder, f'frame_{timestep:03d}.png')
+            plt.legend()
+            plt.savefig(frame_path)
+            plt.close()
+
+        except Exception as e:
+            print(f"Error processing frame {timestep}: {e}")
+
+    # Create animated GIF
+    images = []
+    for i in range(df['TimeStep'].max() + 1):
+        try:
+            images.append(Image.open(os.path.join(output_folder, f'frame_{i:03d}.png')))
+        except:
+            continue
+
+    images[0].save('tussock_volume.gif', save_all=True, append_images=images[1:], duration=50, loop=0)
+
+    # Remove individual frames after creating the GIF
+    for i in range(df['TimeStep'].max() + 1):
+        frame_path = os.path.join(output_folder, f'frame_{i:03d}.png')
+        if os.path.exists(frame_path):
+            os.remove(frame_path)
+    os.rmdir(output_folder)
+
 
 if __name__ == "__main__":
     main()

@@ -6,7 +6,7 @@
 #include "tussock_model.h"
 
 double calculateDistance(const Tiller& tiller) {
-    return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY() + tiller.getZ() * tiller.getZ());
+    return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY());
 }
 
 void resolveOverlaps(std::vector<Tiller>& tillers) {
@@ -65,8 +65,7 @@ int main() {
     std::vector<Tiller> previous_step;
     previous_step.push_back(initial_tiller);
 
-
-    int sim_time = 500; //total length of the sim in years
+    int sim_time = 250; //total length of the sim in years
 
     for (int time_step = 0; time_step <= sim_time; time_step++) {
         std::vector<Tiller> step_data;
@@ -124,7 +123,7 @@ int main() {
             else { //now iterate through dead tillers
 
                 //simulate decay, only add tillers into the data which are not decayed
-                tiller.growRadius(-0.05);
+                tiller.growRadius(-0.02);
                 if (tiller.getRadius() >= 0.01) {
                     step_data.emplace_back(tiller.getAge(), tiller.getSizeClass(), tiller.getRadius(), tiller.getX(), tiller.getY(), tiller.getZ(), tiller.getStatus());
                 }
