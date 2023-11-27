@@ -4,6 +4,8 @@
 #include <cmath>
 #include <map>
 #include "tussock_model.h"
+#include <string>
+#include <sstream>
 
 double calculateDistance(const Tiller& tiller) {
     return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY());
@@ -29,8 +31,9 @@ void resolveOverlaps(std::vector<Tiller>& tillers) {
     }
 }
 
-int main() {
-    std::srand(static_cast<unsigned>(std::time(nullptr)));
+void simulate(const int sim_time, const int sim_id) {
+    
+
 
     //the "tiller" object contains the following:
     // tiller size class, 
@@ -58,27 +61,30 @@ int main() {
         {0.0000,0.0063,0.0782,0.1730,0.2739,0.3202,0.4054,0.3779,0.3776}   //probability of tiller classes producing a daughter tiller
     };
 
-    std::ofstream outputFile("tiller_data.csv", std::ios::app);  // Open CSV file in append mode
+    std::ostringstream output_name;
+    output_name << "sim_data/tiller_data_sim_num_" << sim_id << ".csv";
+    std::string out_file_name = output_name.str();
+
+    std::ofstream outputFile(out_file_name, std::ios::ate);  // Open CSV file in append mode
     outputFile << "TimeStep,Age,SizeClass,Radius,X,Y,Z,Status\n";
 
     Tiller initial_tiller(1,1, 0.5, 0.001, 0, 0, 1); // initalize the first tiller at coords 0,0,0,
     std::vector<Tiller> previous_step;
     previous_step.push_back(initial_tiller);
 
-    int sim_time = 400; //total length of the sim in years
+    // int sim_time = 400; //total length of the sim in years
 
     for (int time_step = 0; time_step <= sim_time; time_step++) {
         std::vector<Tiller> step_data;
         std::vector<Tiller> newTillers; // Store new tillers separately
 
-        std::cout << "Time Step: " << time_step <<" Number of Tillers: " << previous_step.size() << '\n';
+        // std::cout << "Time Step: " << time_step <<" Number of Tillers: " << previous_step.size() << '\n';
 
         for (Tiller& tiller : previous_step) {
             if (tiller.getStatus() == 1) { // Check if the tiller is alive
 
                 double distance = calculateDistance(tiller);
                 int size_class = tiller.getSizeClass();
-                int age = tiller.getAge();
                 double surviveEvent = static_cast<double>(std::rand()) / RAND_MAX;
 
                 //first determine if tiller lives or dies
@@ -141,6 +147,23 @@ int main() {
         }
 
         previous_step = step_data;
+    }
+}
+
+int main() {
+    std::srand(static_cast<unsigned>(std::time(nullptr)));
+
+    int sim_time;
+    std::cout << "Enter Simulation time in Years: ";
+    std::cin >> sim_time;
+
+    int num_sims;
+    std::cout << "Enter Number of Simulations: ";
+    std::cin >> num_sims;
+
+    for (int sim_id = 0; sim_id < num_sims; sim_id++){
+        std::cout << "Simulation Number: " << sim_id <<"\n";
+        simulate(sim_time, sim_id);
     }
 
     return 0;

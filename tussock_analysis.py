@@ -6,61 +6,74 @@ from scipy.spatial import ConvexHull, convex_hull_plot_2d
 import numpy as np
 import os
 from PIL import Image
+import argparse
 
 def main():
 
-    data = pd.read_csv("tiller_data.csv")
-    print(data)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--num_sims', help='number of sims to analyze')
+    args = parser.parse_args()
 
-    # num_tillers(data)
-    # avg_distance(data)
+    size_data = []
+    number_tiller_data = []
 
-    # point_scatter_3d(data)
+    for i in range(int(args.num_sims)):
+        data = pd.read_csv(f'sim_data/tiller_data_sim_num_{i}.csv')
 
-    compute_volume(data)
+        # size_data.append(final_size(data))
+        print(num_tillers(data))
 
-def avg_distance(data):
-    data['distance'] = (data['X']**2 + data['Y']**2)**0.5
+    # plot_min_max_avg(size_data)
+    plot_tiller_number(number_tiller_data)
 
-    # Calculate average radius for total, status 1, and status 0
-    average_radius_total = data.groupby('TimeStep')['distance'].mean()
-    average_radius_alive = data[data['Status'] == 1].groupby('TimeStep')['distance'].mean()
-    average_radius_dead = data[data['Status'] == 0].groupby('TimeStep')['distance'].mean()
+def final_size(data):
 
-    average_height_total = data.groupby('TimeStep')['Z'].mean()
-    average_height_alive = data[data['Status']==1].groupby('TimeStep')['Z'].mean()
-    average_height_dead = data[data['Status']==0].groupby('TimeStep')['Z'].mean()
+    sim_width = (data.groupby('TimeStep')['X'].max() - data.groupby('TimeStep')['X'].min())
+    
+    return sim_width
 
-    # Plot the lines
-    fig, ax = plt.subplots(2)
+def plot_min_max_avg(size_data):
+    min_values = size_data[0].copy()
+    max_values = size_data[0].copy()
+    avg_values = size_data[0].copy()
 
-    ax[0].plot(average_radius_total, label='Total', linewidth=1)
-    ax[0].plot(average_radius_alive, label='Alive', linewidth=1, color='g', linestyle='--')
-    ax[0].plot(average_radius_dead, label='Dead', linewidth=1, color='brown', linestyle='--')
-    ax[0].set_title('Average Distance from Center of Tussock')
+    for i in range(1, len(size_data)):
+        min_values = pd.concat([min_values, size_data[i]], axis=1).min(axis=1)
+        max_values = pd.concat([max_values, size_data[i]], axis=1).max(axis=1)
+        avg_values += size_data[i]
 
-    ax[1].plot(average_height_total, label='Total', linewidth=1)
-    ax[1].plot(average_height_alive, label='Alive', linewidth=1, color='g', linestyle='--')
-    ax[1].plot(average_height_dead, label='Dead', linewidth=1, color='brown', linestyle='--')
-    ax[1].set_title('Average Height Above Soil')
+    avg_values /= len(size_data)
 
-    plt.show()
+    plt.plot(avg_values, label='Average', color='blue')
 
-
-def num_tillers(data):
-    # Group the data by "TimeStep" and "Status"
-    grouped = data.groupby(["TimeStep", "Status"]).size().unstack(fill_value=0)
-
-    total = grouped.sum(axis=1)
-    alive = grouped[1]  # Assuming 1 represents alive status
-    dead = grouped[0]   # Assuming 0 represents dead status
-
-    plt.plot(total, label='Total Tillers', linewidth=1)
-    plt.plot(alive, label='Alive Tillers', linewidth=1, linestyle='--', color='g')
-    plt.plot(dead, label='Dead Tillers', linewidth=1, linestyle='--', color='brown')
+    plt.fill_between(range(len(avg_values)), min_values, max_values, color='blue', alpha=0.3, label='Min-Max Range')
 
     plt.legend()
     plt.show()
+
+def num_tillers(data):
+    grouped = data.groupby(["TimeStep", "Status"]).size().unstack(fill_value=0)
+
+    total = grouped.sum(axis=1)
+    alive = grouped[1]  # represents alive status
+    dead = grouped[0]   # represents dead status
+
+    return total, alive, dead
+
+def plot_tiller_number(number_tiller_data):
+    fig, axs = plt.subplots(3, 1, figsize=(10, 8))
+
+    for i, label in enumerate(["Total Tillers", "Alive Tillers", "Dead Tillers"]):
+        axs[i].set_title(label)
+
+        for j, data in enumerate(number_tiller_data):
+            axs[i].plot(data[i], label=f'Sim number: {j}', linewidth=1)
+
+        axs[i].legend()
+
+    plt.tight_layout()
+    plt.show()
+    
     
 def tillering_rate(data):
     pass
@@ -151,6 +164,7 @@ def compute_volume(df, output_folder='frames'):
             root_top = alive_volume.points[alive_bottom]
             root_bottom = np.copy(root_top)
             root_bottom[:, 2] = -100  # Extend the root shape downward to z=-100
+            print(root_bottom)
             root = np.vstack((root_top, root_bottom))
 
             root_necromass_volume = ConvexHull(root)
