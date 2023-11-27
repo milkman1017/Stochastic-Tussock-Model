@@ -65,7 +65,7 @@ int main() {
     std::vector<Tiller> previous_step;
     previous_step.push_back(initial_tiller);
 
-    int sim_time = 250; //total length of the sim in years
+    int sim_time = 400; //total length of the sim in years
 
     for (int time_step = 0; time_step <= sim_time; time_step++) {
         std::vector<Tiller> step_data;
@@ -82,14 +82,14 @@ int main() {
                 double surviveEvent = static_cast<double>(std::rand()) / RAND_MAX;
 
                 //first determine if tiller lives or dies
-                if (surviveEvent < (survival_matrix[0][size_class-1] / (.5*distance))) {  //if tiller lives, determine new size class from transition probabilities
+                if (surviveEvent < (survival_matrix[0][size_class-1] / (distance))) {  //if tiller lives, determine new size class from transition probabilities
                 //for now just divide the survival matrix probabilities by the distance from the center
                 //will need to get actual data to validate that this is good enough
                 //also to see what kind of relationship between distance and survival there is (linear, exponentional, etc)
  
                 double tillerEvent = static_cast<double>(std::rand())/ RAND_MAX;
 
-                if (tillerEvent < tillering_matrix[0][size_class-1] / (0.5*distance)) {
+                if (tillerEvent < tillering_matrix[0][size_class-1] / (distance)) {
                     Tiller newTiller = tiller.makeDaughter();
                     newTillers.push_back(newTiller); //store new tiller separately, add into total data at the end of iterating through every current tiller
 

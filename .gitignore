@@ -1,2 +1,5 @@
 *.o
 tussock_model
+*.csv
+*.gif
+*.png

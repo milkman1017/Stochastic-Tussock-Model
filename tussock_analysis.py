@@ -127,8 +127,9 @@ def compute_volume(df, output_folder='frames'):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    alive_volumes = []  # List to store volumes for each timestep
+    alive_volumes = [] 
     dead_volumes = []
+    root_volumes = []
 
     for timestep in range(df['TimeStep'].max() + 1):
 
@@ -144,28 +145,37 @@ def compute_volume(df, output_folder='frames'):
             alive_volume = ConvexHull(alive_tillers)
             dead_volume = ConvexHull(dead_tillers)
 
+            alive_bottom = np.argsort(alive_volume.points[:, 2])
+
+            # Define the root shape using the bottom 10 points of the alive volume
+            root_top = alive_volume.points[alive_bottom]
+            root_bottom = np.copy(root_top)
+            root_bottom[:, 2] = -100  # Extend the root shape downward to z=-100
+            root = np.vstack((root_top, root_bottom))
+
+            root_necromass_volume = ConvexHull(root)
+
             fig = plt.figure(figsize=(12, 6))
 
             # 3D plot
             ax1 = fig.add_subplot(121, projection="3d")\
             
-            ax1.set_xlim(-10, 10)
-            ax1.set_ylim(-10, 10)
-            ax1.set_zlim(0, 2)
-
             ax1.plot_trisurf(*zip(*alive_tillers[alive_volume.vertices]), color='green', alpha=0.5, label='Alive')
             ax1.plot_trisurf(*zip(*dead_tillers[dead_volume.vertices]), color='brown', alpha=0.5, label='Dead')
+            # ax1.plot_trisurf(*zip(*root[root_necromass_volume.vertices]), color='black', alpha=0.5, label='Root Necromass')
 
             ax1.set_title(f'Time Step: {timestep}')
 
-            #volume graph
+            # Volume graph
             ax2 = fig.add_subplot(122)
 
             alive_volumes.append(alive_volume.volume)
             dead_volumes.append(dead_volume.volume - alive_volume.volume)
+            root_volumes.append(root_necromass_volume.volume)
 
             ax2.plot(range(len(alive_volumes)), alive_volumes, color='green', label='Alive')
             ax2.plot(range(len(dead_volumes)), dead_volumes, color='brown', label='Dead')
+            ax2.plot(range(len(root_volumes)), root_volumes, color='black', label='Root Necromass')
 
             ax2.set_title('Tussock Volume')
             ax2.set_xlabel('Time Step')
