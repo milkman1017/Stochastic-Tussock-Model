@@ -6,6 +6,8 @@
 #include "tussock_model.h"
 #include <string>
 #include <sstream>
+#include <filesystem>
+#include <thread>
 
 double calculateDistance(const Tiller& tiller) {
     return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY());
@@ -31,10 +33,7 @@ void resolveOverlaps(std::vector<Tiller>& tillers) {
     }
 }
 
-void simulate(const int sim_time, const int sim_id) {
-    
-
-
+void simulate(const int sim_time, const int sim_id, const std::string outdir) {
     //the "tiller" object contains the following:
     // tiller size class, 
     // radius (assumed to be 0.5)
@@ -62,7 +61,7 @@ void simulate(const int sim_time, const int sim_id) {
     };
 
     std::ostringstream output_name;
-    output_name << "sim_data/tiller_data_sim_num_" << sim_id << ".csv";
+    output_name << outdir << "/tiller_data_sim_num_" << sim_id << ".csv";
     std::string out_file_name = output_name.str();
 
     std::ofstream outputFile(out_file_name, std::ios::ate);  // Open CSV file in append mode
@@ -161,9 +160,15 @@ int main() {
     std::cout << "Enter Number of Simulations: ";
     std::cin >> num_sims;
 
+    std::string outdir;
+    std::cout << "Enter output (relative) directory: ";
+    std::cin >> outdir;
+
+    std::filesystem::create_directory(outdir);
+
     for (int sim_id = 0; sim_id < num_sims; sim_id++){
         std::cout << "Simulation Number: " << sim_id <<"\n";
-        simulate(sim_time, sim_id);
+        simulate(sim_time, sim_id, outdir);
     }
 
     return 0;

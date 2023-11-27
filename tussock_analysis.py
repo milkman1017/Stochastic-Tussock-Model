@@ -21,10 +21,13 @@ def main():
         data = pd.read_csv(f'sim_data/tiller_data_sim_num_{i}.csv')
 
         # size_data.append(final_size(data))
-        print(num_tillers(data))
+        # number_tiller_data.append(num_tillers(data))
 
     # plot_min_max_avg(size_data)
-    plot_tiller_number(number_tiller_data)
+    # plot_tiller_number(number_tiller_data)
+
+    data = pd.read_csv(f'sim_data/tiller_data_sim_num_0.csv')
+    point_scatter_3d(data)
 
 def final_size(data):
 
@@ -63,15 +66,29 @@ def num_tillers(data):
 def plot_tiller_number(number_tiller_data):
     fig, axs = plt.subplots(3, 1, figsize=(10, 8))
 
-    for i, label in enumerate(["Total Tillers", "Alive Tillers", "Dead Tillers"]):
+    for i, label, color in zip([0, 1, 2], ["Total Tillers", "Alive Tillers", "Dead Tillers"], ['blue', 'green', 'brown']):
         axs[i].set_title(label)
 
+        min_values = number_tiller_data[0][i].copy()
+        max_values = number_tiller_data[0][i].copy()
+        mean_values = number_tiller_data[0][i].copy()
+
         for j, data in enumerate(number_tiller_data):
-            axs[i].plot(data[i], label=f'Sim number: {j}', linewidth=1)
+            min_values = pd.concat([min_values, data[i]], axis=1).min(axis=1)
+            max_values = pd.concat([max_values, data[i]], axis=1).max(axis=1)
+            mean_values += data[i]
+
+        mean_values /= len(number_tiller_data)
+
+        axs[i].plot(mean_values, label='Mean', color=color)
+
+        axs[i].fill_between(range(len(mean_values)), min_values, max_values, color=color, alpha=0.3, label='Min-Max Range')
 
         axs[i].legend()
 
     plt.tight_layout()
+    plt.xlabel('Time (yrs)')
+    plt.ylabel('Number')
     plt.show()
     
     
