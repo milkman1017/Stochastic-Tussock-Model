@@ -67,7 +67,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
     std::ofstream outputFile(out_file_name, std::ios::ate);  // Open CSV file in append mode
     outputFile << "TimeStep,Age,SizeClass,Radius,X,Y,Z,Status\n";
 
-    Tiller initial_tiller(1,1, 0.5, 0.001, 0, 0, 1); // initalize the first tiller at coords 0,0,0,
+    Tiller initial_tiller(1,0, 0.5, 0.001, 0, 0, 1); // initalize the first tiller at coords 0,0,0,
     std::vector<Tiller> previous_step;
     previous_step.push_back(initial_tiller);
 
@@ -163,12 +163,25 @@ int main() {
     std::string outdir;
     std::cout << "Enter output (relative) directory: ";
     std::cin >> outdir;
-
     std::filesystem::create_directory(outdir);
 
-    for (int sim_id = 0; sim_id < num_sims; sim_id++){
-        std::cout << "Simulation Number: " << sim_id <<"\n";
-        simulate(sim_time, sim_id, outdir);
+    int num_threads;
+    std::cout << "Enter the number of threads: ";
+    std::cin >> num_threads;
+
+    std::vector<std::thread> threads;
+
+    for (int sim_id = 0; sim_id < num_sims; sim_id++) {
+        std::cout << "Simulation Number: " << sim_id << "\n";
+        
+        threads.emplace_back(simulate, sim_time, sim_id, outdir);
+
+        if (threads.size() == num_threads || sim_id == num_sims - 1) {
+            for (auto& thread : threads) {
+                thread.join();
+            }
+            threads.clear();
+        }
     }
 
     return 0;
