@@ -37,24 +37,19 @@ class Tiller {
         }
 
         bool isOverlapping(const Tiller& other) const {
-            double distance = std::sqrt(std::pow(x - other.getX(), 2) + std::pow(y - other.getY(), 2) + std::pow(z - other.getZ(), 2));
+            double distance = std::sqrt(std::pow(x - other.getX(), 2) + std::pow(y - other.getY(), 2));
             double sumOfRadii = getRadius() + other.getRadius();
 
             return (distance <= sumOfRadii);
         }
-        void move(){
-
-            std::srand(static_cast<double>(std::rand())); 
-
-            double move_angle = (std::rand() % 360) * (3.141 / 180);
-            double move_radius = 0.1;
+        void move(double move_angle){
+        
+            double move_radius = 0.01;
             x += move_radius * std::cos(move_angle);
             y += move_radius * std::sin(move_angle);
         }
 
-
         Tiller makeDaughter() {
-            std::srand(static_cast<unsigned>(std::rand()));
 
             double randomRadius = 1.0 * static_cast<double>(std::rand()) / RAND_MAX;
             double randomAngle = 2.0 * 3.141 * static_cast<double>(std::rand()) / RAND_MAX;

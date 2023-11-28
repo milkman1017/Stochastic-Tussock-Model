@@ -1,39 +1,31 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <cmath>
-#include <map>
 #include "tussock_model.h"
 #include <string>
-#include <sstream>
-#include <filesystem>
 #include <thread>
+#include <filesystem>
+#include <random>
 
 double calculateDistance(const Tiller& tiller) {
     return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY());
 }
 
-void resolveOverlaps(std::vector<Tiller>& tillers) {
+void resolveOverlaps(std::vector<Tiller>& tillers, std::random_device& rd) {
     for (size_t i = 0; i < tillers.size(); ++i) {
         for (size_t j = i + 1; j < tillers.size(); ++j) {
-            // Calculate the distance between the two Tiller objects.
-            double distance = std::sqrt(
-                std::pow(tillers[i].getX() - tillers[j].getX(), 2) +
-                std::pow(tillers[i].getY() - tillers[j].getY(), 2) +
-                std::pow(tillers[i].getZ() - tillers[j].getZ(), 2)
-            );
-
-            double sumOfRadii = tillers[i].getRadius() + tillers[j].getRadius();
-
-            if (distance <= sumOfRadii && distance <= 2) {
-               
-                tillers[i].move();
+            while (tillers[i].isOverlapping(tillers[j])){
+                tillers[i].move((rd() % 360) * (3.141 / 180));
             }
         }
     }
 }
 
 void simulate(const int sim_time, const int sim_id, const std::string outdir) {
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<double> dis(0.0, 1.0);
+
     //the "tiller" object contains the following:
     // tiller size class, 
     // radius (assumed to be 0.5)
@@ -52,26 +44,23 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
         {0.0046,0.0000,0.0000,0.0000,0.0134,0.0341,0.1467,0.2672,0.5000},
     };
 
-    double survival_matrix[1][9] = {
-        {1.0000,0.6467,0.8839,0.8981,0.8753,0.9003,0.9073,0.8969,0.9541}    //probability of a tiller size class n surviving the time step
+    double survival_matrix[9] = {
+        1.0000,0.6467,0.8839,0.8981,0.8753,0.9003,0.9073,0.8969,0.9541    //probability of a tiller size class n surviving the time step
     };
 
-    double tillering_matrix[1][9] = {
-        {0.0000,0.0063,0.0782,0.1730,0.2739,0.3202,0.4054,0.3779,0.3776}   //probability of tiller classes producing a daughter tiller
+    double tillering_matrix[9] = {
+        0.0000,0.0063,0.0782,0.1730,0.2739,0.3202,0.4054,0.3779,0.3776   //probability of tiller classes producing a daughter tiller
     };
 
-    std::ostringstream output_name;
-    output_name << outdir << "/tiller_data_sim_num_" << sim_id << ".csv";
-    std::string out_file_name = output_name.str();
-
+    std::string out_file_name = outdir + "/tiller_data_sim_num_" + std::to_string(sim_id) + ".csv";
     std::ofstream outputFile(out_file_name, std::ios::ate);  // Open CSV file in append mode
-    outputFile << "TimeStep,Age,SizeClass,Radius,X,Y,Z,Status\n";
 
-    Tiller initial_tiller(1,0, 0.5, 0.001, 0, 0, 1); // initalize the first tiller at coords 0,0,0,
+
+    Tiller first_tiller(1,1, 0.5, 0.001, 0, 0, 1); // initalize the first tiller at coords 0,0,0,
     std::vector<Tiller> previous_step;
-    previous_step.push_back(initial_tiller);
+    previous_step.push_back(first_tiller);
 
-    // int sim_time = 400; //total length of the sim in years
+    std::vector<std::string> buffer;
 
     for (int time_step = 0; time_step <= sim_time; time_step++) {
         std::vector<Tiller> step_data;
@@ -84,23 +73,25 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
 
                 double distance = calculateDistance(tiller);
                 int size_class = tiller.getSizeClass();
-                double surviveEvent = static_cast<double>(std::rand()) / RAND_MAX;
+                double surviveEvent = dis(gen);
 
                 //first determine if tiller lives or dies
-                if (surviveEvent < (survival_matrix[0][size_class-1] / (distance))) {  //if tiller lives, determine new size class from transition probabilities
+                if (surviveEvent < (survival_matrix[size_class-1] / (0.5*distance))) {  //if tiller lives, determine new size class from transition probabilities
                 //for now just divide the survival matrix probabilities by the distance from the center
                 //will need to get actual data to validate that this is good enough
                 //also to see what kind of relationship between distance and survival there is (linear, exponentional, etc)
  
-                double tillerEvent = static_cast<double>(std::rand())/ RAND_MAX;
+                double tillerEvent = dis(gen);
 
-                if (tillerEvent < tillering_matrix[0][size_class-1] / (distance)) {
+
+                if (tillerEvent < tillering_matrix[size_class-1] / (0.5*distance)) {
                     Tiller newTiller = tiller.makeDaughter();
                     newTillers.push_back(newTiller); //store new tiller separately, add into total data at the end of iterating through every current tiller
-
+                    // resolveOverlaps(newTillers)
                 }
 
-                double transition_prob = static_cast<double>(std::rand()) / RAND_MAX;
+                double transition_prob = dis(gen);
+
 
                 double cumulative_prob = 0.0;
                 int new_size_class = 0;
@@ -139,18 +130,22 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
         // Append new tillers to the main vector after the loop
         step_data.insert(step_data.end(), newTillers.begin(), newTillers.end());
 
-        resolveOverlaps(step_data);
+        resolveOverlaps(step_data, rd);
 
         for (Tiller& data : step_data) {
-            outputFile << time_step << ',' << data.getAge() << ',' << data.getSizeClass() <<','<<data.getRadius() << ',' <<data.getX()<<','<<data.getY()<<','<<data.getZ() << "," <<data.getStatus()<<'\n';
+            buffer.emplace_back(std::to_string(time_step) + ',' + std::to_string(data.getAge()) + ',' + std::to_string(data.getSizeClass()) + ','+ std::to_string(data.getRadius()) + ',' + std::to_string(data.getX()) + ',' + std::to_string(data.getY()) + ',' + std::to_string(data.getZ()) + "," + std::to_string(data.getStatus()) + '\n');
         }
 
         previous_step = step_data;
     }
+    std::string big_buffer = "TimeStep,Age,SizeClass,Radius,X,Y,Z,Status\n";
+    for(std::string& step: buffer){
+        big_buffer += step;
+    }
+    outputFile << big_buffer;
 }
 
 int main() {
-    std::srand(static_cast<unsigned>(std::time(nullptr)));
 
     int sim_time;
     std::cout << "Enter Simulation time in Years: ";
@@ -165,7 +160,7 @@ int main() {
     std::cin >> outdir;
     std::filesystem::create_directory(outdir);
 
-    int num_threads;
+    long unsigned int num_threads;
     std::cout << "Enter the number of threads: ";
     std::cin >> num_threads;
 
@@ -173,10 +168,10 @@ int main() {
 
     for (int sim_id = 0; sim_id < num_sims; sim_id++) {
         std::cout << "Simulation Number: " << sim_id << "\n";
-        
+
         threads.emplace_back(simulate, sim_time, sim_id, outdir);
 
-        if (threads.size() == num_threads || sim_id == num_sims - 1) {
+        if ((threads.size() == num_threads) || (sim_id == num_sims - 1)) {
             for (auto& thread : threads) {
                 thread.join();
             }
