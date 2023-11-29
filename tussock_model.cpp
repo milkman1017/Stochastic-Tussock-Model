@@ -21,6 +21,21 @@ void resolveOverlaps(std::vector<Tiller>& tillers, std::random_device& rd) {
     }
 }
 
+void input(int &sim_time, int &num_sims, std::string &outdir, long unsigned int &num_threads){
+    std::cout << "Enter Simulation time in Years: ";
+    std::cin >> sim_time;
+
+    std::cout << "Enter Number of Simulations: ";
+    std::cin >> num_sims;
+
+    std::cout << "Enter output (relative) directory: ";
+    std::cin >> outdir;
+    std::filesystem::create_directory(outdir);
+
+    std::cout << "Enter the number of threads: ";
+    std::cin >> num_threads;
+}
+
 void simulate(const int sim_time, const int sim_id, const std::string outdir) {
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -55,7 +70,6 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
     std::string out_file_name = outdir + "/tiller_data_sim_num_" + std::to_string(sim_id) + ".csv";
     std::ofstream outputFile(out_file_name, std::ios::ate);  // Open CSV file in append mode
 
-
     Tiller first_tiller(1,1, 0.5, 0.001, 0, 0, 1); // initalize the first tiller at coords 0,0,0,
     std::vector<Tiller> previous_step;
     previous_step.push_back(first_tiller);
@@ -83,7 +97,6 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
  
                 double tillerEvent = dis(gen);
 
-
                 if (tillerEvent < tillering_matrix[size_class-1] / (0.5*distance)) {
                     Tiller newTiller = tiller.makeDaughter();
                     newTillers.push_back(newTiller); //store new tiller separately, add into total data at the end of iterating through every current tiller
@@ -91,7 +104,6 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
                 }
 
                 double transition_prob = dis(gen);
-
 
                 double cumulative_prob = 0.0;
                 int new_size_class = 0;
@@ -146,23 +158,12 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
 }
 
 int main() {
-
     int sim_time;
-    std::cout << "Enter Simulation time in Years: ";
-    std::cin >> sim_time;
-
     int num_sims;
-    std::cout << "Enter Number of Simulations: ";
-    std::cin >> num_sims;
-
     std::string outdir;
-    std::cout << "Enter output (relative) directory: ";
-    std::cin >> outdir;
-    std::filesystem::create_directory(outdir);
+    unsigned long int num_threads;
 
-    long unsigned int num_threads;
-    std::cout << "Enter the number of threads: ";
-    std::cin >> num_threads;
+    input(sim_time, num_sims, outdir, num_threads);
 
     std::vector<std::thread> threads;
 
