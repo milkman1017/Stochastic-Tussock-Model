@@ -87,7 +87,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
         std::vector<Tiller> step_data;
         std::vector<Tiller> newTillers; // Store new tillers separately
 
-        // std::cout << "Time Step: " << time_step <<" Number of Tillers: " << previous_step.size() << '\n';
+        std::cout << "Time Step: " << time_step <<" Number of Tillers: " << previous_step.size() << '\n';
 
         int alive_tillers = 0;
 
@@ -101,7 +101,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
                 double surviveEvent = dis(gen);
 
                 //first determine if tiller lives or dies
-                if (surviveEvent < (survival_matrix[size_class-1] / (0.5*distance))) {  //if tiller lives, determine new size class from transition probabilities
+                if (surviveEvent < (survival_matrix[size_class-1] / (0.05*distance))) {  //if tiller lives, determine new size class from transition probabilities
                 //for now just divide the survival matrix probabilities by the distance from the center
                 //will need to get actual data to validate that this is good enough
                 //also to see what kind of relationship between distance and survival there is (linear, exponentional, etc)
@@ -129,7 +129,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
                 }
 
                 tiller.growRadius(0.05);
-                tiller.mature(1);
+                tiller.mature(1);  //increase age by one year
 
             //if it didnt survive, it died:
             } else {
@@ -160,6 +160,11 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
         }
 
         previous_step = step_data;
+
+        if (alive_tillers > 500) {
+            std::cout << "Too many alive tillers";
+            break;
+        }
     }
     std::string big_buffer = "TimeStep,Age,SizeClass,Radius,X,Y,Z,Status\n";
     for(std::string& step: buffer){
