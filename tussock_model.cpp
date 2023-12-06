@@ -7,14 +7,21 @@
 #include <filesystem>
 #include <random>
 
-double calculateDistance(const Tiller& tiller) {
+double calculater0(const Tiller& tiller) {
     return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY());
+}
+
+double calculateTillersDistance(const Tiller& tiller1, const Tiller& tiller2){
+    return std::sqrt(tiller1.getX() * tiller2.getX() + tiller1.getY() * tiller2.getY());
+
+
+
 }
 
 void resolveOverlaps(std::vector<Tiller>& tillers, std::random_device& rd) {
     for (size_t i = 0; i < tillers.size(); ++i) {
         for (size_t j = i + 1; j < tillers.size(); ++j) {
-            while (tillers[i].isOverlapping(tillers[j])){
+            while (calculateTillersDistance(tillers[i], tillers[j]) < 1 && tillers[i].isOverlapping(tillers[j])){
                 tillers[i].move((rd() % 360) * (3.141 / 180));
             }
         }
@@ -82,10 +89,14 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
 
         // std::cout << "Time Step: " << time_step <<" Number of Tillers: " << previous_step.size() << '\n';
 
+        int alive_tillers = 0;
+
         for (Tiller& tiller : previous_step) {
             if (tiller.getStatus() == 1) { // Check if the tiller is alive
 
-                double distance = calculateDistance(tiller);
+                alive_tillers +=1;
+
+                double distance = calculater0(tiller);
                 int size_class = tiller.getSizeClass();
                 double surviveEvent = dis(gen);
 
@@ -97,7 +108,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
  
                 double tillerEvent = dis(gen);
 
-                if (tillerEvent < tillering_matrix[size_class-1] / (0.5*distance)) {
+                if (tillerEvent < tillering_matrix[size_class-1] / (distance)) {
                     Tiller newTiller = tiller.makeDaughter();
                     newTillers.push_back(newTiller); //store new tiller separately, add into total data at the end of iterating through every current tiller
                     // resolveOverlaps(newTillers)

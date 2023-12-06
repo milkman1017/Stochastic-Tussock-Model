@@ -44,7 +44,7 @@ class Tiller {
         }
         void move(double move_angle){
         
-            double move_radius = 0.01;
+            double move_radius = 0.05;
             x += move_radius * std::cos(move_angle);
             y += move_radius * std::sin(move_angle);
         }
