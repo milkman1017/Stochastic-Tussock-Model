@@ -6,7 +6,7 @@
 
 class Tiller {
     public:
-        Tiller (int age, int size_class, double radius, double x, double y, double z, bool status) : age(age), size_class(size_class), radius(radius), x(x), y(y), z(z), status(status) {}
+        Tiller (int age, int size_class, double radius, double x, double y, double z, int num_roots, bool status) : age(age), size_class(size_class), radius(radius), x(x), y(y), z(z), num_roots(num_roots), status(status) {}
 
         int getSizeClass() const {return size_class;}
 
@@ -19,6 +19,8 @@ class Tiller {
         bool getStatus() const {return status;}
 
         int getAge() const {return age;}
+
+        int getNumRoots() const {return num_roots;}
 
         void growRadius(double dRadius){
             radius += dRadius;
@@ -34,6 +36,11 @@ class Tiller {
 
         void mature (int age_growth) {
             age += age_growth;
+            z += 0.2;   //simulates the growth of the stem base every year
+        }
+
+        void growRoots(int new_roots) {
+            num_roots = new_roots;
         }
 
         bool isOverlapping(const Tiller& other) const {
@@ -57,13 +64,14 @@ class Tiller {
             double yOffset = randomRadius * std::sin(randomAngle);
 
             //0.1 is to ensure that the daughter tiller is made slightly above the parent
-            double zOffset = 0.1 * static_cast<double>(std::rand()) / RAND_MAX;
+            // double zOffset = 0.1 * static_cast<double>(std::rand()) / RAND_MAX;
 
             double newX = x + xOffset;
             double newY = y + yOffset;
-            double newZ = z + zOffset;
+            // double newZ = z + zOffset;
+            double newZ = z;
 
-            return Tiller(1,1, 0.5, newX, newY, newZ, 1);
+            return Tiller(1,1, 0.5, newX, newY, newZ, 3, 1);
 
         }
 
@@ -71,5 +79,6 @@ class Tiller {
         int age;
         int size_class; // size class as defined by Jim McGraw
         double radius, x, y, z; // radius of tiller, x,y,z coords
+        int num_roots;
         bool status; // 1 for alive, 0 for dead
 };

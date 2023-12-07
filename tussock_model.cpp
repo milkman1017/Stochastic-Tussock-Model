@@ -77,7 +77,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
     std::string out_file_name = outdir + "/tiller_data_sim_num_" + std::to_string(sim_id) + ".csv";
     std::ofstream outputFile(out_file_name, std::ios::ate);  // Open CSV file in append mode
 
-    Tiller first_tiller(1,1, 0.5, 0.001, 0, 0, 1); // initalize the first tiller at coords 0,0,0,
+    Tiller first_tiller(1,1, 0.5, 0.001, 0, 0, 3, 1); // initalize the first tiller at coords 0,0,0,...attributes are age, size class, radius, x,y,z, num fo roots, and status
     std::vector<Tiller> previous_step;
     previous_step.push_back(first_tiller);
 
@@ -87,7 +87,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
         std::vector<Tiller> step_data;
         std::vector<Tiller> newTillers; // Store new tillers separately
 
-        std::cout << "Time Step: " << time_step <<" Number of Tillers: " << previous_step.size() << '\n';
+        // std::cout << "Time Step: " << time_step <<" Number of Tillers: " << previous_step.size() << '\n';
 
         int alive_tillers = 0;
 
@@ -101,35 +101,39 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
                 double surviveEvent = dis(gen);
 
                 //first determine if tiller lives or dies
-                if (surviveEvent < (survival_matrix[size_class-1] / (0.05*distance))) {  //if tiller lives, determine new size class from transition probabilities
-                //for now just divide the survival matrix probabilities by the distance from the center
-                //will need to get actual data to validate that this is good enough
-                //also to see what kind of relationship between distance and survival there is (linear, exponentional, etc)
- 
-                double tillerEvent = dis(gen);
+                if (surviveEvent < (survival_matrix[size_class-1] / (distance))) {  //if tiller lives, determine new size class from transition probabilities
+                    //for now just divide the survival matrix probabilities by the distance from the center
+                    //will need to get actual data to validate that this is good enough
+                    //also to see what kind of relationship between distance and survival there is (linear, exponentional, etc)
+    
+                    double tillerEvent = dis(gen);
 
-                if (tillerEvent < tillering_matrix[size_class-1] / (distance)) {
-                    Tiller newTiller = tiller.makeDaughter();
-                    newTillers.push_back(newTiller); //store new tiller separately, add into total data at the end of iterating through every current tiller
-                    // resolveOverlaps(newTillers)
-                }
-
-                double transition_prob = dis(gen);
-
-                double cumulative_prob = 0.0;
-                int new_size_class = 0;
-
-                for (int m = 0; m < 9; m++) {
-                    cumulative_prob += class_transition_matrix[size_class - 1][m];
-                    if (transition_prob < cumulative_prob) {
-                        new_size_class = m + 1; // Adding 1 to convert from 0-based index to 1-based size class
-                        tiller.setClass(new_size_class);
-                        break;
+                    if (tillerEvent < tillering_matrix[size_class-1] * (-2*distance) + 0.75) {
+                        Tiller newTiller = tiller.makeDaughter();
+                        newTillers.push_back(newTiller); //store new tiller separately, add into total data at the end of iterating through every current tiller
+                        // resolveOverlaps(newTillers)
                     }
-                }
 
-                tiller.growRadius(0.05);
-                tiller.mature(1);  //increase age by one year
+                    double transition_prob = dis(gen);
+
+                    double cumulative_prob = 0.0;
+                    int new_size_class = 0;
+
+                    for (int m = 0; m < 9; m++) {
+                        cumulative_prob += class_transition_matrix[size_class - 1][m];
+                        if (transition_prob < cumulative_prob) {
+                            new_size_class = m + 1; // Adding 1 to convert from 0-based index to 1-based size class
+                            tiller.setClass(new_size_class);
+                            break;
+                        }
+                    }
+
+                    tiller.growRadius(0.05);
+                    tiller.mature(1);  //increase age by one year, this will also increase the stem base by 2 mm
+
+                    std::uniform_int_distribution<int> int_dis(2,4);
+                    int new_roots = int_dis(gen);
+                    tiller.growRoots(new_roots);
 
             //if it didnt survive, it died:
             } else {
@@ -137,14 +141,15 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
 
             };
 
-                step_data.emplace_back(tiller.getAge(), tiller.getSizeClass(), tiller.getRadius(), tiller.getX(), tiller.getY(), tiller.getZ(), tiller.getStatus());
+                step_data.emplace_back(tiller.getAge(), tiller.getSizeClass(), tiller.getRadius(), tiller.getX(), tiller.getY(), tiller.getZ(), tiller.getNumRoots(), tiller.getStatus());
             } 
             else { //now iterate through dead tillers
 
                 //simulate decay, only add tillers into the data which are not decayed
-                tiller.growRadius(-0.02);
+                tiller.growRadius(-0.001);
+                tiller.growRoots(0);
                 if (tiller.getRadius() >= 0.01) {
-                    step_data.emplace_back(tiller.getAge(), tiller.getSizeClass(), tiller.getRadius(), tiller.getX(), tiller.getY(), tiller.getZ(), tiller.getStatus());
+                    step_data.emplace_back(tiller.getAge(), tiller.getSizeClass(), tiller.getRadius(), tiller.getX(), tiller.getY(), tiller.getZ(), tiller.getNumRoots(), tiller.getStatus());
                 }
 
             }
@@ -156,17 +161,20 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
         resolveOverlaps(step_data, rd);
 
         for (Tiller& data : step_data) {
-            buffer.emplace_back(std::to_string(time_step) + ',' + std::to_string(data.getAge()) + ',' + std::to_string(data.getSizeClass()) + ','+ std::to_string(data.getRadius()) + ',' + std::to_string(data.getX()) + ',' + std::to_string(data.getY()) + ',' + std::to_string(data.getZ()) + "," + std::to_string(data.getStatus()) + '\n');
+            buffer.emplace_back(std::to_string(time_step) + ',' + std::to_string(data.getAge()) + ',' + std::to_string(data.getSizeClass()) + ','+ std::to_string(data.getRadius()) + ',' + std::to_string(data.getX()) + ',' + std::to_string(data.getY()) + ',' + std::to_string(data.getZ()) + "," + std::to_string(data.getNumRoots()) + "," + std::to_string(data.getStatus()) + '\n');
         }
 
         previous_step = step_data;
 
         if (alive_tillers > 500) {
-            std::cout << "Too many alive tillers";
+            std::cout << "Too many alive tillers in simulation number: " << sim_id << "\n";
             break;
         }
     }
-    std::string big_buffer = "TimeStep,Age,SizeClass,Radius,X,Y,Z,Status\n";
+
+    std::cout << "Finished sim number: " << sim_id <<"\n";
+
+    std::string big_buffer = "TimeStep,Age,SizeClass,Radius,X,Y,Z,NumRoots,Status\n";
     for(std::string& step: buffer){
         big_buffer += step;
     }
@@ -184,7 +192,7 @@ int main() {
     std::vector<std::thread> threads;
 
     for (int sim_id = 0; sim_id < num_sims; sim_id++) {
-        std::cout << "Simulation Number: " << sim_id << "\n";
+        std::cout << "Starting Simulation Number: " << sim_id << "\n";
 
         threads.emplace_back(simulate, sim_time, sim_id, outdir);
 

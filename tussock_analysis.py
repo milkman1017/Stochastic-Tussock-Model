@@ -1,240 +1,172 @@
 import pandas as pd
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-from matplotlib.animation import FuncAnimation
-from scipy.spatial import ConvexHull, convex_hull_plot_2d
 import numpy as np
-import os
-from PIL import Image
+import matplotlib.pyplot as plt
 import argparse
+from scipy.spatial import ConvexHull, convex_hull_plot_2d
 
-def main():
-
+def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--num_sims', help='number of sims to analyze')
-    args = parser.parse_args()
 
-    size_data = []
-    number_tiller_data = []
+    parser.add_argument('--nsims', type=int, help='The number of simulations that you wish to simulate')
+    parser.add_argument('--filepath', type=str, help='The directory containing the simulations to analyze')
+    parser.add_argument('--outdir', type=str, help='Output directory to save the analysis')
 
-    for i in range(int(args.num_sims)):
-        data = pd.read_csv(f'lol/tiller_data_sim_num_{i}.csv')
-
-        size_data.append(final_size(data))
-        number_tiller_data.append(num_tillers(data))
+    args=parser.parse_args()
     
-    # print(number_tiller_data)
+    return args
 
-    # plot_min_max_avg(size_data)
-    # plot_tiller_number(number_tiller_data)
+def numberOfTillers(df):
+    df = df.groupby('TimeStep')
 
-    data = pd.read_csv(f'lol/tiller_data_sim_num_0.csv')
-    point_scatter_3d(data)
-    # compute_volume(data)
+    for timestep in df:
+        stepdata = timestep[1]
 
-def final_size(data):
+def tussockDiameter(df):
+    df = df.groupby("TimeStep")
 
-    sim_width = (data.groupby('TimeStep')['X'].max() - data.groupby('TimeStep')['X'].min())
-    
-    return sim_width
+    diameters = []
 
-def plot_min_max_avg(size_data):
-    min_values = size_data[0].copy()
-    max_values = size_data[0].copy()
-    avg_values = size_data[0].copy()
+    x_diameters = (df['X'].max() - df['X'].min())
+    y_diameters = (df['Y'].max() - df['Y'].min())
 
-    for i in range(1, len(size_data)):
-        min_values = pd.concat([min_values, size_data[i]], axis=1).min(axis=1)
-        max_values = pd.concat([max_values, size_data[i]], axis=1).max(axis=1)
-        avg_values += size_data[i]
+    for x_diameter, y_diameter in zip(x_diameters, y_diameters):
+        diameter = np.mean([x_diameter, y_diameter])
+        diameters.append(diameter)
 
-    avg_values /= len(size_data)
+    return diameters
 
-    plt.plot(avg_values, label='Average', color='blue')
+def graph_diameters(diameter_data):
 
-    plt.fill_between(range(len(avg_values)), min_values, max_values, color='blue', alpha=0.3, label='Min-Max Range')
+    diameter_growth = np.diff(diameter_data)
 
+    fig, ax = plt.subplots(2)
+
+    ax[0].plot(diameter_data.mean(axis=0), linewidth=1, label='Mean Tussock Diameter')
+    ax[0].fill_between(range(len(diameter_data.min(axis=0))), diameter_data.min(axis=0), diameter_data.max(axis=0), alpha=0.2, label='Range of Tussock Diameter')
+    ax[0].set_title('Tussock Diameter')
+    ax[0].set_ylabel('Diameter (cm)')
+    ax[0].set_xlabel('Time (yrs)')
+
+    ax[1].plot(diameter_growth.mean(axis=0), linewidth=1, label='Mean of Growth')
+    ax[1].fill_between(range(len(diameter_growth.min(axis=0))), diameter_growth.min(axis=0), diameter_growth.max(axis=0), alpha=0.2, label='Range of Growth')
+    ax[1].set_title('Tussock Growth')
+    ax[1].set_ylabel('Growth (cm/yr)')
+    ax[1].set_xlabel('Time (yrs)')
+
+    plt.tight_layout()
     plt.legend()
     plt.show()
 
-def num_tillers(data):
-    grouped = data.groupby(["TimeStep", "Status"]).size().unstack(fill_value=0)
+def tussock_height(df):
+    df = df.groupby("TimeStep")
 
-    total = grouped.sum(axis=1)
-    alive = grouped[1]  # represents alive status
-    dead = grouped[0]   # represents dead status
+    mean_height = df['Z'].mean()
+    return mean_height
 
-    return total, alive, dead
+def graph_heights(height_data):
+    fig, ax = plt.subplots()
 
-def plot_tiller_number(number_tiller_data):
-    fig, axs = plt.subplots(3, 1, figsize=(10, 8))
+    ax.plot(height_data.mean(axis=0), linewidth=1, label='Mean Height of Tussock from all Simulations')
+    ax.fill_between(range(len(height_data.min(axis=0))), height_data.min(axis=0), height_data.max(axis=0), alpha=0.2, label='Range of Mean Tussock Heights')
 
-    for i, label, color in zip([0, 1, 2], ["Total Tillers", "Alive Tillers", "Dead Tillers"], ['blue', 'green', 'brown']):
-        axs[i].set_title(label)
+    plt.show()
 
-        if len(number_tiller_data) == 1:
-            min_values = number_tiller_data[0][i].copy()
-            max_values = number_tiller_data[0][i].copy()
-        else:
-            min_values = number_tiller_data[0][i].copy()
-            max_values = number_tiller_data[0][i].copy()
+def compute_volumes(df):
+    df = df.groupby("TimeStep")
 
-            for j, data in enumerate(number_tiller_data[1:]):
-                min_values = np.minimum(min_values, data[i])
-                max_values = np.maximum(max_values, data[i])
+    tussock_volumes = []
+    alive_volumes = []
+    dead_volumes = []
 
-        mean_values = number_tiller_data[0][i].copy()
+    for timestep in df:
+        step_data = timestep[1]
 
-        for j, data in enumerate(number_tiller_data):
-            mean_values += data[i]
+        all_points = step_data[['X','Y','Z']]
+        alive_points = step_data[step_data['Status']==1][['X','Y','Z']]
+        dead_points = step_data[step_data['Status']==0][['X','Y','Z']]
 
-        mean_values /= len(number_tiller_data)
+        try:
+            tussock_volume = ConvexHull(all_points).volume
+            tussock_volumes.append(tussock_volume)
+        except Exception as e:
+            tussock_volumes.append(0)
 
-        axs[i].plot(mean_values, label='Mean', color=color)
+        try: 
+            alive_volume = ConvexHull(alive_points).volume
+            alive_volumes.append(alive_volume)
+        except Exception as e:
+            alive_volumes.append(0)
 
-        axs[i].fill_between(range(len(mean_values)), min_values, max_values, color=color, alpha=0.3, label='Min-Max Range')
+        try:
+            dead_volume = ConvexHull(dead_points).volume
+            dead_volumes.append(dead_volume)
+        except Exception as e:
+            dead_volumes.append(0)
+    
+    return tussock_volumes, alive_volumes, dead_volumes
 
-        axs[i].legend()
+def graph_volume(volumes):
+    total_volumes = np.array(volumes['total'])
+    alive_volumes = np.array(volumes['alive'])
+    dead_volumes = np.array(volumes['dead'])
+
+    fig, ax = plt.subplots(3)
+
+    ax[0].plot(total_volumes.mean(axis=0), linewidth=1, color='b', label='Mean Above Ground Volume')
+    ax[0].fill_between(range(len(total_volumes.min(axis=0))), total_volumes.min(axis=0), total_volumes.max(axis=0), alpha=0.2, color='b', label='Range of Above Ground Volume')
+    ax[0].set_title('Total Tussock Volume')
+    ax[0].set_ylabel('Volume (cm^3)')
+    ax[0].set_xlabel('Time (yrs)')
+
+    ax[1].plot(alive_volumes.mean(axis=0), linewidth=1, color='g', label='Mean Above Ground Volume')
+    ax[1].fill_between(range(len(alive_volumes.min(axis=0))), alive_volumes.min(axis=0), alive_volumes.max(axis=0), alpha=0.2, color='g', label='Range of Above Ground Volume')
+    ax[1].set_title('Living Tussock Volume')
+    ax[1].set_ylabel('Volume (cm^3)')
+    ax[1].set_xlabel('Time (yrs)')
+
+    ax[2].plot(dead_volumes.mean(axis=0), linewidth=1, color='brown', label='Mean Above Ground Volume')
+    ax[2].fill_between(range(len(dead_volumes.min(axis=0))), dead_volumes.min(axis=0), dead_volumes.max(axis=0), alpha=0.2, color='brown', label='Range of Above Ground Volume')
+    ax[2].set_title('Dead Tussock Volume')
+    ax[2].set_ylabel('Volume (cm^3)')
+    ax[2].set_xlabel('Time (yrs)')
 
     plt.tight_layout()
-    plt.xlabel('Time (yrs)')
-    plt.ylabel('Number')
     plt.show()
-    
-def tillering_rate(data):
+
+def rootVolume(df):
     pass
 
-def point_scatter_3d(data):
-    output_dir = 'scatter_plot_frames'
-    os.makedirs(output_dir, exist_ok=True)
+def main():
+    args = parse_args()
 
-    for timestep in data['TimeStep'].unique():
-        fig = plt.figure()
-        ax = fig.add_subplot(111, projection='3d')
+    tussock_diameters = []
+    tussock_heights = []
 
-        timestep_data = data[data['TimeStep'] == timestep]
+    volumes = dict()
+    volumes['total'] = []
+    volumes['alive'] = []
+    volumes['dead'] = []
+    
+    for sim in range(int(args.nsims)):
+        sim_data = pd.read_csv(f'{args.filepath}/tiller_data_sim_num_{sim}.csv')
 
-        ax.scatter(
-            timestep_data[timestep_data['Status'] == 1]['X'],
-            timestep_data[timestep_data['Status'] == 1]['Y'],
-            timestep_data[timestep_data['Status'] == 1]['Z'],
-            color='green',
-            label='Alive'
-        )
+        # tussock_diameters.append(tussockDiameter(sim_data, args))
 
-        ax.scatter(
-            timestep_data[timestep_data['Status'] == 0]['X'],
-            timestep_data[timestep_data['Status'] == 0]['Y'],
-            timestep_data[timestep_data['Status'] == 0]['Z'],
-            color='brown',
-            label='Dead'
-        )
+        # tussock_heights.append(tussock_height(sim_data))
 
-        ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_zlabel('Z')
-        ax.set_title(f'Time Step: {timestep}')
-        ax.legend()
+        tussock_volume, alive_volume, dead_volume = compute_volumes(sim_data)
+        volumes['total'].append(tussock_volume)
+        volumes['alive'].append(alive_volume)
+        volumes['dead'].append(dead_volume)
 
-        # ax.set_xlim(-10, 10)
-        # ax.set_ylim(-10, 10)
-        # ax.set_zlim(0, 2)
+    # tussock_diameters = np.array(tussock_diameters)
+    # tussock_heights = np.array(tussock_heights)
 
-        frame_filename = os.path.join(output_dir, f'frame_{timestep:03d}.png')
-        plt.savefig(frame_filename)
-        plt.close()
+    # graph_diameters(tussock_diameters)
+    # graph_heights(tussock_heights)
+    graph_volume(volumes)
 
-    frames = []
-    for timestep in data['TimeStep'].unique():
-        frame_filename = os.path.join(output_dir, f'frame_{timestep:03d}.png')
-        frames.append(Image.open(frame_filename))
-
-    output_gif_filename = 'growth.gif'
-    frames[0].save(output_gif_filename, save_all=True, append_images=frames[1:], duration=50, loop=0)
-
-    for frame_filename in os.listdir(output_dir):
-        os.remove(os.path.join(output_dir, frame_filename))
-    os.rmdir(output_dir)
-
-def compute_volume(df, output_folder='frames'):
-
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
-
-    alive_volumes = [] 
-    dead_volumes = []
-    root_volumes = []
-
-    for timestep in range(df['TimeStep'].max() + 1):
-
-        timestep_data = df[df['TimeStep'] == timestep]
-
-        alive_tillers = timestep_data[timestep_data['Status'] == 1][['X', 'Y', 'Z']].values
-        dead_tillers = timestep_data[timestep_data['Status'] == 0][['X','Y','Z']].values
-
-        if len(alive_tillers) < 3:
-            continue
-
-        try:
-            alive_volume = ConvexHull(alive_tillers)
-            dead_volume = ConvexHull(dead_tillers)
-
-            alive_bottom = np.argsort(alive_volume.points[:, 2])
-
-            root_top = alive_volume.points[alive_bottom]
-            root_bottom = np.copy(root_top)
-            root_bottom[:, 2] = -100  # Extend the root shape downward to z=-100
-
-            root = np.vstack((root_top, root_bottom))
-
-            root_necromass_volume = ConvexHull(root)
-
-            fig = plt.figure(figsize=(12, 6))
-
-            ax1 = fig.add_subplot(121, projection="3d")
-            
-            ax1.plot_trisurf(*zip(*alive_tillers[alive_volume.vertices]), color='green', alpha=0.5, label='Alive')
-            ax1.plot_trisurf(*zip(*dead_tillers[dead_volume.vertices]), color='brown', alpha=0.5, label='Dead')
-            # ax1.plot_trisurf(*zip(*root[root_necromass_volume.vertices]), color='black', alpha=0.5, label='Root Necromass')
-
-            ax1.set_title(f'Time Step: {timestep}')
-
-            ax2 = fig.add_subplot(122)
-
-            alive_volumes.append(alive_volume.volume)
-            dead_volumes.append(dead_volume.volume - alive_volume.volume)
-            root_volumes.append(root_necromass_volume.volume)
-
-            ax2.plot(range(len(alive_volumes)), alive_volumes, color='green', label='Alive')
-            ax2.plot(range(len(dead_volumes)), dead_volumes, color='brown', label='Dead')
-            ax2.plot(range(len(root_volumes)), root_volumes, color='black', label='Root Necromass')
-
-            ax2.set_title('Tussock Volume')
-            ax2.set_xlabel('Time Step')
-            ax2.set_ylabel('Volume')
-
-            frame_path = os.path.join(output_folder, f'frame_{timestep:03d}.png')
-            plt.legend()
-            plt.savefig(frame_path)
-            plt.close()
-
-        except Exception as e:
-            print(f"Error processing frame {timestep}: {e}")
-
-    images = []
-    for i in range(df['TimeStep'].max() + 1):
-        try:
-            images.append(Image.open(os.path.join(output_folder, f'frame_{i:03d}.png')))
-        except:
-            continue
-
-    images[0].save('tussock_volume.gif', save_all=True, append_images=images[1:], duration=50, loop=0)
-
-    for i in range(df['TimeStep'].max() + 1):
-        frame_path = os.path.join(output_folder, f'frame_{i:03d}.png')
-        if os.path.exists(frame_path):
-            os.remove(frame_path)
-    os.rmdir(output_folder)
+        
 
 
 if __name__ == "__main__":
