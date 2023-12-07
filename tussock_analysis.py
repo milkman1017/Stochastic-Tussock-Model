@@ -18,8 +18,32 @@ def parse_args():
 def numberOfTillers(df):
     df = df.groupby('TimeStep')
 
+    total_tillers = []
+    alive_tillers = []
+    dead_tillers = []
+
     for timestep in df:
         stepdata = timestep[1]
+
+        total_tiller = len(stepdata)
+        alive_tiller = len(stepdata[stepdata['Status']==1])
+        dead_tiller = len(stepdata[stepdata['Status']==0])
+
+        total_tillers.append(total_tiller)
+        alive_tillers.append(alive_tiller)
+        dead_tillers.append(dead_tiller)
+        
+    return total_tillers, alive_tillers, dead_tillers
+
+def graph_tiller_number(tiller_number):
+    total_tillers = np.array(tiller_number['total'])
+    alive_tillers = np.array(tiller_number['alive'])
+    dead_tillers = np.array(tiller_number['dead'])
+
+    for data in alive_tillers:
+        plt.plot(data, linewidth=1)
+    
+    plt.show()
 
 def tussockDiameter(df):
     df = df.groupby("TimeStep")
@@ -133,8 +157,40 @@ def graph_volume(volumes):
     plt.tight_layout()
     plt.show()
 
-def rootVolume(df):
-    pass
+def calculate_root_volume(df):
+    df = df.groupby("TimeStep")
+
+    live_root_volumes = []
+    dead_root_volumes = []
+
+
+    for timestep in df:
+        stepdata = timestep[1]
+
+        try:
+            dead_root_volume = np.round(dead_root_volumes[-1] + live_root_volumes[-1]/2,2) #assume dead roots are half the diameter as the live ones, but same length, also assume roots dont decay
+            dead_root_volumes.append(dead_root_volume)
+        except Exception as e:
+            dead_root_volumes.append(0)
+
+        live_root_volume = np.round(stepdata['NumRoots'].sum() * np.pi * 0.3**2 * 100, 2)  #volume of roots is assuming they are a cylinder extending down to permafrost (approx 100 cm) and of thickness 6 mm (3 mm diameter)
+        live_root_volumes.append(live_root_volume)
+
+    return live_root_volumes, dead_root_volumes
+
+def graph_root_volumes(root_volumes):
+    alive_root_volumes = np.array(root_volumes['alive'])
+    dead_root_volumes = np.array(root_volumes['dead'])
+
+    fig, ax = plt.subplots(2)
+
+    for data in alive_root_volumes:
+        ax[0].plot(data)
+
+    for data in dead_root_volumes:
+        ax[1].plot(data)
+
+    plt.show()
 
 def main():
     args = parse_args()
@@ -146,28 +202,45 @@ def main():
     volumes['total'] = []
     volumes['alive'] = []
     volumes['dead'] = []
+
+    tiller_number = dict()
+    tiller_number['total'] = []
+    tiller_number['alive'] = []
+    tiller_number['dead'] = []
+
+    root_volumes = dict()
+    root_volumes['alive'] = []
+    root_volumes['dead'] = []
     
     for sim in range(int(args.nsims)):
         sim_data = pd.read_csv(f'{args.filepath}/tiller_data_sim_num_{sim}.csv')
 
-        # tussock_diameters.append(tussockDiameter(sim_data, args))
+        # tussock_diameters.append(tussockDiameter(sim_data))
 
         # tussock_heights.append(tussock_height(sim_data))
 
-        tussock_volume, alive_volume, dead_volume = compute_volumes(sim_data)
-        volumes['total'].append(tussock_volume)
-        volumes['alive'].append(alive_volume)
-        volumes['dead'].append(dead_volume)
+        # tussock_volume, alive_volume, dead_volume = compute_volumes(sim_data)
+        # volumes['total'].append(tussock_volume)
+        # volumes['alive'].append(alive_volume)
+        # volumes['dead'].append(dead_volume)
+
+        # total_tillers, alive_tillers, dead_tillers = numberOfTillers(sim_data)
+        # tiller_number['total'].append(total_tillers)
+        # tiller_number['alive'].append(alive_tillers)
+        # tiller_number['dead'].append(dead_tillers)\
+
+        alive_root_volumes, dead_root_volumes = calculate_root_volume(sim_data)
+        root_volumes['alive'].append(alive_root_volumes)
+        root_volumes['dead'].append(dead_root_volumes)
 
     # tussock_diameters = np.array(tussock_diameters)
     # tussock_heights = np.array(tussock_heights)
 
     # graph_diameters(tussock_diameters)
     # graph_heights(tussock_heights)
-    graph_volume(volumes)
-
-        
-
+    # graph_volume(volumes)
+    # graph_tiller_number(tiller_number)
+    graph_root_volumes(root_volumes)
 
 if __name__ == "__main__":
     main()
