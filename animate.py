@@ -60,9 +60,9 @@ def point_scatter_3d(data):
         ax.set_title(f'Time Step: {timestep}')
         ax.legend()
 
-        # ax.set_xlim(-10, 10)
-        # ax.set_ylim(-10, 10)
-        # ax.set_zlim(0, 2)
+        ax.set_xlim(-15, 15)
+        ax.set_ylim(-15, 15)
+        ax.set_zlim(0, 20)
 
         frame_filename = os.path.join(output_dir, f'frame_{timestep:03d}.png')
         plt.savefig(frame_filename)

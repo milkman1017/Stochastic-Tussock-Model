@@ -117,7 +117,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
     
                     double tillerEvent = dis(gen);
 
-                    if (tillerEvent < tillering_matrix[size_class-1] / (0.5*distance)) {
+                    if (tillerEvent < tillering_matrix[size_class-1] / (0.05*distance)) {
                         Tiller newTiller = tiller.makeDaughter();
                         newTillers.push_back(newTiller); //store new tiller separately, add into total data at the end of iterating through every current tiller
                         // resolveOverlaps(newTillers)
@@ -155,7 +155,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
             else { //now iterate through dead tillers
 
                 //simulate decay, only add tillers into the data which are not decayed
-                tiller.growRadius(-0.005);
+                tiller.growRadius(-0.02);
                 tiller.growRoots(0);
                 if (tiller.getRadius() >= 0.01) {
                     step_data.emplace_back(tiller.getAge(), tiller.getSizeClass(), tiller.getRadius(), tiller.getX(), tiller.getY(), tiller.getZ(), tiller.getNumRoots(), tiller.getStatus());
