@@ -26,7 +26,7 @@ def main():
     data = pd.read_csv(f'{args.filepath}/tiller_data_sim_num_{args.sim_id}.csv')
     
     point_scatter_3d(data)
-    compute_volume(data)
+    # compute_volume(data)
 
 def point_scatter_3d(data):
     output_dir = 'scatter_plot_frames'
@@ -79,6 +79,8 @@ def point_scatter_3d(data):
     for frame_filename in os.listdir(output_dir):
         os.remove(os.path.join(output_dir, frame_filename))
     os.rmdir(output_dir)
+
+    print('Stem bases animated')
 
 def compute_volume(df, output_folder='frames'):
 

@@ -40,9 +40,28 @@ def graph_tiller_number(tiller_number):
     alive_tillers = np.array(tiller_number['alive'])
     dead_tillers = np.array(tiller_number['dead'])
 
-    for data in alive_tillers:
-        plt.plot(data, linewidth=1)
-    
+    fig, ax = plt.subplots(3)
+
+    ax[0].plot(total_tillers.mean(axis=0), linewidth=1, color='b', label='Number of Total Tillers')
+    ax[0].fill_between(range(len(total_tillers.min(axis=0))), total_tillers.min(axis=0), total_tillers.max(axis=0), color='b', alpha=0.2, label='Range of Total Tillers')
+    ax[0].set_xlabel('Time (yrs)')
+    ax[0].set_ylabel('Num of Tillers')
+    plt.legend()
+
+    ax[1].plot(alive_tillers.mean(axis=0), linewidth=1, color='g', label='Number of Alive Tillers')
+    ax[1].fill_between(range(len(alive_tillers.min(axis=0))), alive_tillers.min(axis=0), alive_tillers.max(axis=0), color='g', alpha=0.2, label='Range of Alive Tillers')
+    ax[1].set_xlabel('Time (yrs)')
+    ax[1].set_ylabel('Num of Tillers')
+    plt.legend()
+
+    ax[2].plot(dead_tillers.mean(axis=0), linewidth=1, color='brown', label='Number of Dead Tillers')
+    ax[2].fill_between(range(len(dead_tillers.min(axis=0))), dead_tillers.min(axis=0), dead_tillers.max(axis=0), color='brown', alpha=0.2, label='Range of Dead Tillers')
+    ax[2].set_xlabel('Time (yrs)')
+    ax[2].set_ylabel('Num of Tillers')
+
+    plt.legend()
+    plt.title('Number of Tillers')
+    plt.tight_layout()
     plt.show()
 
 def tussockDiameter(df):
@@ -92,7 +111,7 @@ def graph_heights(height_data):
 
     ax.plot(height_data.mean(axis=0), linewidth=1, label='Mean Height of Tussock from all Simulations')
     ax.fill_between(range(len(height_data.min(axis=0))), height_data.min(axis=0), height_data.max(axis=0), alpha=0.2, label='Range of Mean Tussock Heights')
-
+    plt.title('Tussock Height')
     plt.show()
 
 def compute_volumes(df):
@@ -189,7 +208,8 @@ def graph_root_volumes(root_volumes):
 
     for data in dead_root_volumes:
         ax[1].plot(data)
-
+        
+    plt.title('Root Volumes')
     plt.show()
 
 def main():
@@ -215,31 +235,31 @@ def main():
     for sim in range(int(args.nsims)):
         sim_data = pd.read_csv(f'{args.filepath}/tiller_data_sim_num_{sim}.csv')
 
-        # tussock_diameters.append(tussockDiameter(sim_data))
+        tussock_diameters.append(tussockDiameter(sim_data))
 
-        # tussock_heights.append(tussock_height(sim_data))
+        tussock_heights.append(tussock_height(sim_data))
 
-        # tussock_volume, alive_volume, dead_volume = compute_volumes(sim_data)
-        # volumes['total'].append(tussock_volume)
-        # volumes['alive'].append(alive_volume)
-        # volumes['dead'].append(dead_volume)
+        tussock_volume, alive_volume, dead_volume = compute_volumes(sim_data)
+        volumes['total'].append(tussock_volume)
+        volumes['alive'].append(alive_volume)
+        volumes['dead'].append(dead_volume)
 
-        # total_tillers, alive_tillers, dead_tillers = numberOfTillers(sim_data)
-        # tiller_number['total'].append(total_tillers)
-        # tiller_number['alive'].append(alive_tillers)
-        # tiller_number['dead'].append(dead_tillers)\
+        total_tillers, alive_tillers, dead_tillers = numberOfTillers(sim_data)
+        tiller_number['total'].append(total_tillers)
+        tiller_number['alive'].append(alive_tillers)
+        tiller_number['dead'].append(dead_tillers)
 
         alive_root_volumes, dead_root_volumes = calculate_root_volume(sim_data)
         root_volumes['alive'].append(alive_root_volumes)
         root_volumes['dead'].append(dead_root_volumes)
 
-    # tussock_diameters = np.array(tussock_diameters)
-    # tussock_heights = np.array(tussock_heights)
+    tussock_diameters = np.array(tussock_diameters)
+    tussock_heights = np.array(tussock_heights)
 
-    # graph_diameters(tussock_diameters)
-    # graph_heights(tussock_heights)
-    # graph_volume(volumes)
-    # graph_tiller_number(tiller_number)
+    graph_diameters(tussock_diameters)
+    graph_heights(tussock_heights)
+    graph_volume(volumes)
+    graph_tiller_number(tiller_number)
     graph_root_volumes(root_volumes)
 
 if __name__ == "__main__":

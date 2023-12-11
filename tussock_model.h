@@ -6,7 +6,9 @@
 
 class Tiller {
     public:
-        Tiller (int age, int size_class, double radius, double x, double y, double z, int num_roots, bool status) : age(age), size_class(size_class), radius(radius), x(x), y(y), z(z), num_roots(num_roots), status(status) {}
+    Tiller(int age, int size_class, double radius, double x, double y, double z, int num_roots, bool status)
+        : age(age), size_class(size_class), radius(radius), x(x), y(y), z(z), num_roots(num_roots), status(status) {}
+
 
         int getSizeClass() const {return size_class;}
 
@@ -49,9 +51,10 @@ class Tiller {
 
             return (distance <= sumOfRadii);
         }
+
         void move(double move_angle){
         
-            double move_radius = 0.05;
+            double move_radius = 0.1;
             x += move_radius * std::cos(move_angle);
             y += move_radius * std::sin(move_angle);
         }
@@ -82,3 +85,5 @@ class Tiller {
         int num_roots;
         bool status; // 1 for alive, 0 for dead
 };
+
+

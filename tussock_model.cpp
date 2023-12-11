@@ -12,21 +12,30 @@ double calculater0(const Tiller& tiller) {
 }
 
 double calculateTillersDistance(const Tiller& tiller1, const Tiller& tiller2){
-    return std::sqrt(tiller1.getX() * tiller2.getX() + tiller1.getY() * tiller2.getY());
-
-
+    return std::sqrt((tiller1.getX() - tiller2.getX()) * (tiller1.getX() - tiller2.getX()) + ((tiller1.getY() - tiller2.getY()) * (tiller1.getY() - tiller2.getY())));
 
 }
 
 void resolveOverlaps(std::vector<Tiller>& tillers, std::random_device& rd) {
-    for (size_t i = 0; i < tillers.size(); ++i) {
-        for (size_t j = i + 1; j < tillers.size(); ++j) {
-            while (calculateTillersDistance(tillers[i], tillers[j]) < 1 && tillers[i].isOverlapping(tillers[j])){
-                tillers[i].move((rd() % 360) * (3.141 / 180));
+    bool overlapsExist = true;
+
+    while (overlapsExist) {
+        overlapsExist = false;  // Assume no overlaps initially
+
+        for (size_t i = 0; i < tillers.size(); ++i) {
+            for (size_t j = i + 1; j < tillers.size(); ++j) {
+               
+                if (calculateTillersDistance(tillers[i], tillers[j]) <= 1.0 && tillers[i].isOverlapping(tillers[j])) {
+                    overlapsExist = true;
+
+                    tillers[i].move((rd() % 360) * (3.141 / 180));
+                    tillers[j].move((rd() % 360) * (3.141 / 180));
+                }
             }
         }
     }
 }
+
 
 void input(int &sim_time, int &num_sims, std::string &outdir, long unsigned int &num_threads){
     std::cout << "Enter Simulation time in Years: ";
@@ -87,7 +96,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
         std::vector<Tiller> step_data;
         std::vector<Tiller> newTillers; // Store new tillers separately
 
-        // std::cout << "Time Step: " << time_step <<" Number of Tillers: " << previous_step.size() << '\n';
+        std::cout << "Time Step: " << time_step <<" Number of Tillers: " << previous_step.size() << '\n';
 
         int alive_tillers = 0;
 
@@ -101,14 +110,14 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
                 double surviveEvent = dis(gen);
 
                 //first determine if tiller lives or dies
-                if (surviveEvent < (survival_matrix[size_class-1] / (distance))) {  //if tiller lives, determine new size class from transition probabilities
+                if (surviveEvent < (survival_matrix[size_class-1] / (0.25*distance))) {  //if tiller lives, determine new size class from transition probabilities
                     //for now just divide the survival matrix probabilities by the distance from the center
                     //will need to get actual data to validate that this is good enough
                     //also to see what kind of relationship between distance and survival there is (linear, exponentional, etc)
     
                     double tillerEvent = dis(gen);
 
-                    if (tillerEvent < tillering_matrix[size_class-1] * (-2*distance) + 0.75) {
+                    if (tillerEvent < tillering_matrix[size_class-1] / (0.5*distance)) {
                         Tiller newTiller = tiller.makeDaughter();
                         newTillers.push_back(newTiller); //store new tiller separately, add into total data at the end of iterating through every current tiller
                         // resolveOverlaps(newTillers)
@@ -146,7 +155,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
             else { //now iterate through dead tillers
 
                 //simulate decay, only add tillers into the data which are not decayed
-                tiller.growRadius(-0.001);
+                tiller.growRadius(-0.005);
                 tiller.growRoots(0);
                 if (tiller.getRadius() >= 0.01) {
                     step_data.emplace_back(tiller.getAge(), tiller.getSizeClass(), tiller.getRadius(), tiller.getX(), tiller.getY(), tiller.getZ(), tiller.getNumRoots(), tiller.getStatus());
