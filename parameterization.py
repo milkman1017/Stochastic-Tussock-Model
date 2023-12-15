@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 
-#Run $ wget  "https://docs.google.com/spreadsheets/d/10GTAd_nk9Dk_p1eNLxz2D14TqNW_sVkA-c2kS2VzZDU/export?format=csv&edit#gid=0" -O "parameterization_data.csv" to get most recent data
+#Run $ wget  "https://docs.google.com/spreadsheets/d/1GfVrWWKMBeOzuNMu31YC-pTHkpYPN9guSKM_pvvei5U/export?format=csv&edit#gid=0" -O "parameterization_data.csv" to get most recent data
+
 
 def parameterizeSurviveEvent(df):
     counts, bins = np.histogram(df['Normal r0'], bins='auto')
