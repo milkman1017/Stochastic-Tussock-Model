@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <random>
 
+
 double calculater0(const Tiller& tiller) {
     return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY());
 }
@@ -41,6 +42,22 @@ void resolveOverlaps(std::vector<Tiller>& tillers, std::random_device& rd) {
     }
 }
 
+void readFromFile(const std::string& filename, double& ks, double& kr) {
+    std::ifstream inputFile(filename);
+
+    if (inputFile.is_open()) {
+        // Assuming the file format is "ks=value" and "kr=value"
+        inputFile.ignore(256, '=');
+        inputFile >> ks;
+
+        inputFile.ignore(256, '=');
+        inputFile >> kr;
+
+        inputFile.close();
+    } else {
+        std::cerr << "Unable to open file: " << filename << std::endl;
+    }
+}
 
 void input(int &sim_time, int &num_sims, std::string &outdir, long unsigned int &num_threads){
     std::cout << "Enter Simulation time in Years: ";
@@ -88,6 +105,10 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
         0.0000,0.0063,0.0782,0.1730,0.2739,0.3202,0.4054,0.3779,0.3776   //probability of tiller classes producing a daughter tiller
     };
 
+    double ks, kr;
+
+    readFromFile("parameters.txt", ks, kr);
+
     std::string out_file_name = outdir + "/tiller_data_sim_num_" + std::to_string(sim_id) + ".csv";
     std::ofstream outputFile(out_file_name, std::ios::ate);  // Open CSV file in append mode
 
@@ -101,7 +122,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
         std::vector<Tiller> step_data;
         std::vector<Tiller> newTillers; // Store new tillers separately
 
-        std::cout << "Time Step: " << time_step <<" Number of Tillers: " << previous_step.size() << '\n';
+        // std::cout << "Time Step: " << time_step <<" Number of Tillers: " << previous_step.size() << '\n';
 
         int alive_tillers = 0;
 
@@ -115,14 +136,14 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
                 double surviveEvent = dis(gen);
 
                 //first determine if tiller lives or dies
-                if (surviveEvent < (survival_matrix[size_class-1] / (0.2*distance))) {  //if tiller lives, determine new size class from transition probabilities
+                if (surviveEvent < (survival_matrix[size_class-1] / (ks*distance))) {  //if tiller lives, determine new size class from transition probabilities
                     //for now just divide the survival matrix probabilities by the distance from the center
                     //will need to get actual data to validate that this is good enough
                     //also to see what kind of relationship between distance and survival there is (linear, exponentional, etc)
     
                     double tillerEvent = dis(gen);
 
-                    if (tillerEvent < tillering_matrix[size_class-1] / (0.05*distance)) {
+                    if (tillerEvent < tillering_matrix[size_class-1] / (kr*distance)) {
                         Tiller newTiller = tiller.makeDaughter();
                         newTillers.push_back(newTiller); //store new tiller separately, add into total data at the end of iterating through every current tiller
                         // resolveOverlaps(newTillers)
@@ -194,6 +215,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
     }
     outputFile << big_buffer;
 }
+
 
 int main() {
     int sim_time;
