@@ -21,15 +21,20 @@ void resolveOverlaps(std::vector<Tiller>& tillers, std::random_device& rd) {
 
     while (overlapsExist) {
         overlapsExist = false;  // Assume no overlaps initially
-
         for (size_t i = 0; i < tillers.size(); ++i) {
             for (size_t j = i + 1; j < tillers.size(); ++j) {
                
-                if (calculateTillersDistance(tillers[i], tillers[j]) <= 1.0 && tillers[i].isOverlapping(tillers[j])) {
+                if (calculateTillersDistance(tillers[i], tillers[j]) < 3.5 && tillers[i].isOverlapping(tillers[j])) {
                     overlapsExist = true;
 
-                    tillers[i].move((rd() % 360) * (3.141 / 180));
-                    tillers[j].move((rd() % 360) * (3.141 / 180));
+                    double angle = atan2(tillers[j].getY() - tillers[i].getY(), tillers[j].getX() - tillers[i].getX());
+
+                    double distance = calculateTillersDistance(tillers[i], tillers[j]);
+                    double overlappingDistance = distance - (tillers[i].getRadius() + tillers[j].getRadius());
+
+                    tillers[i].move(angle, overlappingDistance);
+                    tillers[j].move(angle + M_PI, overlappingDistance);
+
                 }
             }
         }
@@ -110,7 +115,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
                 double surviveEvent = dis(gen);
 
                 //first determine if tiller lives or dies
-                if (surviveEvent < (survival_matrix[size_class-1] / (0.25*distance))) {  //if tiller lives, determine new size class from transition probabilities
+                if (surviveEvent < (survival_matrix[size_class-1] / (0.2*distance))) {  //if tiller lives, determine new size class from transition probabilities
                     //for now just divide the survival matrix probabilities by the distance from the center
                     //will need to get actual data to validate that this is good enough
                     //also to see what kind of relationship between distance and survival there is (linear, exponentional, etc)
@@ -154,8 +159,8 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
             } 
             else { //now iterate through dead tillers
 
-                //simulate decay, only add tillers into the data which are not decayed
-                tiller.growRadius(-0.02);
+                //simulate decay, only add tillers into the data which are not decayed for now decay is estimates at -10% biomass per year, lots of conflcting info, will need to do more lit review
+                tiller.decay();
                 tiller.growRoots(0);
                 if (tiller.getRadius() >= 0.01) {
                     step_data.emplace_back(tiller.getAge(), tiller.getSizeClass(), tiller.getRadius(), tiller.getX(), tiller.getY(), tiller.getZ(), tiller.getNumRoots(), tiller.getStatus());

@@ -38,10 +38,15 @@ def point_scatter_3d(data):
 
         timestep_data = data[data['TimeStep'] == timestep]
 
+
+        size = 10 * timestep_data[timestep_data['Status'] == 1]['Radius']
+
+
         ax.scatter(
             timestep_data[timestep_data['Status'] == 1]['X'],
             timestep_data[timestep_data['Status'] == 1]['Y'],
             timestep_data[timestep_data['Status'] == 1]['Z'],
+            s=timestep_data[timestep_data['Status']==1]['Radius'] * 50,
             color='green',
             label='Alive'
         )
@@ -50,6 +55,7 @@ def point_scatter_3d(data):
             timestep_data[timestep_data['Status'] == 0]['X'],
             timestep_data[timestep_data['Status'] == 0]['Y'],
             timestep_data[timestep_data['Status'] == 0]['Z'],
+            s=timestep_data[timestep_data['Status']==0]['Radius'] * 50,
             color='brown',
             label='Dead'
         )
@@ -161,6 +167,8 @@ def compute_volume(df, output_folder='frames'):
         if os.path.exists(frame_path):
             os.remove(frame_path)
     os.rmdir(output_folder)
+
+    print('volumes animated')
 
 
 if __name__ == "__main__":

@@ -52,11 +52,14 @@ class Tiller {
             return (distance <= sumOfRadii);
         }
 
-        void move(double move_angle){
+        void move(double move_angle, double move_distance){
         
-            double move_radius = 0.1;
-            x += move_radius * std::cos(move_angle);
-            y += move_radius * std::sin(move_angle);
+            x += move_distance * std::cos(move_angle);
+            y += move_distance * std::sin(move_angle);
+        }
+
+        void decay() {
+            radius -= 0.20 * radius;
         }
 
         Tiller makeDaughter() {
@@ -67,12 +70,12 @@ class Tiller {
             double yOffset = randomRadius * std::sin(randomAngle);
 
             //0.1 is to ensure that the daughter tiller is made slightly above the parent
-            // double zOffset = 0.1 * static_cast<double>(std::rand()) / RAND_MAX;
+            double zOffset = 0.1 * static_cast<double>(std::rand()) / RAND_MAX;
 
             double newX = x + xOffset;
             double newY = y + yOffset;
-            // double newZ = z + zOffset;
-            double newZ = z;
+            double newZ = z + zOffset;
+            // double newZ = z;
 
             return Tiller(1,1, 0.5, newX, newY, newZ, 3, 1);
 
@@ -85,5 +88,3 @@ class Tiller {
         int num_roots;
         bool status; // 1 for alive, 0 for dead
 };
-
-
