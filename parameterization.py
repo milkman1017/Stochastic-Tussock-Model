@@ -149,19 +149,25 @@ def variation_objective(config, iteration):
 
     return var_tussock_size_objective 
 
-def calculate_parameters(parameters, config):
+def calculate_parameters(parameters, config, iteration, previous_loss):
     optimization_data = pd.read_csv('./optimization_results.csv')
 
-    previous_loss = optimization_data['loss'].iloc[-1]
-
-    min_learning_rate = 1e-6 
+    min_learning_rate = 1e-6
     learning_rate = max(previous_loss / 10000, min_learning_rate)
+
+    # Exponential decay factor (adjust as needed)
+    decay_factor = 0.9
+
+    # Exponentially decay the learning rate
+    learning_rate *= decay_factor ** iteration
 
     grad_ks = np.gradient(optimization_data['loss'], optimization_data['ks'])
     grad_kr = np.gradient(optimization_data['loss'], optimization_data['kr'])
 
     parameters['ks'] = parameters['ks'] - learning_rate * np.sign(grad_ks[-1])
     parameters['kr'] = parameters['kr'] - learning_rate * np.sign(grad_kr[-1])
+
+    return learning_rate
 
 def write_parameters(parameters, config):
     outdir = config.get('Parameterization','outdir')
@@ -206,6 +212,8 @@ def main():
         #initialize random variables first
         parameters['ks'] = random.random()
         parameters['kr'] = random.random()
+        parameters['bs'] = random.random()
+        parameters['br'] = random.random()
 
         write_parameters(parameters, config)
 
@@ -218,10 +226,10 @@ def main():
 
         opt_iteration += 1
 
-    while dloss >= 5:
+    while dloss >= 10:
         print('Iteration: ', opt_iteration)
 
-        calculate_parameters(parameters, config)
+        learning_rate = calculate_parameters(parameters, config, opt_iteration, loss)
         write_parameters(parameters, config)
 
         tussock_model(config)
