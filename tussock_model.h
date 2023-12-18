@@ -49,7 +49,14 @@ class Tiller {
             double distance = std::sqrt(std::pow(x - other.getX(), 2) + std::pow(y - other.getY(), 2));
             double sumOfRadii = getRadius() + other.getRadius();
 
-            return (distance <= sumOfRadii);
+            double tiller1_base_height = 0.2 * age * z;
+            double tiller2_base_height = 0.2 * other.getAge() * other.getZ();
+
+            double tillers_height = tiller1_base_height + tiller2_base_height;
+            double not_overlapping_height = 0.2 * age + 0.2 * other.getAge();
+
+            return(distance <= sumOfRadii && tillers_height >= not_overlapping_height);
+
         }
 
         void move(double move_angle, double move_distance){
@@ -59,7 +66,7 @@ class Tiller {
         }
 
         void decay() {
-            radius -= 0.20 * radius;
+            radius *= 0.80;
         }
 
         Tiller makeDaughter() {

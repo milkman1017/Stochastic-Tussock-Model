@@ -59,8 +59,8 @@ def clean_data(sim_data, messy_data, config):
     last_time_step_rows = sim_data[sim_data['TimeStep'] == last_time_step]
 
     if any(last_time_step_rows['Status'] == 1):
-        observed_diameters = sim_data[sim_data['TimeStep'] <= last_time_step]['X'].tolist()
-        messy_data.extend(observed_diameters)
+        while len(messy_data) < sim_length + 1:
+            messy_data.append(500)
     else:
         while len(messy_data) < sim_length + 1:
             messy_data.append(0)
@@ -93,79 +93,92 @@ def mean_diameter_objective(config, iteration):
     sim_diameters = np.array(sim_diameters)
     mean_sim_diameters = np.mean(sim_diameters, axis=0)
 
+    output_dir = 'mean_diameter_frames'
+    os.makedirs(output_dir, exist_ok=True)
+
     plt.plot(mean_training_diameters, linewidth=1, label='Real Mean Tussock Diameter')
     plt.plot(mean_sim_diameters, linewidth=1, label='Predicted Mean Tussock Diameters')
     plt.ylabel('Tussock Diameter (cm)')
     plt.xlabel('Time (years)')
     plt.legend()
-    plt.savefig(f'Mean_Tuss_diameter_iteration_{iteration}.png')
+
+    frame_filename = os.path.join(output_dir, f'Mean_Tuss_diameter_iteration_{iteration}.png')
+    plt.savefig(frame_filename)
     plt.close()
     
     for mean_diameter in zip(mean_sim_diameters, mean_training_diameters):
-        mean_tussock_size_objective += np.sqrt((mean_diameter[0] - mean_diameter[1])**2)
+        mean_tussock_size_objective += (mean_diameter[0] - mean_diameter[1])**2
+    mean_tussock_size_objective = np.sqrt(mean_tussock_size_objective/len(mean_sim_diameters))
 
     del training_data
 
     return mean_tussock_size_objective
 
-def variation_objective(config, iteration):
+def num_tillers_objective(config, iteration):
     training_data = pd.read_csv('./parameterization_data.csv')
 
     num_sims = int(config.get('Tussock Model', 'nsims'))
     sim_filepath = config.get('Tussock Model', 'filepath')
     sim_length = int(config.get('Tussock Model', 'nyears'))
 
-    var_tussock_size_objective = 0
+    mean_num_tillers_objective = 0
 
-    var_training_diameters = training_data.groupby('Estimated_Age')['Diameter'].var().values
+    training_num_tillers = training_data.groupby('Estimated_Age')['Num_Alive_Tillers'].mean().values
 
-    sim_diameters = []
+    sim_num_tillers = []
 
     for i in range(num_sims):
         sim_data = pd.read_csv(f'{sim_filepath}/tiller_data_sim_num_{i}.csv')
 
-        sim_diameter = (sim_data.groupby('TimeStep')['X'].apply(lambda x: x.max() - x.min())).values.tolist()
+        sim_num_tiller = sim_data[sim_data['Status'] == 1].groupby('TimeStep').size().values.tolist()
 
-        if len(sim_diameter) != (sim_length + 1): #check if data needs to be cleaned
-            sim_diameter = clean_data(sim_data, sim_diameter, config)
+        if len(sim_num_tiller) != (sim_length + 1): #check if data needs to be cleaned
+            sim_num_tiller = clean_data(sim_data, sim_num_tiller, config)
 
-        sim_diameters.append(sim_diameter)
+        sim_num_tillers.append(sim_num_tiller)
 
-    sim_diameters = np.array(sim_diameters)
-    var_sim_diameters = np.var(sim_diameters, axis=0)
+    sim_num_tillers = np.array(sim_num_tillers)
+    mean_sim_num_tillers = np.mean(sim_num_tillers, axis=0)
 
-    plt.plot(var_training_diameters, linewidth=1, label='Real variation Tussock Diameter')
-    plt.plot(var_sim_diameters, linewidth=1, label='Predicted variation Tussock Diameters')
-    plt.ylabel('Tussock Diameter (cm)')
+    output_dir = 'num_tillers_frames'
+    os.makedirs(output_dir, exist_ok=True)
+
+    plt.plot(training_num_tillers, linewidth=1, label='Observed Mean Number of Tillers')
+    plt.plot(mean_sim_num_tillers, linewidth=1, label='Predicted Mean Number of Tillers')
+    plt.ylabel('Number of Tillers')
     plt.xlabel('Time (years)')
     plt.legend()
-    plt.savefig(f'variation_Tuss_diameter_iteration_{iteration}.png')
+
+    frame_filename = os.path.join(output_dir, f'num_tillers_iteration_{iteration}.png')
+    plt.savefig(frame_filename)
     plt.close()
     
-    for var_diameter in zip(var_sim_diameters, var_training_diameters):
-        var_tussock_size_objective += np.sqrt((var_diameter[0] - var_diameter[1])**2)
+    for mean_num in zip(mean_sim_num_tillers, training_num_tillers):
+        mean_num_tillers_objective += (mean_num[0] - mean_num[1])**2
+    mean_num_tillers_objective = np.sqrt(mean_num_tillers_objective/len(mean_sim_num_tillers))
 
     del training_data
 
-    return var_tussock_size_objective 
+    return mean_num_tillers_objective
 
 def calculate_parameters(parameters, config, iteration, previous_loss):
     optimization_data = pd.read_csv('./optimization_results.csv')
 
-    min_learning_rate = 1e-6
-    learning_rate = max(previous_loss / 10000, min_learning_rate)
+    learning_rate = previous_loss / 1000
 
-    # Exponential decay factor (adjust as needed)
     decay_factor = 0.9
 
-    # Exponentially decay the learning rate
     learning_rate *= decay_factor ** iteration
 
     grad_ks = np.gradient(optimization_data['loss'], optimization_data['ks'])
     grad_kr = np.gradient(optimization_data['loss'], optimization_data['kr'])
+    grad_bs = np.gradient(optimization_data['loss'], optimization_data['bs'])
+    grad_br = np.gradient(optimization_data['loss'], optimization_data['br'])
 
     parameters['ks'] = parameters['ks'] - learning_rate * np.sign(grad_ks[-1])
     parameters['kr'] = parameters['kr'] - learning_rate * np.sign(grad_kr[-1])
+    parameters['bs'] = parameters['bs'] - learning_rate * np.sign(grad_bs[-1])
+    parameters['br'] = parameters['br'] - learning_rate * np.sign(grad_br[-1])
 
     return learning_rate
 
@@ -176,8 +189,6 @@ def write_parameters(parameters, config):
     with open(f'{outdir}/parameters.txt', 'w') as file:
         for param_name, param_value in parameters.items():
             file.write(f"{param_name}={param_value}\n")
-
-
 
 def write_optimization_results(parameters, loss, iteration, config):
     outdir = config.get('Parameterization','outdir')
@@ -195,6 +206,20 @@ def write_optimization_results(parameters, loss, iteration, config):
             writer.writeheader()
 
         writer.writerow({**parameters, 'loss': loss})
+
+def animate_fitting(outdir, filename, iteration, outfilename):
+    frames = []
+
+    for timestep in range(iteration):
+        frame_filename = os.path.join(outdir, f'{filename}_{timestep}.png')
+        frames.append(Image.open(frame_filename))
+
+    frames[0].save(outfilename, save_all=True, append_images=frames[1:], duration=50, loop=0)
+
+    for frame_filename in os.listdir(outdir):
+        os.remove(os.path.join(outdir, frame_filename))
+    os.rmdir(outdir)
+
 
 def main():
     config = get_config()
@@ -218,15 +243,15 @@ def main():
         write_parameters(parameters, config)
 
         tussock_model(config)
-
+        
         #is this loss
-        loss = mean_diameter_objective(config, opt_iteration) 
+        loss = 0.5*mean_diameter_objective(config, opt_iteration) + num_tillers_objective(config, opt_iteration)
 
         write_optimization_results(parameters, loss, opt_iteration, config)
 
         opt_iteration += 1
 
-    while dloss >= 10:
+    while dloss >= 1:
         print('Iteration: ', opt_iteration)
 
         learning_rate = calculate_parameters(parameters, config, opt_iteration, loss)
@@ -235,30 +260,17 @@ def main():
         tussock_model(config)
 
         previous_loss = loss
-        loss = mean_diameter_objective(config, opt_iteration) 
+        loss = 0.5*mean_diameter_objective(config, opt_iteration) + num_tillers_objective(config, opt_iteration)
 
         dloss = abs(previous_loss - loss)
 
         write_optimization_results(parameters, loss, opt_iteration, config)
 
         opt_iteration+=1
+
+    animate_fitting('mean_diameter_frames', f'Mean_Tuss_diameter_iteration', opt_iteration, 'mean_diameter_fitting.gif')
     
-    frames = []
-    for timestep in range(opt_iteration):
-        frame_filename = f'Mean_Tuss_diameter_iteration_{timestep}.png'
-        frames.append(Image.open(frame_filename))
-
-    output_gif_filename = 'mean_tus_fitting.gif'
-    frames[0].save(output_gif_filename, save_all=True, append_images=frames[1:], duration=50, loop=0)
-
-    frames = []
-    for timestep in range(opt_iteration):
-        frame_filename = f'variation_Tuss_diameter_iteration_{timestep}.png'
-        frames.append(Image.open(frame_filename))
-
-    output_gif_filename = 'variation_tus_fitting.gif'
-    frames[0].save(output_gif_filename, save_all=True, append_images=frames[1:], duration=50, loop=0)
-
+    animate_fitting('num_tillers_frames', f'num_tillers_iteration', opt_iteration, 'num_tiller_fitting.gif')
 
 if __name__ == '__main__':
     main()

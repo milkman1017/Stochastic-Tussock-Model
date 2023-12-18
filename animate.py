@@ -38,9 +38,7 @@ def point_scatter_3d(data):
 
         timestep_data = data[data['TimeStep'] == timestep]
 
-
         size = 10 * timestep_data[timestep_data['Status'] == 1]['Radius']
-
 
         ax.scatter(
             timestep_data[timestep_data['Status'] == 1]['X'],
@@ -68,7 +66,7 @@ def point_scatter_3d(data):
 
         ax.set_xlim(-15, 15)
         ax.set_ylim(-15, 15)
-        ax.set_zlim(0, 20)
+        ax.set_zlim(0, 50)
 
         frame_filename = os.path.join(output_dir, f'frame_{timestep:03d}.png')
         plt.savefig(frame_filename)

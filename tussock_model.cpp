@@ -42,7 +42,7 @@ void resolveOverlaps(std::vector<Tiller>& tillers, std::random_device& rd) {
     }
 }
 
-void readFromFile(const std::string& filename, double& ks, double& kr) {
+void readFromFile(const std::string& filename, double& ks, double& kr, double& bs, double& br) {
     std::ifstream inputFile(filename);
 
     if (inputFile.is_open()) {
@@ -52,6 +52,12 @@ void readFromFile(const std::string& filename, double& ks, double& kr) {
 
         inputFile.ignore(256, '=');
         inputFile >> kr;
+
+        inputFile.ignore(256, '=');
+        inputFile >> bs;
+
+        inputFile.ignore(256, '=');
+        inputFile >> br;
 
         inputFile.close();
     } else {
@@ -105,9 +111,9 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
         0.0000,0.0063,0.0782,0.1730,0.2739,0.3202,0.4054,0.3779,0.3776   //probability of tiller classes producing a daughter tiller
     };
 
-    double ks, kr;
+    double ks, kr, bs, br;
 
-    readFromFile("parameters.txt", ks, kr);
+    readFromFile("parameters.txt", ks, kr, bs, br);
 
     std::string out_file_name = outdir + "/tiller_data_sim_num_" + std::to_string(sim_id) + ".csv";
     std::ofstream outputFile(out_file_name, std::ios::ate);  // Open CSV file in append mode
@@ -136,14 +142,14 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
                 double surviveEvent = dis(gen);
 
                 //first determine if tiller lives or dies
-                if (surviveEvent < (survival_matrix[size_class-1] / (ks*distance))) {  //if tiller lives, determine new size class from transition probabilities
+                if (surviveEvent < (survival_matrix[size_class-1] / (ks*distance)+bs)) {  //if tiller lives, determine new size class from transition probabilities
                     //for now just divide the survival matrix probabilities by the distance from the center
                     //will need to get actual data to validate that this is good enough
                     //also to see what kind of relationship between distance and survival there is (linear, exponentional, etc)
     
                     double tillerEvent = dis(gen);
 
-                    if (tillerEvent < tillering_matrix[size_class-1] / (kr*distance)) {
+                    if (tillerEvent < tillering_matrix[size_class-1] / (kr*distance)+br) {
                         Tiller newTiller = tiller.makeDaughter();
                         newTillers.push_back(newTiller); //store new tiller separately, add into total data at the end of iterating through every current tiller
                         // resolveOverlaps(newTillers)
@@ -201,7 +207,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
 
         previous_step = step_data;
 
-        if (alive_tillers > 500) {
+        if (alive_tillers > 400) {
             std::cout << "Too many alive tillers in simulation number: " << sim_id << "\n";
             break;
         }
