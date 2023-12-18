@@ -164,7 +164,7 @@ def num_tillers_objective(config, iteration):
 def calculate_parameters(parameters, config, iteration, previous_loss):
     optimization_data = pd.read_csv('./optimization_results.csv')
 
-    learning_rate = previous_loss / 1000
+    learning_rate = previous_loss / 100
 
     decay_factor = 0.9
 
@@ -175,10 +175,12 @@ def calculate_parameters(parameters, config, iteration, previous_loss):
     grad_bs = np.gradient(optimization_data['loss'], optimization_data['bs'])
     grad_br = np.gradient(optimization_data['loss'], optimization_data['br'])
 
-    parameters['ks'] = parameters['ks'] - learning_rate * np.sign(grad_ks[-1])
-    parameters['kr'] = parameters['kr'] - learning_rate * np.sign(grad_kr[-1])
-    parameters['bs'] = parameters['bs'] - learning_rate * np.sign(grad_bs[-1])
-    parameters['br'] = parameters['br'] - learning_rate * np.sign(grad_br[-1])
+    print(grad_ks)
+
+    parameters['ks'] = parameters['ks'] - learning_rate * grad_ks[-1]
+    parameters['kr'] = parameters['kr'] - learning_rate * grad_kr[-1]
+    parameters['bs'] = parameters['bs'] - learning_rate * grad_bs[-1]
+    parameters['br'] = parameters['br'] - learning_rate * grad_br[-1]
 
     return learning_rate
 
@@ -251,7 +253,7 @@ def main():
 
         opt_iteration += 1
 
-    while dloss >= 1:
+    while dloss >= 1 or loss > 100:
         print('Iteration: ', opt_iteration)
 
         learning_rate = calculate_parameters(parameters, config, opt_iteration, loss)
