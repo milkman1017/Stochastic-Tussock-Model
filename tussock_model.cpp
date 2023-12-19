@@ -169,7 +169,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
                         }
                     }
 
-                    tiller.growRadius(0.05);
+                    tiller.growRadius(0.01);
                     tiller.mature(1);  //increase age by one year, this will also increase the stem base by 2 mm
 
                     std::uniform_int_distribution<int> int_dis(2,4);

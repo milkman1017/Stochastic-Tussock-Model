@@ -8,6 +8,7 @@ import configparser
 import random
 import csv
 from PIL import Image
+import seaborn as sns
 
 #Run $ wget  "https://docs.google.com/spreadsheets/d/1GfVrWWKMBeOzuNMu31YC-pTHkpYPN9guSKM_pvvei5U/export?format=csv&edit#gid=0" -O "parameterization_data.csv" to get most recent data
 
@@ -36,12 +37,11 @@ def tussock_model(config):
 
     num_sims = int(config.get('Tussock Model', 'nsims'))
     outdir = config.get('Tussock Model', 'filepath')
-    sim_time = int(config.get('Tussock Model', 'nyears'))
     num_threads = int(config.get('Tussock Model','nthreads'))
 
+    sim_time = int(random.uniform(40, 200))
+
     if make_result.returncode == 0:
-        
-        num_threads = 10
 
         cpp_input = f"{sim_time}\n{num_sims}\n{outdir}\n{num_threads}\n"
 
@@ -58,131 +58,108 @@ def clean_data(sim_data, messy_data, config):
     last_time_step = sim_data['TimeStep'].max()
     last_time_step_rows = sim_data[sim_data['TimeStep'] == last_time_step]
 
+    if messy_data != []:
+        messy_last = messy_data[-1]
+    else: 
+        messy_last = 0
+
     if any(last_time_step_rows['Status'] == 1):
         while len(messy_data) < sim_length + 1:
-            messy_data.append(500)
+            messy_data.append(messy_last * 10)
     else:
         while len(messy_data) < sim_length + 1:
             messy_data.append(0)
 
     return messy_data
 
-def mean_diameter_objective(config, iteration):
-    training_data = pd.read_csv('./parameterization_data.csv')
+def diameter_objective(config, iteration):
+    training_data = pd.read_csv('./tussock_allometry.csv')
 
     num_sims = int(config.get('Tussock Model', 'nsims'))
     sim_filepath = config.get('Tussock Model', 'filepath')
-    sim_length = int(config.get('Tussock Model', 'nyears'))
 
-    mean_tussock_size_objective = 0
+    training_data['field_davg'] = pd.to_numeric(training_data['field_davg'], errors='coerce')
+    training_data['field_davg'] = training_data['field_davg'].astype(float)
 
-    mean_training_diameters = training_data.groupby('Estimated_Age')['Diameter'].mean().values
+    training_diameters = training_data['field_davg'].values
+
+    training_diameters = training_diameters[~np.isnan(training_diameters)]
+
+    obv_counts, obv_bins = np.histogram(training_diameters, bins='auto')
 
     sim_diameters = []
 
     for i in range(num_sims):
         sim_data = pd.read_csv(f'{sim_filepath}/tiller_data_sim_num_{i}.csv')
 
-        sim_diameter = (sim_data.groupby('TimeStep')['X'].apply(lambda x: x.max() - x.min())).values.tolist()
+        diameter = sim_data[sim_data['TimeStep'] == sim_data['TimeStep'].max()]['X'].max() - sim_data[sim_data['TimeStep'] == sim_data['TimeStep'].max()]['X'].min()
 
-        if len(sim_diameter) != (sim_length + 1): #check if data needs to be cleaned
-            sim_diameter = clean_data(sim_data, sim_diameter, config)
+        sim_diameters.append(diameter)
 
-        sim_diameters.append(sim_diameter)
+    model_counts, model_bins = np.histogram(sim_diameters, bins='auto')
 
-    sim_diameters = np.array(sim_diameters)
-    mean_sim_diameters = np.mean(sim_diameters, axis=0)
+
+    common_bins = np.linspace(min(min(obv_bins), min(model_bins)),
+                            max(max(obv_bins), max(model_bins)),
+                            num=100)
+
+    common_bins = np.union1d(common_bins, obv_bins[:-1])
+    common_bins = np.union1d(common_bins, model_bins[:-1])
+
+    obs_dist = np.interp(common_bins, obv_bins[:-1], obv_counts, left=0, right=0)
+    model_dist = np.interp(common_bins, model_bins[:-1], model_counts, left=0, right=0)
+
+    squared_diff = (obs_dist - model_dist) ** 2
+
+    penalty = 1.0  # penality for non-overlapping bins, forces the distributions to align
+    non_overlapping_obs_bins = set(obv_bins[:-1]) - set(common_bins)
+    non_overlapping_model_bins = set(model_bins[:-1]) - set(common_bins)
+
+    for bin_value in non_overlapping_obs_bins:
+        squared_diff += penalty * obs_dist[common_bins == bin_value] ** 2
+
+    for bin_value in non_overlapping_model_bins:
+        squared_diff += penalty * model_dist[common_bins == bin_value] ** 2
+
+    rmse = np.sqrt(np.mean(squared_diff))
 
     output_dir = 'mean_diameter_frames'
     os.makedirs(output_dir, exist_ok=True)
 
-    plt.plot(mean_training_diameters, linewidth=1, label='Real Mean Tussock Diameter')
-    plt.plot(mean_sim_diameters, linewidth=1, label='Predicted Mean Tussock Diameters')
-    plt.ylabel('Tussock Diameter (cm)')
-    plt.xlabel('Time (years)')
+    sns.kdeplot(training_diameters, linewidth=1, label='Observed Tussock Diametesr')
+    sns.kdeplot(sim_diameters, linewidth=1, label='Predicted Tussock Diameters')
+    plt.ylabel('Kernel Density')
+    plt.xlabel('Diameter (cm)')
     plt.legend()
 
     frame_filename = os.path.join(output_dir, f'Mean_Tuss_diameter_iteration_{iteration}.png')
     plt.savefig(frame_filename)
     plt.close()
-    
-    for mean_diameter in zip(mean_sim_diameters, mean_training_diameters):
-        mean_tussock_size_objective += (mean_diameter[0] - mean_diameter[1])**2
-    mean_tussock_size_objective = np.sqrt(mean_tussock_size_objective/len(mean_sim_diameters))
 
     del training_data
-
-    return mean_tussock_size_objective
-
-def num_tillers_objective(config, iteration):
-    training_data = pd.read_csv('./parameterization_data.csv')
-
-    num_sims = int(config.get('Tussock Model', 'nsims'))
-    sim_filepath = config.get('Tussock Model', 'filepath')
-    sim_length = int(config.get('Tussock Model', 'nyears'))
-
-    mean_num_tillers_objective = 0
-
-    training_num_tillers = training_data.groupby('Estimated_Age')['Num_Alive_Tillers'].mean().values
-
-    sim_num_tillers = []
-
-    for i in range(num_sims):
-        sim_data = pd.read_csv(f'{sim_filepath}/tiller_data_sim_num_{i}.csv')
-
-        sim_num_tiller = sim_data[sim_data['Status'] == 1].groupby('TimeStep').size().values.tolist()
-
-        if len(sim_num_tiller) != (sim_length + 1): #check if data needs to be cleaned
-            sim_num_tiller = clean_data(sim_data, sim_num_tiller, config)
-
-        sim_num_tillers.append(sim_num_tiller)
-
-    sim_num_tillers = np.array(sim_num_tillers)
-    mean_sim_num_tillers = np.mean(sim_num_tillers, axis=0)
-
-    output_dir = 'num_tillers_frames'
-    os.makedirs(output_dir, exist_ok=True)
-
-    plt.plot(training_num_tillers, linewidth=1, label='Observed Mean Number of Tillers')
-    plt.plot(mean_sim_num_tillers, linewidth=1, label='Predicted Mean Number of Tillers')
-    plt.ylabel('Number of Tillers')
-    plt.xlabel('Time (years)')
-    plt.legend()
-
-    frame_filename = os.path.join(output_dir, f'num_tillers_iteration_{iteration}.png')
-    plt.savefig(frame_filename)
-    plt.close()
-    
-    for mean_num in zip(mean_sim_num_tillers, training_num_tillers):
-        mean_num_tillers_objective += (mean_num[0] - mean_num[1])**2
-    mean_num_tillers_objective = np.sqrt(mean_num_tillers_objective/len(mean_sim_num_tillers))
-
-    del training_data
-
-    return mean_num_tillers_objective
+    return rmse
 
 def calculate_parameters(parameters, config, iteration, previous_loss):
     optimization_data = pd.read_csv('./optimization_results.csv')
+    gradients = dict()
 
-    learning_rate = previous_loss / 100
+    learning_rate = previous_loss/1000
 
-    decay_factor = 0.9
+    print('unclipped learning rate: ', learning_rate)
+    # learning_rate = np.clip(learning_rate, 0.00001, max_learning_rate)
+    print('clipped learning rate: ', learning_rate)
+    for key in parameters:
+        gradient = np.gradient(optimization_data['loss'], optimization_data[key])
+        print('gradient: ', gradient[-1])
+        norm_gradient = gradient / np.linalg.norm(gradient, ord=2)
+        print('norm_gradient: ', norm_gradient[-1])
+        parameter_change = learning_rate * norm_gradient[-1] 
+        print('unclipped parameter change: ', parameter_change)
+        parameter_change = np.clip(parameter_change, -0.1, 0.1)
+        print('clipped parameter change: ', parameter_change)
+        parameters[key] = parameters[key] - parameter_change
 
-    learning_rate *= decay_factor ** iteration
-
-    grad_ks = np.gradient(optimization_data['loss'], optimization_data['ks'])
-    grad_kr = np.gradient(optimization_data['loss'], optimization_data['kr'])
-    grad_bs = np.gradient(optimization_data['loss'], optimization_data['bs'])
-    grad_br = np.gradient(optimization_data['loss'], optimization_data['br'])
-
-    print(grad_ks)
-
-    parameters['ks'] = parameters['ks'] - learning_rate * grad_ks[-1]
-    parameters['kr'] = parameters['kr'] - learning_rate * grad_kr[-1]
-    parameters['bs'] = parameters['bs'] - learning_rate * grad_bs[-1]
-    parameters['br'] = parameters['br'] - learning_rate * grad_br[-1]
-
-    return learning_rate
+    return gradients
 
 def write_parameters(parameters, config):
     outdir = config.get('Parameterization','outdir')
@@ -237,32 +214,34 @@ def main():
         print('Iteration: ', opt_iteration)
 
         #initialize random variables first
-        parameters['ks'] = random.random()
-        parameters['kr'] = random.random()
-        parameters['bs'] = random.random()
-        parameters['br'] = random.random()
+        parameters['ks'] = np.random.uniform(0, 0.5)
+        parameters['kr'] = random.uniform(0, 0.5)
+        parameters['bs'] = random.uniform(0, 0.1)
+        parameters['br'] = random.uniform(0, 0.1)
 
         write_parameters(parameters, config)
 
         tussock_model(config)
         
         #is this loss
-        loss = 0.5*mean_diameter_objective(config, opt_iteration) + num_tillers_objective(config, opt_iteration)
+        loss = diameter_objective(config, opt_iteration)
 
         write_optimization_results(parameters, loss, opt_iteration, config)
 
         opt_iteration += 1
 
-    while dloss >= 1 or loss > 100:
+    print('dloss: ', dloss, ' loss: ', loss)
+    while opt_iteration  < 50:
+        print('dloss: ', dloss, ' loss: ', loss)
         print('Iteration: ', opt_iteration)
 
-        learning_rate = calculate_parameters(parameters, config, opt_iteration, loss)
+        gradients = calculate_parameters(parameters, config, opt_iteration, loss)
         write_parameters(parameters, config)
 
         tussock_model(config)
 
         previous_loss = loss
-        loss = 0.5*mean_diameter_objective(config, opt_iteration) + num_tillers_objective(config, opt_iteration)
+        loss = diameter_objective(config, opt_iteration)
 
         dloss = abs(previous_loss - loss)
 
@@ -270,9 +249,9 @@ def main():
 
         opt_iteration+=1
 
-    animate_fitting('mean_diameter_frames', f'Mean_Tuss_diameter_iteration', opt_iteration, 'mean_diameter_fitting.gif')
+    animate_fitting('mean_diameter_frames', f'Mean_Tuss_diameter_iteration', opt_iteration, 'diameter_dist_fitting.gif')
     
-    animate_fitting('num_tillers_frames', f'num_tillers_iteration', opt_iteration, 'num_tiller_fitting.gif')
+    # animate_fitting('num_tillers_frames', f'num_tillers_iteration', opt_iteration, 'num_tiller_fitting.gif')
 
 if __name__ == '__main__':
     main()

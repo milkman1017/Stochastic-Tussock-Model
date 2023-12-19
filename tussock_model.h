@@ -38,7 +38,7 @@ class Tiller {
 
         void mature (int age_growth) {
             age += age_growth;
-            z += 0.2;   //simulates the growth of the stem base every year
+            z += 0.1;   //simulates the growth of the stem base every year
         }
 
         void growRoots(int new_roots) {
@@ -66,7 +66,9 @@ class Tiller {
         }
 
         void decay() {
-            radius *= 0.80;
+            double decay_amount = 1 - (0.04 + static_cast<double>(std::rand()) / (RAND_MAX / (0.40 - 0.04)));
+
+            radius *= decay_amount;
         }
 
         Tiller makeDaughter() {
