@@ -100,7 +100,7 @@ def diameter_objective(config, iteration):
         if num_alive_tillers >= 2*num_dead_tillers:
             diameter = 60
         else:
-            diameter = sim_data[sim_data['TimeStep'] == sim_data['TimeStep'].max()]['X'].max() - sim_data[sim_data['TimeStep'] == sim_data['TimeStep'].max()]['X'].min()
+            diameter = abs(sim_data[sim_data['TimeStep'] == sim_data['TimeStep'].max()]['X'].max() - sim_data[sim_data['TimeStep'] == sim_data['TimeStep'].max()]['X'].min())
 
         if diameter == 0.0:
             diameter=1
@@ -109,10 +109,6 @@ def diameter_objective(config, iteration):
             sim_diameters.append(diameter)
         
     model_hist, model_bins = np.histogram(sim_diameters, bins=obv_bins, density=True)
-
-    print(obv_hist)
-    print('-------')
-    print(model_hist)
 
     rmse = np.sqrt(np.mean((obv_hist - model_hist)**2))
 
@@ -138,12 +134,13 @@ def calculate_parameters(parameters, config, iteration, previous_loss, dloss):
     if dloss ==0.0:
         learning_rate = previous_loss
     else:
-        learning_rate = previous_loss/100
+        learning_rate = previous_loss/10
 
-    print('unclipped learning rate: ', learning_rate)
-    # learning_rate = np.clip(learning_rate, 0.00001, max_learning_rate)
-    print('clipped learning rate: ', learning_rate)
+
+    print('learning rate: ', learning_rate)
+    print('-------')
     for key in parameters:
+        print('Parameter: ', key)
         gradient = np.gradient(optimization_data['loss'], optimization_data[key])
         if gradient[-1] == 0.0:
             parameters[key] = parameters[key] - learning_rate
@@ -210,6 +207,7 @@ def main():
     dloss=100
 
     while opt_iteration <= 1:
+        print('------')
         print('Iteration: ', opt_iteration)
 
         globals = np.random.random(2)
@@ -236,6 +234,7 @@ def main():
 
     print('dloss: ', dloss, ' loss: ', loss)
     while opt_iteration  < 100 and loss > 0.02:
+        print('-----')
         print('dloss: ', dloss, ' loss: ', loss)
         print('Iteration: ', opt_iteration)
 
