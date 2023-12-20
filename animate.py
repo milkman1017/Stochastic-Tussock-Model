@@ -38,8 +38,6 @@ def point_scatter_3d(data):
 
         timestep_data = data[data['TimeStep'] == timestep]
 
-        size = 10 * timestep_data[timestep_data['Status'] == 1]['Radius']
-
         ax.scatter(
             timestep_data[timestep_data['Status'] == 1]['X'],
             timestep_data[timestep_data['Status'] == 1]['Y'],

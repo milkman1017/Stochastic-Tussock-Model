@@ -9,6 +9,7 @@ import random
 import csv
 from PIL import Image
 import seaborn as sns
+from scipy.interpolate import interp1d
 
 #Run $ wget  "https://docs.google.com/spreadsheets/d/1GfVrWWKMBeOzuNMu31YC-pTHkpYPN9guSKM_pvvei5U/export?format=csv&edit#gid=0" -O "parameterization_data.csv" to get most recent data
 
@@ -85,52 +86,43 @@ def diameter_objective(config, iteration):
 
     training_diameters = training_diameters[~np.isnan(training_diameters)]
 
-    obv_counts, obv_bins = np.histogram(training_diameters, bins='auto')
+    obv_hist, obv_bins = np.histogram(training_diameters, bins='auto', density=True)
 
     sim_diameters = []
 
     for i in range(num_sims):
         sim_data = pd.read_csv(f'{sim_filepath}/tiller_data_sim_num_{i}.csv')
+        last_time_step_data = sim_data[sim_data['TimeStep'] == sim_data['TimeStep'].max()]
 
-        diameter = sim_data[sim_data['TimeStep'] == sim_data['TimeStep'].max()]['X'].max() - sim_data[sim_data['TimeStep'] == sim_data['TimeStep'].max()]['X'].min()
+        num_alive_tillers = last_time_step_data['Status'].sum()
+        num_dead_tillers = (last_time_step_data['Status'] == 0).sum()
 
-        sim_diameters.append(diameter)
+        if num_alive_tillers >= 2*num_dead_tillers:
+            diameter = 60
+        else:
+            diameter = sim_data[sim_data['TimeStep'] == sim_data['TimeStep'].max()]['X'].max() - sim_data[sim_data['TimeStep'] == sim_data['TimeStep'].max()]['X'].min()
 
-    model_counts, model_bins = np.histogram(sim_diameters, bins='auto')
+        if diameter == 0.0:
+            diameter=1
+            sim_diameters.append(diameter)
+        else:
+            sim_diameters.append(diameter)
+        
+    model_hist, model_bins = np.histogram(sim_diameters, bins=obv_bins, density=True)
 
+    print(obv_hist)
+    print('-------')
+    print(model_hist)
 
-    common_bins = np.linspace(min(min(obv_bins), min(model_bins)),
-                            max(max(obv_bins), max(model_bins)),
-                            num=100)
-
-    common_bins = np.union1d(common_bins, obv_bins[:-1])
-    common_bins = np.union1d(common_bins, model_bins[:-1])
-
-    obs_dist = np.interp(common_bins, obv_bins[:-1], obv_counts, left=0, right=0)
-    model_dist = np.interp(common_bins, model_bins[:-1], model_counts, left=0, right=0)
-
-    squared_diff = (obs_dist - model_dist) ** 2
-
-    penalty = 1.0  # penality for non-overlapping bins, forces the distributions to align
-    non_overlapping_obs_bins = set(obv_bins[:-1]) - set(common_bins)
-    non_overlapping_model_bins = set(model_bins[:-1]) - set(common_bins)
-
-    for bin_value in non_overlapping_obs_bins:
-        squared_diff += penalty * obs_dist[common_bins == bin_value] ** 2
-
-    for bin_value in non_overlapping_model_bins:
-        squared_diff += penalty * model_dist[common_bins == bin_value] ** 2
-
-    rmse = np.sqrt(np.mean(squared_diff))
+    rmse = np.sqrt(np.mean((obv_hist - model_hist)**2))
 
     output_dir = 'mean_diameter_frames'
     os.makedirs(output_dir, exist_ok=True)
-
-    sns.kdeplot(training_diameters, linewidth=1, label='Observed Tussock Diametesr')
-    sns.kdeplot(sim_diameters, linewidth=1, label='Predicted Tussock Diameters')
-    plt.ylabel('Kernel Density')
-    plt.xlabel('Diameter (cm)')
+    sns.kdeplot(training_diameters, label='Observed Tussock Diameter Distribution', linewidth=1)
+    sns.kdeplot(sim_diameters, label='Modeled Tussock Diameter Distribution', linewidth=1)
     plt.legend()
+    plt.title(f'Training Iteration: {iteration}')
+    plt.xlabel('Tussock Diameter')
 
     frame_filename = os.path.join(output_dir, f'Mean_Tuss_diameter_iteration_{iteration}.png')
     plt.savefig(frame_filename)
@@ -139,25 +131,32 @@ def diameter_objective(config, iteration):
     del training_data
     return rmse
 
-def calculate_parameters(parameters, config, iteration, previous_loss):
+def calculate_parameters(parameters, config, iteration, previous_loss, dloss):
     optimization_data = pd.read_csv('./optimization_results.csv')
     gradients = dict()
 
-    learning_rate = previous_loss/1000
+    if dloss ==0.0:
+        learning_rate = previous_loss
+    else:
+        learning_rate = previous_loss/100
 
     print('unclipped learning rate: ', learning_rate)
     # learning_rate = np.clip(learning_rate, 0.00001, max_learning_rate)
     print('clipped learning rate: ', learning_rate)
     for key in parameters:
         gradient = np.gradient(optimization_data['loss'], optimization_data[key])
-        print('gradient: ', gradient[-1])
-        norm_gradient = gradient / np.linalg.norm(gradient, ord=2)
-        print('norm_gradient: ', norm_gradient[-1])
-        parameter_change = learning_rate * norm_gradient[-1] 
-        print('unclipped parameter change: ', parameter_change)
-        parameter_change = np.clip(parameter_change, -0.1, 0.1)
-        print('clipped parameter change: ', parameter_change)
-        parameters[key] = parameters[key] - parameter_change
+        if gradient[-1] == 0.0:
+            parameters[key] = parameters[key] - learning_rate
+        else:
+            print('gradient: ', gradient[-1])
+            norm_gradient = gradient / np.linalg.norm(gradient, ord=2)
+            print('norm_gradient: ', norm_gradient[-1])
+            parameter_change = learning_rate * gradient[-1] 
+            print('unclipped parameter change: ', parameter_change)
+            parameter_change = np.clip(parameter_change, -0.25, 0.25)
+            print('clipped parameter change: ', parameter_change)
+            parameters[key] = parameters[key] - parameter_change
+            print('==============================')
 
     return gradients
 
@@ -213,12 +212,17 @@ def main():
     while opt_iteration <= 1:
         print('Iteration: ', opt_iteration)
 
+        globals = np.random.random(2)
+        globals = np.sort(globals)
+
         #initialize random variables first
         parameters['ks'] = np.random.uniform(0, 0.5)
         parameters['kr'] = random.uniform(0, 0.5)
         parameters['bs'] = random.uniform(0, 0.1)
         parameters['br'] = random.uniform(0, 0.1)
-
+        parameters['g_min'] = random.uniform(0, globals[0])
+        parameters['g_max'] = random.uniform(0, globals[1])
+        
         write_parameters(parameters, config)
 
         tussock_model(config)
@@ -231,11 +235,11 @@ def main():
         opt_iteration += 1
 
     print('dloss: ', dloss, ' loss: ', loss)
-    while opt_iteration  < 50:
+    while opt_iteration  < 100 and loss > 0.02:
         print('dloss: ', dloss, ' loss: ', loss)
         print('Iteration: ', opt_iteration)
 
-        gradients = calculate_parameters(parameters, config, opt_iteration, loss)
+        gradients = calculate_parameters(parameters, config, opt_iteration, loss, dloss)
         write_parameters(parameters, config)
 
         tussock_model(config)
