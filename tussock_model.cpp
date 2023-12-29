@@ -87,7 +87,7 @@ void input(int &sim_time, int &num_sims, std::string &outdir, long unsigned int 
     std::cin >> num_threads;
 }
 
-void simulate(const int sim_time, const int sim_id, const std::string outdir) {
+void simulate(const int max_sim_time, const int sim_id, const std::string outdir) {
     double ks, kr, bs, br, g_min, g_max;
     readFromFile("parameters.txt", ks, kr, bs, br, g_min, g_max);
 
@@ -95,6 +95,11 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
     std::mt19937 gen(rd());
     std::uniform_real_distribution<double> dis(0.0, 1.0);
     std::uniform_real_distribution<double> g(g_min, g_max);
+    std::uniform_real_distribution<double> time(40, max_sim_time);
+
+    int sim_time = time(gen);
+
+    std::cout << sim_time << "\n";
 
     double global = g(gen);
 
@@ -126,6 +131,7 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
 
     std::string out_file_name = outdir + "/tiller_data_sim_num_" + std::to_string(sim_id) + ".csv";
     std::ofstream outputFile(out_file_name, std::ios::ate);  // Open CSV file in append mode
+
 
     Tiller first_tiller(1,1, 0.5, 0.001, 0, 0, 3, 1); // initalize the first tiller at coords 0,0,0,...attributes are age, size class, radius, x,y,z, num fo roots, and status
     std::vector<Tiller> previous_step;
@@ -232,19 +238,20 @@ void simulate(const int sim_time, const int sim_id, const std::string outdir) {
 }
 
 int main() {
-    int sim_time;
+    int max_sim_time;
     int num_sims;
     std::string outdir;
     unsigned long int num_threads;
 
-    input(sim_time, num_sims, outdir, num_threads);
+    input(max_sim_time, num_sims, outdir, num_threads);
 
     std::vector<std::thread> threads;
 
     for (int sim_id = 0; sim_id < num_sims; sim_id++) {
         std::cout << "Starting Simulation Number: " << sim_id << "\n";
 
-        threads.emplace_back(simulate, sim_time, sim_id, outdir);
+
+        threads.emplace_back(simulate, max_sim_time, sim_id, outdir);
 
         if ((threads.size() == num_threads) || (sim_id == num_sims - 1)) {
             for (auto& thread : threads) {

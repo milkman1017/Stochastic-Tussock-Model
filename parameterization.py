@@ -39,8 +39,8 @@ def tussock_model(config):
     num_sims = int(config.get('Tussock Model', 'nsims'))
     outdir = config.get('Tussock Model', 'filepath')
     num_threads = int(config.get('Tussock Model','nthreads'))
+    sim_time = int(config.get('Tussock Model', 'nyears'))
 
-    sim_time = int(random.uniform(40, 200))
 
     if make_result.returncode == 0:
 
@@ -48,7 +48,6 @@ def tussock_model(config):
 
         process = subprocess.Popen('./tussock_model', stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         output, _ = process.communicate(input=cpp_input)
-        print(output)
 
     else:
         print("Makefile execution failed")
@@ -134,7 +133,9 @@ def calculate_parameters(parameters, config, iteration, previous_loss, dloss):
     if dloss ==0.0:
         learning_rate = previous_loss
     else:
-        learning_rate = previous_loss/10
+        learning_rate = previous_loss
+
+    learning_rate = 0.1
 
 
     print('learning rate: ', learning_rate)
@@ -150,7 +151,7 @@ def calculate_parameters(parameters, config, iteration, previous_loss, dloss):
             print('norm_gradient: ', norm_gradient[-1])
             parameter_change = learning_rate * gradient[-1] 
             print('unclipped parameter change: ', parameter_change)
-            parameter_change = np.clip(parameter_change, -0.25, 0.25)
+            parameter_change = np.clip(parameter_change, -0.1, 0.1)
             print('clipped parameter change: ', parameter_change)
             parameters[key] = parameters[key] - parameter_change
             print('==============================')
@@ -210,16 +211,13 @@ def main():
         print('------')
         print('Iteration: ', opt_iteration)
 
-        globals = np.random.random(2)
-        globals = np.sort(globals)
-
         #initialize random variables first
-        parameters['ks'] = np.random.uniform(0, 0.5)
-        parameters['kr'] = random.uniform(0, 0.5)
+        parameters['ks'] = np.random.uniform(0.3, 0.6)
+        parameters['kr'] = random.uniform(0.3, 0.6)
         parameters['bs'] = random.uniform(0, 0.1)
         parameters['br'] = random.uniform(0, 0.1)
-        parameters['g_min'] = random.uniform(0, globals[0])
-        parameters['g_max'] = random.uniform(0, globals[1])
+        parameters['g_min'] = random.uniform(0, 0.5)
+        parameters['g_max'] = random.uniform(1, 1.5)
         
         write_parameters(parameters, config)
 
@@ -233,7 +231,7 @@ def main():
         opt_iteration += 1
 
     print('dloss: ', dloss, ' loss: ', loss)
-    while opt_iteration  < 100 and loss > 0.02:
+    while opt_iteration  < 150 and loss > 0.01:
         print('-----')
         print('dloss: ', dloss, ' loss: ', loss)
         print('Iteration: ', opt_iteration)

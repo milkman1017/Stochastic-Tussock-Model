@@ -66,7 +66,7 @@ class Tiller {
         }
 
         void decay() {
-            double decay_amount = 1 - (0.04 + static_cast<double>(std::rand()) / (RAND_MAX / (0.40 - 0.04)));
+            double decay_amount = 1 - 0.02;
 
             radius *= decay_amount;
         }

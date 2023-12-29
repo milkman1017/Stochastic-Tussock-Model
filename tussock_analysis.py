@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
-from scipy.spatial import ConvexHull, convex_hull_plot_2d
+import seaborn as sns
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -15,252 +15,137 @@ def parse_args():
     
     return args
 
-def numberOfTillers(df):
-    df = df.groupby('TimeStep')
+def get_num_tillers(data):
 
-    total_tillers = []
-    alive_tillers = []
-    dead_tillers = []
+    last_time_step_data = data[data['TimeStep'] == data['TimeStep'].max()]
 
-    for timestep in df:
-        stepdata = timestep[1]
+    last_step_num_tillers = len(last_time_step_data)
+    last_step_alive_tillers = len(last_time_step_data[last_time_step_data['Status']==1])
+    last_step_dead_tillers = len(last_time_step_data[last_time_step_data['Status']==0])
 
-        total_tiller = len(stepdata)
-        alive_tiller = len(stepdata[stepdata['Status']==1])
-        dead_tiller = len(stepdata[stepdata['Status']==0])
+    return last_step_num_tillers, last_step_alive_tillers, last_step_dead_tillers
 
-        total_tillers.append(total_tiller)
-        alive_tillers.append(alive_tiller)
-        dead_tillers.append(dead_tiller)
-        
-    return total_tillers, alive_tillers, dead_tillers
-
-def graph_tiller_number(tiller_number):
-    total_tillers = np.array(tiller_number['total'])
-    alive_tillers = np.array(tiller_number['alive'])
-    dead_tillers = np.array(tiller_number['dead'])
-
-    fig, ax = plt.subplots(3)
-
-    ax[0].plot(total_tillers.mean(axis=0), linewidth=1, color='b', label='Number of Total Tillers')
-    ax[0].fill_between(range(len(total_tillers.min(axis=0))), total_tillers.min(axis=0), total_tillers.max(axis=0), color='b', alpha=0.2, label='Range of Total Tillers')
-    ax[0].set_xlabel('Time (yrs)')
-    ax[0].set_ylabel('Num of Tillers')
-    plt.legend()
-
-    ax[1].plot(alive_tillers.mean(axis=0), linewidth=1, color='g', label='Number of Alive Tillers')
-    ax[1].fill_between(range(len(alive_tillers.min(axis=0))), alive_tillers.min(axis=0), alive_tillers.max(axis=0), color='g', alpha=0.2, label='Range of Alive Tillers')
-    ax[1].set_xlabel('Time (yrs)')
-    ax[1].set_ylabel('Num of Tillers')
-    plt.legend()
-
-    ax[2].plot(dead_tillers.mean(axis=0), linewidth=1, color='brown', label='Number of Dead Tillers')
-    ax[2].fill_between(range(len(dead_tillers.min(axis=0))), dead_tillers.min(axis=0), dead_tillers.max(axis=0), color='brown', alpha=0.2, label='Range of Dead Tillers')
-    ax[2].set_xlabel('Time (yrs)')
-    ax[2].set_ylabel('Num of Tillers')
-
-    plt.legend()
-    plt.title('Number of Tillers')
-    plt.tight_layout()
-    plt.show()
-
-def tussockDiameter(df):
-    df = df.groupby("TimeStep")
-
-    diameters = []
-
-    x_diameters = (df['X'].max() - df['X'].min())
-    y_diameters = (df['Y'].max() - df['Y'].min())
-
-    for x_diameter, y_diameter in zip(x_diameters, y_diameters):
-        diameter = np.mean([x_diameter, y_diameter])
-        diameters.append(diameter)
-
-    return diameters
-
-def graph_diameters(diameter_data):
-
-    diameter_growth = np.diff(diameter_data)
-
-    fig, ax = plt.subplots(2)
-
-    ax[0].plot(diameter_data.mean(axis=0), linewidth=1, label='Mean Tussock Diameter')
-    ax[0].fill_between(range(len(diameter_data.min(axis=0))), diameter_data.min(axis=0), diameter_data.max(axis=0), alpha=0.2, label='Range of Tussock Diameter')
-    ax[0].set_title('Tussock Diameter')
-    ax[0].set_ylabel('Diameter (cm)')
-    ax[0].set_xlabel('Time (yrs)')
-
-    ax[1].plot(diameter_growth.mean(axis=0), linewidth=1, label='Mean of Growth')
-    ax[1].fill_between(range(len(diameter_growth.min(axis=0))), diameter_growth.min(axis=0), diameter_growth.max(axis=0), alpha=0.2, label='Range of Growth')
-    ax[1].set_title('Tussock Growth')
-    ax[1].set_ylabel('Growth (cm/yr)')
-    ax[1].set_xlabel('Time (yrs)')
-
-    plt.tight_layout()
-    plt.legend()
-    plt.show()
-
-def tussock_height(df):
-    df = df.groupby("TimeStep")
-
-    mean_height = df['Z'].mean()
-    return mean_height
-
-def graph_heights(height_data):
+def graph_num_tillers(num_tillers,args):
     fig, ax = plt.subplots()
 
-    ax.plot(height_data.mean(axis=0), linewidth=1, label='Mean Height of Tussock from all Simulations')
-    ax.fill_between(range(len(height_data.min(axis=0))), height_data.min(axis=0), height_data.max(axis=0), alpha=0.2, label='Range of Mean Tussock Heights')
-    plt.title('Tussock Height')
+    for key in num_tillers:
+        sns.kdeplot(num_tillers[key], label=key, linewidth=1)
+
+    plt.legend()
+    plt.xlabel('Number of Tillers')
+    plt.ylabel('Density')
+    plt.title('Distribution of the Number of Tillers')
+    plt.savefig(f'{args.outdir}/num_tiller_dist.png')
     plt.show()
 
-def compute_volumes(df):
-    df = df.groupby("TimeStep")
+def get_diameter(data):
+    last_time_step_data = data[data['TimeStep'] == data['TimeStep'].max()]
 
-    tussock_volumes = []
-    alive_volumes = []
-    dead_volumes = []
+    diameter = (last_time_step_data['X'].max() - last_time_step_data['X'].min())
 
-    for timestep in df:
-        step_data = timestep[1]
+    return diameter
 
-        all_points = step_data[['X','Y','Z']]
-        alive_points = step_data[step_data['Status']==1][['X','Y','Z']]
-        dead_points = step_data[step_data['Status']==0][['X','Y','Z']]
+def graph_diameter_distributions(diameters, args):
+    sns.kdeplot(diameters)
 
-        try:
-            tussock_volume = ConvexHull(all_points).volume
-            tussock_volumes.append(tussock_volume)
-        except Exception as e:
-            tussock_volumes.append(0)
+    plt.xlabel('Tussock Diameter (cm)')
+    plt.ylabel('Density')
+    plt.title('Distribution of Tussock Diameters')
+    plt.savefig(f'{args.outdir}/diameters_dist.png')
+    plt.show()
 
-        try: 
-            alive_volume = ConvexHull(alive_points).volume
-            alive_volumes.append(alive_volume)
-        except Exception as e:
-            alive_volumes.append(0)
+def get_height(data):
+    last_time_step_data = data[data['TimeStep'] == data['TimeStep'].max()]
 
-        try:
-            dead_volume = ConvexHull(dead_points).volume
-            dead_volumes.append(dead_volume)
-        except Exception as e:
-            dead_volumes.append(0)
+    height  = last_time_step_data[last_time_step_data['Status']==1]['Z'].mean()
     
-    return tussock_volumes, alive_volumes, dead_volumes
+    return height
 
-def graph_volume(volumes):
-    total_volumes = np.array(volumes['total'])
-    alive_volumes = np.array(volumes['alive'])
-    dead_volumes = np.array(volumes['dead'])
+def graph_height_distribution(heights, args):
+    sns.kdeplot(heights)
 
-    fig, ax = plt.subplots(3)
-
-    ax[0].plot(total_volumes.mean(axis=0), linewidth=1, color='b', label='Mean Above Ground Volume')
-    ax[0].fill_between(range(len(total_volumes.min(axis=0))), total_volumes.min(axis=0), total_volumes.max(axis=0), alpha=0.2, color='b', label='Range of Above Ground Volume')
-    ax[0].set_title('Total Tussock Volume')
-    ax[0].set_ylabel('Volume (cm^3)')
-    ax[0].set_xlabel('Time (yrs)')
-
-    ax[1].plot(alive_volumes.mean(axis=0), linewidth=1, color='g', label='Mean Above Ground Volume')
-    ax[1].fill_between(range(len(alive_volumes.min(axis=0))), alive_volumes.min(axis=0), alive_volumes.max(axis=0), alpha=0.2, color='g', label='Range of Above Ground Volume')
-    ax[1].set_title('Living Tussock Volume')
-    ax[1].set_ylabel('Volume (cm^3)')
-    ax[1].set_xlabel('Time (yrs)')
-
-    ax[2].plot(dead_volumes.mean(axis=0), linewidth=1, color='brown', label='Mean Above Ground Volume')
-    ax[2].fill_between(range(len(dead_volumes.min(axis=0))), dead_volumes.min(axis=0), dead_volumes.max(axis=0), alpha=0.2, color='brown', label='Range of Above Ground Volume')
-    ax[2].set_title('Dead Tussock Volume')
-    ax[2].set_ylabel('Volume (cm^3)')
-    ax[2].set_xlabel('Time (yrs)')
-
-    plt.tight_layout()
+    plt.xlabel('Height Above Mineral Soil (cm)')
+    plt.ylabel('Distribution')
+    plt.title('Distribution of Tussock Heights')
+    plt.savefig(f'{args.outdir}/height_dist.png')
     plt.show()
 
-def calculate_root_volume(df):
-    df = df.groupby("TimeStep")
+def graph_height_vs_radius(diameters, heights, args):
+    radii = np.array(diameters) / 2
 
-    live_root_volumes = []
-    dead_root_volumes = []
+    plt.scatter(radii, heights, s=2)
+
+    # z = np.polyfit(radii, heights, 1)
+    # p = np.poly1d(z)
+    # plt.plot(radii, p(radii))
+
+    plt.xlabel('Tussock Radius (cm)')
+    plt.ylabel('Height Above Mineral Soil (cm)')
+    plt.title('Tussock Height vs Radius')
+    plt.savefig(f'{args.outdir}/height_vs_radius.png')
+    plt.show()
+
+def graph_radius_vs_tillers(diameters, num_tillers, args):
+    radii = np.array(diameters) / 2
+
+    plt.scatter(radii, num_tillers['all'], s=2)
+
+    z = np.polyfit(radii, num_tillers['all'], 2)
+    p = np.poly1d(z)
+    radii_fit = np.linspace(min(radii), max(radii), 100)
 
 
-    for timestep in df:
-        stepdata = timestep[1]
+    plt.plot(radii_fit, p(radii_fit), linewidth=1, label=f'Trend Line')
 
-        try:
-            dead_root_volume = np.round(dead_root_volumes[-1] + live_root_volumes[-1]/2,2) #assume dead roots are half the diameter as the live ones, but same length, also assume roots dont decay
-            dead_root_volumes.append(dead_root_volume)
-        except Exception as e:
-            dead_root_volumes.append(0)
+    plt.xlabel('Tussock Radius (cm)')
+    plt.ylabel('Number of Tillers')
+    plt.title('Tussock Radius vs Number of Tillers')
+    plt.legend()
+    plt.savefig(f'{args.outdir}/radius_vs_tillers.png')
+    plt.show()
 
-        live_root_volume = np.round(stepdata['NumRoots'].sum() * np.pi * 0.3**2 * 100, 2)  #volume of roots is assuming they are a cylinder extending down to permafrost (approx 100 cm) and of thickness 6 mm (3 mm diameter)
-        live_root_volumes.append(live_root_volume)
+def graph_packing_index(diameters, num_tillers):
+    radii = np.array(diameters)
+    num_tillers = np.array(num_tillers['all'])
 
-    return live_root_volumes, dead_root_volumes
-
-def graph_root_volumes(root_volumes):
-    alive_root_volumes = np.array(root_volumes['alive'])
-    dead_root_volumes = np.array(root_volumes['dead'])
-
-    fig, ax = plt.subplots(2)
-
-    for data in alive_root_volumes:
-        ax[0].plot(data)
-
-    for data in dead_root_volumes:
-        ax[1].plot(data)
-        
-    plt.title('Root Volumes')
+    packing_index = radii/num_tillers
+    sns.kdeplot(packing_index)
     plt.show()
 
 def main():
     args = parse_args()
 
-    tussock_diameters = []
-    tussock_heights = []
+    filepath = args.filepath
 
-    volumes = dict()
-    volumes['total'] = []
-    volumes['alive'] = []
-    volumes['dead'] = []
+    num_tillers = dict()
+    num_tillers['all'] = []
+    num_tillers['alive'] = []
+    num_tillers['dead'] = []
 
-    tiller_number = dict()
-    tiller_number['total'] = []
-    tiller_number['alive'] = []
-    tiller_number['dead'] = []
+    diameters = []
 
-    root_volumes = dict()
-    root_volumes['alive'] = []
-    root_volumes['dead'] = []
+    heights = []
+
+    for sim_id in range(int(args.nsims)):
+        data = pd.read_csv(f'{filepath}/tiller_data_sim_num_{sim_id}.csv')
+
+        num_tiller, num_alive_tiller, num_dead_tiller = get_num_tillers(data)
+        num_tillers['all'].append(num_tiller)
+        num_tillers['alive'].append(num_alive_tiller)
+        num_tillers['dead'].append(num_dead_tiller)
+
+        diameters.append(get_diameter(data))
+
+        heights.append(get_height(data))
+
+    graph_num_tillers(num_tillers, args)
+    graph_diameter_distributions(diameters, args)
+    graph_height_distribution(heights, args)
+    graph_height_vs_radius(diameters, heights, args)
+    graph_radius_vs_tillers(diameters, num_tillers, args)
+    graph_packing_index(diameters, num_tillers)
+        
     
-    for sim in range(int(args.nsims)):
-        sim_data = pd.read_csv(f'{args.filepath}/tiller_data_sim_num_{sim}.csv')
-
-        tussock_diameters.append(tussockDiameter(sim_data))
-
-        tussock_heights.append(tussock_height(sim_data))
-
-        tussock_volume, alive_volume, dead_volume = compute_volumes(sim_data)
-        volumes['total'].append(tussock_volume)
-        volumes['alive'].append(alive_volume)
-        volumes['dead'].append(dead_volume)
-
-        total_tillers, alive_tillers, dead_tillers = numberOfTillers(sim_data)
-        tiller_number['total'].append(total_tillers)
-        tiller_number['alive'].append(alive_tillers)
-        tiller_number['dead'].append(dead_tillers)
-
-        alive_root_volumes, dead_root_volumes = calculate_root_volume(sim_data)
-        root_volumes['alive'].append(alive_root_volumes)
-        root_volumes['dead'].append(dead_root_volumes)
-
-    tussock_diameters = np.array(tussock_diameters)
-    tussock_heights = np.array(tussock_heights)
-
-    graph_diameters(tussock_diameters)
-    graph_heights(tussock_heights)
-    graph_volume(volumes)
-    graph_tiller_number(tiller_number)
-    graph_root_volumes(root_volumes)
 
 if __name__ == "__main__":
     main()

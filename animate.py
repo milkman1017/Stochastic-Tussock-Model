@@ -26,7 +26,7 @@ def main():
     data = pd.read_csv(f'{args.filepath}/tiller_data_sim_num_{args.sim_id}.csv')
     
     point_scatter_3d(data)
-    # compute_volume(data)
+    compute_volume(data)
 
 def point_scatter_3d(data):
     output_dir = 'scatter_plot_frames'
@@ -64,7 +64,7 @@ def point_scatter_3d(data):
 
         ax.set_xlim(-15, 15)
         ax.set_ylim(-15, 15)
-        ax.set_zlim(0, 50)
+        ax.set_zlim(0, 40)
 
         frame_filename = os.path.join(output_dir, f'frame_{timestep:03d}.png')
         plt.savefig(frame_filename)
