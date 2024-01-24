@@ -94,7 +94,6 @@ def graph_radius_vs_tillers(diameters, num_tillers, args):
     p = np.poly1d(z)
     radii_fit = np.linspace(min(radii), max(radii), 100)
 
-
     plt.plot(radii_fit, p(radii_fit), linewidth=1, label=f'Trend Line')
 
     plt.xlabel('Tussock Radius (cm)')
@@ -112,6 +111,37 @@ def graph_packing_index(diameters, num_tillers):
     sns.kdeplot(packing_index)
     plt.show()
 
+def get_root_necrovolume(data):
+    alive = data[data['Status']==1]
+    year_data = alive.groupby('TimeStep').agg({'NumRoots': 'sum'})
+   
+    yearly_alive_volume = year_data['NumRoots'] * 0.03 * 100 #estimate roots as a cylinder with radius of 3 mm and a length of 100 cm
+    yearly_necro_volume = yearly_alive_volume / 2 #estimate that root volume decreases in half when dead
+
+    necro_volume = yearly_necro_volume.cumsum().iloc[-1]
+
+    return necro_volume
+
+def graph_radius_vs_necrovolume(diameters, necrovolumes, args):
+    radii = np.array(diameters) / 2
+    necrovolumes = np.array(necrovolumes)
+    # Assuming necromass has a density of 0.9 g/cm^3, needs to be validated
+    necromass = (necrovolumes * 0.11) / 1000
+
+    plt.scatter(necromass, radii, s=1, label='Data Points')
+
+    z = np.polyfit(necromass, radii, 4)
+    p = np.poly1d(z)
+
+    trendline_x = np.linspace(min(necromass), max(necromass), 100)
+    trendline_y = p(trendline_x)
+
+    plt.plot(trendline_x, trendline_y, 'r-', label='Trend Line', linewidth=1)
+    plt.xlabel('Root Necromass (kg)')
+    plt.ylabel('Tussock Radius (cm)')
+    plt.legend()
+    plt.show()
+
 def main():
     args = parse_args()
 
@@ -126,24 +156,29 @@ def main():
 
     heights = []
 
+    necrovolumes = []
+
     for sim_id in range(int(args.nsims)):
         data = pd.read_csv(f'{filepath}/tiller_data_sim_num_{sim_id}.csv')
 
-        num_tiller, num_alive_tiller, num_dead_tiller = get_num_tillers(data)
-        num_tillers['all'].append(num_tiller)
-        num_tillers['alive'].append(num_alive_tiller)
-        num_tillers['dead'].append(num_dead_tiller)
+        # num_tiller, num_alive_tiller, num_dead_tiller = get_num_tillers(data)
+        # num_tillers['all'].append(num_tiller)
+        # num_tillers['alive'].append(num_alive_tiller)
+        # num_tillers['dead'].append(num_dead_tiller)
 
         diameters.append(get_diameter(data))
 
-        heights.append(get_height(data))
+        # heights.append(get_height(data))
 
-    graph_num_tillers(num_tillers, args)
-    graph_diameter_distributions(diameters, args)
-    graph_height_distribution(heights, args)
-    graph_height_vs_radius(diameters, heights, args)
-    graph_radius_vs_tillers(diameters, num_tillers, args)
-    graph_packing_index(diameters, num_tillers)
+        necrovolumes.append(get_root_necrovolume(data))
+
+    # graph_num_tillers(num_tillers, args)
+    # graph_diameter_distributions(diameters, args)
+    # graph_height_distribution(heights, args)
+    # graph_height_vs_radius(diameters, heights, args)
+    # graph_radius_vs_tillers(diameters, num_tillers, args)
+    # graph_packing_index(diameters, num_tillers)
+    graph_radius_vs_necrovolume(diameters, necrovolumes, args)
         
     
 
