@@ -20,7 +20,7 @@ def get_config():
 
 def graph_real_data():
 
-    df = pd.read_csv('./parameterization_data.csv')
+    df = pd.read_csv('./tussock_allometry.csv')
 
     scatter_plot = sns.scatterplot(x='Estimated_Age', y='Diameter', hue='Location', data=df, palette='viridis')
 
@@ -137,19 +137,18 @@ def calculate_parameters(parameters, config, iteration, previous_loss, dloss):
 
     learning_rate = 0.1
 
-
     print('learning rate: ', learning_rate)
     print('-------')
     for key in parameters:
         print('Parameter: ', key)
         gradient = np.gradient(optimization_data['loss'], optimization_data[key])
         if gradient[-1] == 0.0:
-            parameters[key] = parameters[key] - learning_rate
+            parameters[key] = parameters[key]
         else:
             print('gradient: ', gradient[-1])
             norm_gradient = gradient / np.linalg.norm(gradient, ord=2)
             print('norm_gradient: ', norm_gradient[-1])
-            parameter_change = learning_rate * gradient[-1] 
+            parameter_change = learning_rate * norm_gradient[-1] 
             print('unclipped parameter change: ', parameter_change)
             parameter_change = np.clip(parameter_change, -0.1, 0.1)
             print('clipped parameter change: ', parameter_change)
@@ -196,7 +195,6 @@ def animate_fitting(outdir, filename, iteration, outfilename):
         os.remove(os.path.join(outdir, frame_filename))
     os.rmdir(outdir)
 
-
 def main():
     config = get_config()
 
@@ -214,10 +212,6 @@ def main():
         #initialize random variables first
         parameters['ks'] = np.random.uniform(0.3, 0.6)
         parameters['kr'] = random.uniform(0.3, 0.6)
-        parameters['bs'] = random.uniform(0, 0.1)
-        parameters['br'] = random.uniform(0, 0.1)
-        parameters['g_min'] = random.uniform(0, 0.5)
-        parameters['g_max'] = random.uniform(1, 1.5)
         
         write_parameters(parameters, config)
 
@@ -231,7 +225,7 @@ def main():
         opt_iteration += 1
 
     print('dloss: ', dloss, ' loss: ', loss)
-    while opt_iteration  < 150 and loss > 0.01:
+    while opt_iteration  < 150 and loss > 0.03 and dloss >0.0001:
         print('-----')
         print('dloss: ', dloss, ' loss: ', loss)
         print('Iteration: ', opt_iteration)

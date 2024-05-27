@@ -42,7 +42,7 @@ void resolveOverlaps(std::vector<Tiller>& tillers, std::random_device& rd) {
     }
 }
 
-void readFromFile(const std::string& filename, double& ks, double& kr, double& bs, double& br, double& g_min, double& g_max) {
+void readFromFile(const std::string& filename, double& ks, double& kr) {
     std::ifstream inputFile(filename);
 
     if (inputFile.is_open()) {
@@ -52,18 +52,6 @@ void readFromFile(const std::string& filename, double& ks, double& kr, double& b
 
         inputFile.ignore(256, '=');
         inputFile >> kr;
-
-        inputFile.ignore(256, '=');
-        inputFile >> bs;
-
-        inputFile.ignore(256, '=');
-        inputFile >> br;
-
-        inputFile.ignore(256, '=');
-        inputFile >> g_min;
-
-        inputFile.ignore(256, '=');
-        inputFile >> g_max;
         
         inputFile.close();
 
@@ -88,20 +76,17 @@ void input(int &sim_time, int &num_sims, std::string &outdir, long unsigned int 
 }
 
 void simulate(const int max_sim_time, const int sim_id, const std::string outdir) {
-    double ks, kr, bs, br, g_min, g_max;
-    readFromFile("parameters.txt", ks, kr, bs, br, g_min, g_max);
+    double ks, kr;
+    readFromFile("parameters.txt", ks, kr);
 
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<double> dis(0.0, 1.0);
-    std::uniform_real_distribution<double> g(g_min, g_max);
     std::uniform_real_distribution<double> time(40, max_sim_time);
 
     int sim_time = time(gen);
 
     std::cout << sim_time << "\n";
-
-    double global = g(gen);
 
     //the "tiller" object contains the following:
     // tiller size class, 
@@ -132,7 +117,6 @@ void simulate(const int max_sim_time, const int sim_id, const std::string outdir
     std::string out_file_name = outdir + "/tiller_data_sim_num_" + std::to_string(sim_id) + ".csv";
     std::ofstream outputFile(out_file_name, std::ios::ate);  // Open CSV file in append mode
 
-
     Tiller first_tiller(1,1, 0.5, 0.001, 0, 0, 3, 1); // initalize the first tiller at coords 0,0,0,...attributes are age, size class, radius, x,y,z, num fo roots, and status
     std::vector<Tiller> previous_step;
     previous_step.push_back(first_tiller);
@@ -157,14 +141,14 @@ void simulate(const int max_sim_time, const int sim_id, const std::string outdir
                 double surviveEvent = dis(gen);
 
                 //first determine if tiller lives or dies
-                if (surviveEvent < (survival_matrix[size_class-1] / (ks*distance)+bs) * global) {  //if tiller lives, determine new size class from transition probabilities
+                if (surviveEvent < (survival_matrix[size_class-1] / (ks*distance))) {  //if tiller lives, determine new size class from transition probabilities
                     //for now just divide the survival matrix probabilities by the distance from the center
                     //will need to get actual data to validate that this is good enough
                     //also to see what kind of relationship between distance and survival there is (linear, exponentional, etc)
     
                     double tillerEvent = dis(gen);
 
-                    if (tillerEvent < (tillering_matrix[size_class-1] / (kr*distance)+br) * global) {
+                    if (tillerEvent < (tillering_matrix[size_class-1] / (kr*distance))) {
                         Tiller newTiller = tiller.makeDaughter();
                         newTillers.push_back(newTiller); //store new tiller separately, add into total data at the end of iterating through every current tiller
                         // resolveOverlaps(newTillers)

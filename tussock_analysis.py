@@ -107,7 +107,7 @@ def graph_packing_index(diameters, num_tillers):
     radii = np.array(diameters)
     num_tillers = np.array(num_tillers['all'])
 
-    packing_index = radii/num_tillers
+    packing_index = radii/num_tillers * 10
     sns.kdeplot(packing_index)
     plt.show()
 
@@ -115,7 +115,7 @@ def get_root_necrovolume(data):
     alive = data[data['Status']==1]
     year_data = alive.groupby('TimeStep').agg({'NumRoots': 'sum'})
    
-    yearly_alive_volume = year_data['NumRoots'] * 0.03 * 100 #estimate roots as a cylinder with radius of 3 mm and a length of 100 cm
+    yearly_alive_volume = year_data['NumRoots'] * 0.03 * 50 #estimate roots as a cylinder with radius of 3 mm and a length of 50 cm
     yearly_necro_volume = yearly_alive_volume / 2 #estimate that root volume decreases in half when dead
 
     necro_volume = yearly_necro_volume.cumsum().iloc[-1]
@@ -142,6 +142,32 @@ def graph_radius_vs_necrovolume(diameters, necrovolumes, args):
     plt.legend()
     plt.show()
 
+def get_ages(data):
+    alive_tillers = data[data['Status']==1]
+    dead_tillers = data[data['Status']==0]
+
+    return alive_tillers['Age'].tolist(), dead_tillers['Age'].tolist()
+
+def age_hist(ages):
+    fig, ax = plt.subplots(2, figsize=(10, 8))
+
+    # Alive tillers
+    mean_alive = np.array(ages['alive']).mean()
+    ax[0].hist(ages['alive'], bins='auto', color='skyblue', edgecolor='black', density=True)
+    ax[0].axvline(mean_alive, color='red', linestyle='dashed', linewidth=1)
+    ax[0].text(mean_alive, ax[0].get_ylim()[1]*0.9, f'Mean: {mean_alive:.2f}', color='red')
+    ax[0].set_title('Alive Tillers')
+
+    # Dead tillers
+    mean_dead = np.array(ages['dead']).mean()
+    ax[1].hist(ages['dead'], bins='auto', color='lightgreen', edgecolor='black', density=True)
+    ax[1].axvline(mean_dead, color='red', linestyle='dashed', linewidth=1)
+    ax[1].text(mean_dead, ax[1].get_ylim()[1]*0.9, f'Mean: {mean_dead:.2f}', color='red')
+    ax[1].set_title('Dead Tillers')
+
+    plt.tight_layout()
+    plt.show()
+
 def main():
     args = parse_args()
 
@@ -158,29 +184,36 @@ def main():
 
     necrovolumes = []
 
+    ages = dict()
+    ages['alive'] = []
+    ages['dead'] = []
+
     for sim_id in range(int(args.nsims)):
         data = pd.read_csv(f'{filepath}/tiller_data_sim_num_{sim_id}.csv')
 
-        # num_tiller, num_alive_tiller, num_dead_tiller = get_num_tillers(data)
-        # num_tillers['all'].append(num_tiller)
-        # num_tillers['alive'].append(num_alive_tiller)
-        # num_tillers['dead'].append(num_dead_tiller)
+        num_tiller, num_alive_tiller, num_dead_tiller = get_num_tillers(data)
+        num_tillers['all'].append(num_tiller)
+        num_tillers['alive'].append(num_alive_tiller)
+        num_tillers['dead'].append(num_dead_tiller)
 
         diameters.append(get_diameter(data))
 
-        # heights.append(get_height(data))
+        heights.append(get_height(data))
 
         necrovolumes.append(get_root_necrovolume(data))
 
-    # graph_num_tillers(num_tillers, args)
-    # graph_diameter_distributions(diameters, args)
-    # graph_height_distribution(heights, args)
-    # graph_height_vs_radius(diameters, heights, args)
-    # graph_radius_vs_tillers(diameters, num_tillers, args)
-    # graph_packing_index(diameters, num_tillers)
-    graph_radius_vs_necrovolume(diameters, necrovolumes, args)
-        
-    
+        alive_age, dead_age = get_ages(data)
+        ages['alive'].extend(alive_age)
+        ages['dead'].extend(dead_age)
 
+    graph_num_tillers(num_tillers, args)
+    graph_diameter_distributions(diameters, args)
+    graph_height_distribution(heights, args)
+    graph_height_vs_radius(diameters, heights, args)
+    graph_radius_vs_tillers(diameters, num_tillers, args)
+    graph_packing_index(diameters, num_tillers)
+    graph_radius_vs_necrovolume(diameters, necrovolumes, args)
+    age_hist(ages)
+        
 if __name__ == "__main__":
     main()
