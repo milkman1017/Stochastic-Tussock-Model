@@ -1,157 +1,206 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.stats import norm
+from sklearn.linear_model import LogisticRegression
 from scipy.optimize import curve_fit
 
-# Growth function
-def growth_function(x, a, b, c):
+def load_data(file_path):
+    return pd.read_csv(file_path)
+
+def extract_columns(data):
+    leaf_area_2016 = data['2016 Leaf Area']
+    leaf_area_2017 = data['2017 Leaf Area'].copy()
+    s0_recruits = data['2017 # S0 (current yr new)']
+    s1_recruits = data['2017 # S1 (last yr new)?']
+    
+    # Set negative values in 2017 leaf area to 0
+    leaf_area_2017[leaf_area_2017 < 0] = 0
+    
+    return leaf_area_2016, leaf_area_2017, s0_recruits, s1_recruits, data['Garden']
+
+def growth_model(x, a, b, c):
     return a * x**b + c
 
-# Fit the growth model
-def fit_growth_model(data):
-    x_data = data['2016 Leaf Area']
-    y_data = data['2017 Leaf Area']
-    popt, _ = curve_fit(growth_function, x_data, y_data, maxfev=10000)
-    return popt
+def growth_function(leaf_area_2016, leaf_area_2017, x):
+    params, _ = curve_fit(growth_model, leaf_area_2016, leaf_area_2017, maxfev=10000)
+    return growth_model(x, *params), params
 
-# Survival function
-def survival_function(data):
-    total_tillers = len(data)
-    dead_tillers = len(data[data['2017 Type (1-3) 1=dead'] == 1])
-    survival_rate = 1 - (dead_tillers / total_tillers)
-    return survival_rate
+def survival_function_continuous(leaf_area_2016, leaf_area_2017, x):
+    survival_outcome = (leaf_area_2017 > 0).astype(int)
+    log_reg = LogisticRegression(max_iter=1000)
+    log_reg.fit(leaf_area_2016.values.reshape(-1, 1), survival_outcome)
+    return log_reg.predict_proba(x.reshape(-1, 1))[:, 1], log_reg
 
-# Reproduction function
-def reproduction_function(data):
-    new_tillers = data['2017 # S0 (current yr new)'].sum()
-    total_tillers = len(data)
-    reproduction_rate = new_tillers / total_tillers
-    return reproduction_rate
-
-# Construct the IPM kernel
-def construct_kernel(popt, size_range, survival_rate, reproduction_rate):
-    a, b, c = popt
-    kernel = np.zeros((len(size_range), len(size_range)))
+def reproduction_function_continuous(leaf_area_2016, s0_recruits, s1_recruits, x):
+    total_recruits = s0_recruits + s1_recruits
+    reproduction_outcome = (total_recruits > 0).astype(int)
     
-    for i, x in enumerate(size_range):
-        for j, y in enumerate(size_range):
-            growth = growth_function(x, a, b, c)
-            
-            # Kernel entry: transition from size x to y
-            kernel[i, j] = survival_rate * (y - growth)**2 * reproduction_rate
-    
-    return kernel
+    log_reg = LogisticRegression(max_iter=1000)
+    log_reg.fit(leaf_area_2016.values.reshape(-1, 1), reproduction_outcome)
+    return log_reg.predict_proba(x.reshape(-1, 1))[:, 1] * total_recruits.mean(), log_reg
 
-# Analyze the IPM
-def analyze_ipm(kernel, size_range, category):
-    eigenvalues, eigenvectors = np.linalg.eig(kernel.T)
-    dominant_index = np.argmax(eigenvalues)
-    stable_distribution = eigenvectors[:, dominant_index].real
-    stable_distribution /= stable_distribution.sum()
-    
-    plt.plot(size_range, stable_distribution, label=category)
+def plot_reproduction_probability(min_leaf_area, max_leaf_area, reproduction_function_continuous, leaf_area_2016, s0_recruits, s1_recruits, gardens, nbins=100):
+    leaf_area_range = np.linspace(min_leaf_area, max_leaf_area, nbins)
+
+    plt.figure(figsize=(10, 6))
+    for garden in gardens.unique():
+        garden_mask = gardens == garden
+        reproduction_probs_continuous, _ = reproduction_function_continuous(
+            leaf_area_2016[garden_mask], s0_recruits[garden_mask], s1_recruits[garden_mask], leaf_area_range)
+        plt.plot(leaf_area_range, reproduction_probs_continuous, linestyle='-', label=garden)
+
     plt.xlabel('Leaf Area')
-    plt.ylabel('Stable Distribution')
-    plt.title('Stable Size Distribution')
+    plt.ylabel('Reproduction Probability')
+    plt.title('Reproduction Probability vs Leaf Area')
     plt.legend()
-    plt.savefig(f'stable_distribution_{category}.png')
-    plt.clf()
+    plt.grid(True)
+    plt.show()
 
-# Plot the kernel
-def plot_kernel(kernel, size_range, category):
-    plt.imshow(kernel, extent=(size_range[0], size_range[-1], size_range[0], size_range[-1]), origin='lower', aspect='auto', cmap='hot')
-    plt.colorbar(label='Kernel Value')
-    plt.xlabel('Size at time t')
-    plt.ylabel('Size at time t+1')
-    plt.title(f'Kernel Distribution for {category}')
-    plt.savefig(f'kernel_distribution_{category}.png')
-    plt.clf()
+def project(leaf_area_bins, leaf_area_2016, garden_mask, leaf_area_2017, s0_recruits, s1_recruits, kernels, garden):
+    X, Y = np.meshgrid(leaf_area_bins, leaf_area_bins)
+    growth_probs, growth_params = growth_function(leaf_area_2016[garden_mask], leaf_area_2017[garden_mask], X)
+    survival_probs, _ = survival_function_continuous(leaf_area_2016[garden_mask], leaf_area_2017[garden_mask], X.flatten())
+    survival_probs = survival_probs.reshape(X.shape)
+    reproduction_probs, _ = reproduction_function_continuous(leaf_area_2016[garden_mask], s0_recruits[garden_mask], s1_recruits[garden_mask], X.flatten())
+    reproduction_probs = reproduction_probs.reshape(X.shape)
+    kernel = norm.pdf(Y, loc=growth_probs, scale=5) * survival_probs + reproduction_probs
+    kernel /= kernel.sum(axis=0)
+    kernels[garden] = kernel
+    return kernels, growth_params
 
-# Simulate population dynamics
-def simulate_population(kernel, initial_distribution, num_time_steps):
-    population_size = np.zeros(num_time_steps)
-    average_leaf_area = np.zeros(num_time_steps)
-    size_distribution = np.zeros((num_time_steps, len(initial_distribution)))
+def plot_ipm_kernel(min_leaf_area, max_leaf_area, growth_function, leaf_area_2016, leaf_area_2017, survival_function_continuous, reproduction_function_continuous, s0_recruits, s1_recruits, gardens, nbins=100):
+    n_bins = nbins
+    leaf_area_bins = np.linspace(min_leaf_area, max_leaf_area, n_bins)
     
-    size_distribution[0, :] = initial_distribution
-    population_size[0] = initial_distribution.sum()
-    average_leaf_area[0] = (initial_distribution * size_range).sum() / initial_distribution.sum()
-    
-    for t in range(1, num_time_steps):
-        size_distribution[t, :] = kernel.dot(size_distribution[t-1, :])
-        population_size[t] = size_distribution[t, :].sum()
-        average_leaf_area[t] = (size_distribution[t, :] * size_range).sum() / size_distribution[t, :].sum()
-    
-    return population_size, average_leaf_area, size_distribution
+    unique_gardens = gardens.unique()
+    fig, axs = plt.subplots(1, len(unique_gardens), figsize=(15, 6), sharey=True)
+
+    for i, garden in enumerate(unique_gardens):
+        garden_mask = gardens == garden
+        kernels, _ = project(leaf_area_bins, leaf_area_2016, garden_mask, leaf_area_2017, s0_recruits, s1_recruits, {}, garden)
+
+        ax = axs[i]
+        im = ax.imshow(kernels[garden], extent=[min_leaf_area, max_leaf_area, min_leaf_area, max_leaf_area], origin='lower', aspect='auto')
+        ax.set_title(garden)
+        ax.set_xlabel('Leaf Area (t)')
+        if i == 0:
+            ax.set_ylabel('Leaf Area (t+1)')
+        fig.colorbar(im, ax=ax, label='Transition Probability')
+
+    plt.suptitle('IPM Kernel by Garden')
+    plt.show()
+
+def plot_survival_probability(min_leaf_area, max_leaf_area, survival_function_continuous, leaf_area_2016, leaf_area_2017, gardens):
+    leaf_area_range = np.linspace(min_leaf_area, max_leaf_area, 500)
+
+    plt.figure(figsize=(10, 6))
+    for garden in gardens.unique():
+        garden_mask = gardens == garden
+        survival_probs_continuous, _ = survival_function_continuous(
+            leaf_area_2016[garden_mask], leaf_area_2017[garden_mask], leaf_area_range)
+        plt.plot(leaf_area_range, survival_probs_continuous, linestyle='-', label=garden)
+
+    plt.xlabel('Leaf Area (2016)')
+    plt.ylabel('Survival Probability (2017)')
+    plt.title('Survival Probability vs Leaf Area (2016)')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def plot_stable_size_distribution(kernels, leaf_area_bins, gardens):
+    plt.figure(figsize=(10, 6))
+    for garden, kernel in kernels.items():
+        eigenvalues, eigenvectors = np.linalg.eig(kernel)
+        stable_distribution = np.real(eigenvectors[:, np.argmax(eigenvalues)])
+        stable_distribution /= stable_distribution.sum()
+        plt.plot(leaf_area_bins, stable_distribution, linestyle='-', label=garden)
+
+    plt.xlabel('Leaf Area')
+    plt.ylabel('Stable Size Distribution')
+    plt.title('Stable Size Distribution vs Leaf Area')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def sensitivity_analysis(leaf_area_bins, leaf_area_2016, garden_mask, leaf_area_2017, s0_recruits, s1_recruits, kernels, garden, perturbations):
+    original_kernels, growth_params = project(leaf_area_bins, leaf_area_2016, garden_mask, leaf_area_2017, s0_recruits, s1_recruits, kernels, garden)
+
+    perturbed_kernels = {}
+
+    # Perturb growth function parameters
+    for i, param in enumerate(growth_params):
+        for perturb in perturbations:
+            perturbed_params = growth_params.copy()
+            perturbed_params[i] *= perturb
+            perturbed_growth_probs = growth_model(leaf_area_bins, *perturbed_params)
+
+            perturbed_kernel = norm.pdf(leaf_area_bins[:, None], loc=perturbed_growth_probs, scale=5) * \
+                               survival_function_continuous(leaf_area_2016[garden_mask], leaf_area_2017[garden_mask], leaf_area_bins)[0][:, None] + \
+                               reproduction_function_continuous(leaf_area_2016[garden_mask], s0_recruits[garden_mask], s1_recruits[garden_mask], leaf_area_bins)[0][:, None]
+            perturbed_kernel /= perturbed_kernel.sum(axis=0)
+            perturbed_kernels[f'growth_param_{i}_perturb_{perturb}'] = perturbed_kernel
+
+    # Perturb logistic regression coefficients
+    for perturb in perturbations:
+        survival_probs, survival_log_reg = survival_function_continuous(leaf_area_2016[garden_mask], leaf_area_2017[garden_mask], leaf_area_bins)
+        reproduction_probs, reproduction_log_reg = reproduction_function_continuous(leaf_area_2016[garden_mask], s0_recruits[garden_mask], s1_recruits[garden_mask], leaf_area_bins)
+
+        survival_log_reg.coef_ *= perturb
+        reproduction_log_reg.coef_ *= perturb
+
+        perturbed_survival_probs = survival_log_reg.predict_proba(leaf_area_bins[:, None])[:, 1]
+        perturbed_reproduction_probs = reproduction_log_reg.predict_proba(leaf_area_bins[:, None])[:, 1] * (s0_recruits[garden_mask] + s1_recruits[garden_mask]).mean()
+
+        perturbed_kernel = norm.pdf(leaf_area_bins[:, None], loc=growth_model(leaf_area_bins, *growth_params), scale=5) * \
+                           perturbed_survival_probs[:, None] + \
+                           perturbed_reproduction_probs[:, None]
+        perturbed_kernel /= perturbed_kernel.sum(axis=0)
+        perturbed_kernels[f'survival_reproduction_perturb_{perturb}'] = perturbed_kernel
+
+    return perturbed_kernels
+
+def plot_sensitivity_analysis(perturbed_kernels, leaf_area_bins):
+    plt.figure(figsize=(15, 10))
+    for label, kernel in perturbed_kernels.items():
+        eigenvalues, eigenvectors = np.linalg.eig(kernel)
+        stable_distribution = np.real(eigenvectors[:, np.argmax(eigenvalues)])
+        stable_distribution /= stable_distribution.sum()
+        plt.plot(leaf_area_bins, stable_distribution, linestyle='-', label=label)
+
+    plt.xlabel('Leaf Area')
+    plt.ylabel('Stable Size Distribution')
+    plt.title('Stable Size Distribution Sensitivity Analysis')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
 def main():
-    data = pd.read_csv('16_17_IPM_data.csv')
-    print(data)
+    data = load_data('16-17_IPM_data.csv')
+    leaf_area_2016, leaf_area_2017, s0_recruits, s1_recruits, gardens = extract_columns(data)
+
+    min_leaf_area = min(leaf_area_2016.min(), leaf_area_2017.min())
+    max_leaf_area = max(leaf_area_2016.max(), leaf_area_2017.max())
+
+    n_bins = 100
+
+    plot_reproduction_probability(min_leaf_area, max_leaf_area, reproduction_function_continuous, leaf_area_2016, s0_recruits, s1_recruits, gardens, nbins=n_bins)
+    plot_ipm_kernel(min_leaf_area, max_leaf_area, growth_function, leaf_area_2016, leaf_area_2017, survival_function_continuous, reproduction_function_continuous, s0_recruits, s1_recruits, gardens, nbins=n_bins)
+    plot_survival_probability(min_leaf_area, max_leaf_area, survival_function_continuous, leaf_area_2016, leaf_area_2017, gardens)
     
-    size_range = np.linspace(data['2016 Leaf Area'].min(), data['2016 Leaf Area'].max(), 100)
-    num_time_steps = 50
-    
-    population_sizes = {}
-    average_leaf_areas = {}
-    size_distributions = {}
-    
-    for category in data['Source'].unique():
-        category_data = data[data['Source'] == category]
-        
-        if len(category_data) < 2:
-            print(f"Not enough data for category {category} to fit a model.")
-            continue
-        
-        popt = fit_growth_model(category_data)
-        print(f"Fitted parameters for {category}: {popt}")
-        
-        survival_rate = survival_function(category_data)
-        reproduction_rate = reproduction_function(category_data)
-        
-        kernel = construct_kernel(popt, size_range, survival_rate, reproduction_rate)
-        
-        analyze_ipm(kernel, size_range, category)
-        plot_kernel(kernel, size_range, category)
-        
-        initial_distribution = np.ones(len(size_range))
-        population_size, average_leaf_area, size_distribution = simulate_population(kernel, initial_distribution, num_time_steps)
-        
-        population_sizes[category] = population_size
-        average_leaf_areas[category] = average_leaf_area
-        size_distributions[category] = size_distribution
-    
-    # Plot population size vs time
-    plt.figure()
-    for category, population_size in population_sizes.items():
-        plt.plot(range(num_time_steps), population_size, label=category)
-    plt.xlabel('Time')
-    plt.ylabel('Population Size')
-    plt.title('Population Size vs Time')
-    plt.legend()
-    plt.savefig('population_size_vs_time.png')
-    plt.clf()
-    
-    # Plot average leaf area vs time
-    plt.figure()
-    for category, average_leaf_area in average_leaf_areas.items():
-        plt.plot(range(num_time_steps), average_leaf_area, label=category)
-    plt.xlabel('Time')
-    plt.ylabel('Average Leaf Area')
-    plt.title('Average Leaf Area vs Time')
-    plt.legend()
-    plt.savefig('average_leaf_area_vs_time.png')
-    plt.clf()
-    
-    # Plot size distributions at final time step
-    plt.figure()
-    for category, size_distribution in size_distributions.items():
-        plt.plot(size_range, size_distribution[-1, :], label=category)
-    plt.xlabel('Leaf Area')
-    plt.ylabel('Frequency')
-    plt.title('Size Distribution at Final Time Step')
-    plt.legend()
-    plt.savefig('size_distribution_final.png')
-    plt.clf()
+    leaf_area_bins = np.linspace(min_leaf_area, max_leaf_area, n_bins)
+    kernels = {}
+    for garden in gardens.unique():
+        garden_mask = gardens == garden
+        kernels, _ = project(leaf_area_bins, leaf_area_2016, garden_mask, leaf_area_2017, s0_recruits, s1_recruits, kernels, garden)
+
+    plot_stable_size_distribution(kernels, leaf_area_bins, gardens)
+
+    perturbations = [0.8, 1.2]  # Example perturbations, you can adjust these
+    for garden in gardens.unique():
+        garden_mask = gardens == garden
+        perturbed_kernels = sensitivity_analysis(leaf_area_bins, leaf_area_2016, garden_mask, leaf_area_2017, s0_recruits, s1_recruits, kernels, garden, perturbations)
+        plot_sensitivity_analysis(perturbed_kernels, leaf_area_bins)
 
 if __name__ == "__main__":
     main()
