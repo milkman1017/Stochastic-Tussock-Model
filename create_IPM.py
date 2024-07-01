@@ -6,7 +6,15 @@ from sklearn.linear_model import LogisticRegression
 from scipy.optimize import curve_fit
 
 def load_data(file_path):
-    return pd.read_csv(file_path)
+    data = pd.read_csv(file_path)
+    print("Original Data:")
+    print(data)
+    data.replace([np.inf, -np.inf], np.nan, inplace=True)
+    data.dropna(subset=['2016 Leaf Area'], inplace=True)
+    print("Data after removing NaN values in '2016 Leaf Area' column:")
+    print(data)
+    return data
+
 
 def extract_columns(data):
     leaf_area_2016 = data['2016 Leaf Area']
@@ -176,7 +184,7 @@ def plot_sensitivity_analysis(perturbed_kernels, leaf_area_bins):
     plt.show()
 
 def main():
-    data = load_data('16-17_IPM_data.csv')
+    data = load_data('16-17_All_Data.csv')
     leaf_area_2016, leaf_area_2017, s0_recruits, s1_recruits, gardens = extract_columns(data)
 
     min_leaf_area = min(leaf_area_2016.min(), leaf_area_2017.min())
