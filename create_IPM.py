@@ -17,8 +17,6 @@ def load_data(file_path):
     return data
 
 
-
-
 def plot_growth(data):
 
     os.makedirs("IPM", exist_ok=True)
