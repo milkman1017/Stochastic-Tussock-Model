@@ -3,3 +3,7 @@ tussock_model
 *.csv
 *.gif
 *.png
+*.log
+*.out
+*.err
+!input_data/*

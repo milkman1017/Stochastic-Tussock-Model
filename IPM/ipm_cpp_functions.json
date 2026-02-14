@@ -1,0 +1,145 @@
+{
+  "meta": {
+    "coding": "Sum coding. Ecotype deviations sum to 0 across ecotypes.",
+    "x_variable": "area_n",
+    "ecotype_variable": "Src",
+    "ecotypes_fit": [
+      "CF",
+      "SG",
+      "TL"
+    ],
+    "new_ecotype_placeholder_key": "NEW_ECOTYPE",
+    "z_transform_note": "Models are fit in z, where z = x (identity) or z = log(1+x) (log1p).",
+    "polynomial_eta_form_in_z": "eta(z) = b0 + b1*z + b2*z^2 + b3*z^3  (missing higher terms are 0)"
+  },
+  "vital_rates": {
+    "growth_mean": {
+      "x_transform": "identity",
+      "degree": 2,
+      "scalar_set": "offset",
+      "formula": "y_growth ~ x + I(x**2) + C(ecotype, Sum)",
+      "link": "identity",
+      "response_from_eta": "y = eta",
+      "base_coefficients_in_z": {
+        "b0": 34.56271744473715,
+        "b1": 1.043331450132405,
+        "b2": -0.00030329319726520824,
+        "b3": 0.0
+      },
+      "scalar_active": {
+        "offset": true,
+        "slope": false,
+        "curvature": false
+      },
+      "scalar_deviations": {
+        "offset": {
+          "CF": 61.349478579338275,
+          "SG": -15.967861148692288,
+          "TL": -45.38161743064599,
+          "NEW_ECOTYPE": 0.0
+        },
+        "slope": {
+          "CF": 0.0,
+          "SG": 0.0,
+          "TL": 0.0,
+          "NEW_ECOTYPE": 0.0
+        },
+        "curvature": {
+          "CF": 0.0,
+          "SG": 0.0,
+          "TL": 0.0,
+          "NEW_ECOTYPE": 0.0
+        }
+      },
+      "AIC": 4738.815391994694,
+      "k_params": 5,
+      "n": 369,
+      "noise_model": "Normal(0, sigma^2) additive on y_growth",
+      "sigma_y": 147.74558691423508
+    },
+    "survival": {
+      "x_transform": "identity",
+      "degree": 1,
+      "scalar_set": "none",
+      "formula": "surv ~ x",
+      "link": "logit",
+      "response_from_eta": "p = 1/(1+exp(-eta))",
+      "base_coefficients_in_z": {
+        "b0": -0.4759392738089253,
+        "b1": 0.010061994950699203,
+        "b2": 0.0,
+        "b3": 0.0
+      },
+      "scalar_active": {
+        "offset": false,
+        "slope": false,
+        "curvature": false
+      },
+      "scalar_deviations": {
+        "offset": {
+          "CF": 0.0,
+          "SG": 0.0,
+          "TL": 0.0,
+          "NEW_ECOTYPE": 0.0
+        },
+        "slope": {
+          "CF": 0.0,
+          "SG": 0.0,
+          "TL": 0.0,
+          "NEW_ECOTYPE": 0.0
+        },
+        "curvature": {
+          "CF": 0.0,
+          "SG": 0.0,
+          "TL": 0.0,
+          "NEW_ECOTYPE": 0.0
+        }
+      },
+      "AIC": 173.52244041987842,
+      "k_params": 2,
+      "n": 301
+    },
+    "fecundity": {
+      "x_transform": "identity",
+      "degree": 2,
+      "scalar_set": "none",
+      "formula": "fec_bin ~ x + I(x**2)",
+      "link": "logit",
+      "response_from_eta": "p = 1/(1+exp(-eta))",
+      "base_coefficients_in_z": {
+        "b0": -4.23966202048902,
+        "b1": 0.01478880984282271,
+        "b2": -1.334715680346952e-05,
+        "b3": 0.0
+      },
+      "scalar_active": {
+        "offset": false,
+        "slope": false,
+        "curvature": false
+      },
+      "scalar_deviations": {
+        "offset": {
+          "CF": 0.0,
+          "SG": 0.0,
+          "TL": 0.0,
+          "NEW_ECOTYPE": 0.0
+        },
+        "slope": {
+          "CF": 0.0,
+          "SG": 0.0,
+          "TL": 0.0,
+          "NEW_ECOTYPE": 0.0
+        },
+        "curvature": {
+          "CF": 0.0,
+          "SG": 0.0,
+          "TL": 0.0,
+          "NEW_ECOTYPE": 0.0
+        }
+      },
+      "AIC": 330.01633790149316,
+      "k_params": 3,
+      "n": 301
+    }
+  }
+}
