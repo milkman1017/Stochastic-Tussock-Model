@@ -25,7 +25,7 @@ except Exception:
 # ------------------------------------------------------
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Tussock model parameterization (SPSA; barrier constraints)"
+        description="Tussock model parameterization (Nelder–Mead; barrier constraints)"
     )
 
     parser.add_argument(
@@ -41,6 +41,8 @@ def parse_args():
 
     parser.add_argument("--max_evals", type=int, default=200, help="Max objective evaluations per site.")
     parser.add_argument("--n_init", type=int, default=25, help="Number of random initial trials per site.")
+    parser.add_argument("--tol_f", type=float, default=1e-3, help="Stop if simplex loss spread < tol_f.")
+    parser.add_argument("--tol_x", type=float, default=1e-3, help="Stop if simplex size < tol_x.")
 
     parser.add_argument(
         "--init_log10_span",
@@ -50,6 +52,19 @@ def parse_args():
             "Random init multiplicative span around current values (log10-space). "
             "Each param is multiplied by 10**U(-span, +span)."
         ),
+    )
+
+    parser.add_argument(
+        "--step_frac",
+        type=float,
+        default=0.2,
+        help="Initial simplex step as a fraction of |x0| (fallback to step_abs if x0 ~ 0).",
+    )
+    parser.add_argument(
+        "--step_abs",
+        type=float,
+        default=0.3,
+        help="Fallback absolute step for parameters whose x0 is near zero.",
     )
 
     parser.add_argument(
@@ -75,53 +90,6 @@ def parse_args():
     # plotting controls (BIG speed lever)
     parser.add_argument("--plot_every", type=int, default=10, help="Plot every N evaluations (0 disables plotting).")
     parser.add_argument("--plot_kde", action="store_true", help="Use seaborn KDE for plots (slow).")
-
-    # ------------------------------------------------------
-    # Optimizer controls: SPSA (gradient-ish descent)
-    # ------------------------------------------------------
-    parser.add_argument(
-        "--opt_method",
-        choices=["spsa"],
-        default="spsa",
-        help="Optimization method (currently: spsa).",
-    )
-
-    parser.add_argument(
-        "--spsa_lr0",
-        type=float,
-        default=0.2,
-        help="SPSA base learning rate a0 (ak = a0/(k+A)^alpha).",
-    )
-    parser.add_argument(
-        "--spsa_c0",
-        type=float,
-        default=0.1,
-        help="SPSA base perturbation scale c0 (ck = c0/k^gamma).",
-    )
-    parser.add_argument(
-        "--spsa_alpha",
-        type=float,
-        default=0.602,
-        help="SPSA learning-rate decay exponent alpha.",
-    )
-    parser.add_argument(
-        "--spsa_gamma",
-        type=float,
-        default=0.101,
-        help="SPSA perturbation decay exponent gamma.",
-    )
-    parser.add_argument(
-        "--spsa_A",
-        type=float,
-        default=10.0,
-        help="SPSA stability constant A (typically ~0.1 * iters).",
-    )
-    parser.add_argument(
-        "--spsa_seed",
-        type=int,
-        default=123,
-        help="Random seed for SPSA perturbations.",
-    )
 
     return parser.parse_args()
 
@@ -183,7 +151,6 @@ def initialize_random_parameters_file(param_file: str, config: configparser.Conf
         for k, v in params.items():
             f.write(f"{k}={v}\n")
     return params
-
 
 def read_parameters_file(param_file: str, config: configparser.ConfigParser) -> OrderedDict:
     """
@@ -658,62 +625,96 @@ def write_optimization_results(parameters: OrderedDict, loss: float, iteration_l
 
 
 # ------------------------------------------------------
-# SPSA (gradient-ish, 2 evals per iteration)
+# Nelder–Mead (no SciPy)
 # ------------------------------------------------------
-def spsa_optimize(
-    f,
-    x0,
-    project_fn,
-    max_iters,
-    lr0=0.2,          # a0
-    c0=0.1,           # c0
-    alpha=0.602,      # learning rate decay exponent
-    gamma=0.101,      # perturbation decay exponent
-    A=10.0,           # stability constant
-    seed=123,
-):
-    rng = np.random.default_rng(seed)
-    x = project_fn(np.array(x0, dtype=float))
+def nelder_mead(f, x0, step, max_evals, tol_f, tol_x, project_fn):
+    alpha = 1.0
+    gamma = 2.0
+    rho = 0.5
+    sigma = 0.5
 
-    best_x = x.copy()
-    best_f = float("inf")
-    evals_used = 0
+    n = x0.size
 
-    for k in range(1, max_iters + 1):
-        ak = lr0 / ((k + A) ** alpha)
-        ck = c0 / (k ** gamma)
+    simplex = [project_fn(x0)]
+    for i in range(n):
+        xi = x0.copy()
+        xi[i] += step[i]
+        simplex.append(project_fn(xi))
 
-        # Rademacher perturbation (+1/-1)
-        delta = rng.choice([-1.0, 1.0], size=x.shape)
+    fvals = []
+    evals = 0
+    for x in simplex:
+        fvals.append(f(x))
+        evals += 1
 
-        x_plus = project_fn(x + ck * delta)
-        x_minus = project_fn(x - ck * delta)
+    while evals < max_evals:
+        order = np.argsort(fvals)
+        simplex = [simplex[i] for i in order]
+        fvals = [fvals[i] for i in order]
 
-        f_plus = f(x_plus)
-        evals_used += 1
+        f_spread = max(fvals) - min(fvals)
+        best = simplex[0]
+        sizes = [np.linalg.norm(x - best) for x in simplex[1:]]
+        x_spread = max(sizes) if sizes else 0.0
 
-        f_minus = f(x_minus)
-        evals_used += 1
+        if f_spread < tol_f and x_spread < tol_x:
+            break
 
-        # Gradient estimate
-        ghat = (f_plus - f_minus) / (2.0 * ck) * (1.0 / delta)
+        x_bar = np.mean(simplex[:-1], axis=0)
+        x_worst = simplex[-1]
 
-        # Step
-        x = project_fn(x - ak * ghat)
+        x_r = project_fn(x_bar + alpha * (x_bar - x_worst))
+        f_r = f(x_r)
+        evals += 1
 
-        # Track best using endpoints (no extra eval)
-        if f_plus <= f_minus:
-            cand_f = f_plus
-            cand_x = x_plus
+        if fvals[0] <= f_r < fvals[-2]:
+            simplex[-1] = x_r
+            fvals[-1] = f_r
+            continue
+
+        if f_r < fvals[0]:
+            x_e = project_fn(x_bar + gamma * (x_r - x_bar))
+            f_e = f(x_e)
+            evals += 1
+
+            if f_e < f_r:
+                simplex[-1] = x_e
+                fvals[-1] = f_e
+            else:
+                simplex[-1] = x_r
+                fvals[-1] = f_r
+            continue
+
+        if f_r < fvals[-1]:
+            x_c = project_fn(x_bar + rho * (x_r - x_bar))
         else:
-            cand_f = f_minus
-            cand_x = x_minus
+            x_c = project_fn(x_bar + rho * (x_worst - x_bar))
 
-        if cand_f < best_f:
-            best_f = float(cand_f)
-            best_x = np.array(cand_x, dtype=float).copy()
+        f_c = f(x_c)
+        evals += 1
 
-    return best_x, best_f, evals_used
+        if f_c < fvals[-1]:
+            simplex[-1] = x_c
+            fvals[-1] = f_c
+            continue
+
+        x_best = simplex[0]
+        new_simplex = [x_best]
+        new_fvals = [fvals[0]]
+        for i in range(1, n + 1):
+            x_s = project_fn(x_best + sigma * (simplex[i] - x_best))
+            f_s = f(x_s)
+            evals += 1
+            new_simplex.append(x_s)
+            new_fvals.append(f_s)
+            if evals >= max_evals:
+                break
+
+        simplex = new_simplex
+        fvals = new_fvals
+
+    order = np.argsort(fvals)
+    return simplex[order[0]], fvals[order[0]], evals
 
 
 # ------------------------------------------------------
@@ -873,9 +874,6 @@ def main():
             print(f"[{site_tag}] eval {eval_label:03d}  loss={loss:.6g}")
             return loss
 
-        # ------------------------------------------------------
-        # Random initialization trials (kept)
-        # ------------------------------------------------------
         print(f"[{site_tag}] random init trials: {args.n_init}")
 
         best_init_loss = float("inf")
@@ -889,29 +887,25 @@ def main():
                 best_init_loss = loss_trial
                 best_init_params = trial_params
 
-        # ------------------------------------------------------
-        # SPSA optimization (uses remaining eval budget)
-        # ------------------------------------------------------
         x0 = project_vec(params_to_x(best_init_params))
 
+        step = np.zeros_like(x0)
+        for i in range(x0.size):
+            mag = abs(x0[i])
+            step[i] = args.step_frac * mag if mag > 1e-12 else args.step_abs
+
         remaining_budget = max(0, args.max_evals - eval_label)
-        print(f"[{site_tag}] starting SPSA (remaining eval budget: {remaining_budget})")
+        print(f"[{site_tag}] starting Nelder–Mead (remaining eval budget: {remaining_budget})")
 
-        if remaining_budget > 1:
-            # SPSA uses 2 evals per iteration
-            max_iters = max(1, remaining_budget // 2)
-
-            best_x, best_f, used = spsa_optimize(
+        if remaining_budget > 0:
+            best_x, best_f, used = nelder_mead(
                 f=objective_vec,
                 x0=x0,
+                step=step,
+                max_evals=args.max_evals,
+                tol_f=args.tol_f,
+                tol_x=args.tol_x,
                 project_fn=project_vec,
-                max_iters=max_iters,
-                lr0=args.spsa_lr0,
-                c0=args.spsa_c0,
-                alpha=args.spsa_alpha,
-                gamma=args.spsa_gamma,
-                A=args.spsa_A,
-                seed=args.spsa_seed,
             )
         else:
             best_x = x0
