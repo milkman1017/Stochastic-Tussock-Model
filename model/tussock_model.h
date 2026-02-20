@@ -9,8 +9,6 @@
 
 class Tiller {
 public:
-    // Added dead_leaf_area with default = 0
-    // Root necromass volumes (pool + cumulative)
     Tiller(int age,
            double radius,
            double x,
@@ -21,7 +19,8 @@ public:
            float leaf_area,
            float dead_leaf_area = 0.0f,
            float root_necro_vol = 0.0f,
-           float root_necro_vol_cum = 0.0f)
+           float root_necro_vol_cum = 0.0f,
+           float root_diam_mm = 1.0f)
         : age(age),
           radius(radius),
           x(x),
@@ -32,7 +31,8 @@ public:
           leaf_area(leaf_area),
           dead_leaf_area(dead_leaf_area),
           root_necro_vol(root_necro_vol),
-          root_necro_vol_cum(root_necro_vol_cum) {}
+          root_necro_vol_cum(root_necro_vol_cum),
+          root_diam_mm(root_diam_mm) {}
 
     double getRadius() const { return radius; }
 
@@ -48,23 +48,20 @@ public:
 
     float getLeafArea() const { return leaf_area; }
 
-    // Dead leaf pool (area units)
     float getDeadLeafArea() const { return dead_leaf_area; }
 
-    // Root necromass pools (volume units)
     float getRootNecroVol() const { return root_necro_vol; }
     float getRootNecroVolCum() const { return root_necro_vol_cum; }
 
-    // --- conversions (from Methods) ---
+    float getRootDiamMM() const { return root_diam_mm; }
+
     // SLA = 98 cm^2 g^-1  (Schedlbauer et al. 2018)
     static constexpr float SLA_CM2_PER_G = 98.0f;
 
     // Root tissue density ~ 0.21 g/cm^3 (Carex mean from GRooT proxy)
     static constexpr float RHO_ROOT_G_PER_CM3 = 0.21f;
 
-    // Computed necromass (dry mass)
     float getDeadLeafMass() const {
-        // Assumes dead_leaf_area is in cm^2. If dead_leaf_area is mm^2, convert first: *0.01f.
         return dead_leaf_area / SLA_CM2_PER_G;
     }
 
@@ -87,7 +84,13 @@ public:
         z += 0.2; // simulates the growth of the stem base every year
     }
 
-    void growRoots(int new_roots) { num_roots = new_roots; }
+    void setRoots(int new_roots, float diam_mm) {
+        num_roots = new_roots;
+        root_diam_mm = diam_mm;
+        if (num_roots < 0) num_roots = 0;
+        if (root_diam_mm < 0.5f) root_diam_mm = 0.5f;
+        if (root_diam_mm > 5.0f) root_diam_mm = 5.0f;
+    }
 
     bool isOverlapping(const Tiller& other) const {
         double distance = std::sqrt(std::pow(x - other.getX(), 2) + std::pow(y - other.getY(), 2));
@@ -107,7 +110,6 @@ public:
         y += move_distance * std::sin(move_angle);
     }
 
-    // Dead leaf pool: D_{t+1} = 0.75 * D_t + A_t  (25% mass/volume loss per year)
     void accumulateDeadLeafArea(float prev_leaf_area) {
         dead_leaf_area = 0.75f * dead_leaf_area + prev_leaf_area;
         if (dead_leaf_area < 0) dead_leaf_area = 0;
@@ -118,30 +120,24 @@ public:
         if (dead_leaf_area < 0) dead_leaf_area = 0;
     }
 
-    // Root necromass accounting
-    // Assumption: previous year's roots die/turn over and enter necromass once per year.
-    // pool decays by 15%/yr (i.e., multiply by 0.85), cumulative never decays.
-    static constexpr float ROOT_CONE_DIAMETER_MM = 1.0f;
     static constexpr float ROOT_LENGTH_CM = 50.0f;
 
-    static inline float perRootConeVolumeCm3() {
-        // diameter 1 mm => radius 0.5 mm = 0.05 cm
-        const float r_cm = (ROOT_CONE_DIAMETER_MM * 0.1f) * 0.5f; // 1 mm = 0.1 cm
+    static inline float perRootConeVolumeCm3(float diam_mm) {
+        // diameter mm -> radius cm
+        const float r_cm = (diam_mm * 0.1f) * 0.5f; // 1 mm = 0.1 cm
         const float h_cm = ROOT_LENGTH_CM;
         const float pi = 3.14159265358979323846f;
         return (1.0f / 3.0f) * pi * r_cm * r_cm * h_cm;
     }
 
-    void accumulateRootNecroFromPrevRoots(int prev_roots) {
+    void accumulateRootNecroFromPrevRoots(int prev_roots, float prev_diam_mm) {
         if (prev_roots <= 0) return;
-        const float v_per_root = perRootConeVolumeCm3();
+        const float v_per_root = perRootConeVolumeCm3(prev_diam_mm);
         const float add = v_per_root * static_cast<float>(prev_roots);
 
-        // decaying necro pool (15%/yr decay + additions)
         root_necro_vol = 0.85f * root_necro_vol + add;
         if (root_necro_vol < 0) root_necro_vol = 0;
 
-        // cumulative necro (no decay)
         root_necro_vol_cum += add;
         if (root_necro_vol_cum < 0) root_necro_vol_cum = 0;
     }
@@ -149,24 +145,15 @@ public:
     void decayRootNecroPool() {
         root_necro_vol *= 0.85f;
         if (root_necro_vol < 0) root_necro_vol = 0;
-        // cumulative does not decay
     }
 
     void decay() {
-        // For dead tillers: living leaf tissue is gone; only dead pools persist.
         leaf_area = 0.0f;
 
-        // --- necromass proportional decay ---
-        // Leaf litter: 25% y-o-y mass loss => multiply mass/volume by 0.75
-        // If we assume constant bulk density and fixed height, volume ∝ R^2,
-        // so radius scales as sqrt(volume fraction).
         static constexpr double LEAF_NECRO_FRAC = 0.75;
         radius *= std::sqrt(LEAF_NECRO_FRAC);
 
-        // Dead leaf pool decays by 25% every year
         dead_leaf_area *= 0.75f;
-
-        // Root necro pool decays by 15% every year
         root_necro_vol *= 0.85f;
 
         if (radius < 0) radius = 0;
@@ -191,28 +178,27 @@ public:
         double xOffset      = randomRadius * std::cos(randomAngle);
         double yOffset      = randomRadius * std::sin(randomAngle);
 
-        // 0.1 is to ensure that the daughter tiller is made slightly above the parent
         double zOffset = 0.1 * static_cast<double>(std::rand()) / RAND_MAX;
 
         double newX = x + xOffset;
         double newY = y + yOffset;
         double newZ = z + zOffset;
 
-        // daughter starts with dead pools = 0
-        return Tiller(1, 0.25, newX, newY, newZ, 3, 1, 50, 0.0f, 0.0f, 0.0f);
+        // Daughter tillers start with leaf area = 50
+        return Tiller(1, 0.25, newX, newY, newZ, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f);
     }
 
 private:
     int age;
-    double radius, x, y, z; // radius of tiller, x,y,z coords
+    double radius, x, y, z;
     int num_roots;
-    bool status; // 1 for alive, 0 for dead
+    bool status;
     float leaf_area;
 
-    // dead leaf pool
     float dead_leaf_area;
 
-    // root necromass (volume)
-    float root_necro_vol;      // decaying pool
-    float root_necro_vol_cum;  // cumulative total
+    float root_necro_vol;
+    float root_necro_vol_cum;
+
+    float root_diam_mm;
 };
