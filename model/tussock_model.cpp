@@ -470,7 +470,7 @@ void simulate(const int max_sim_time,
     // initial tiller
     Tiller first_tiller(
         1,      // age
-        0.25,   // radius
+        0.1,   // radius
         0.0,    // x
         0.0,    // y
         0.0,    // z

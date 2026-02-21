@@ -185,7 +185,7 @@ public:
         double newZ = z + zOffset;
 
         // Daughter tillers start with leaf area = 50
-        return Tiller(1, 0.25, newX, newY, newZ, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+        return Tiller(1, 0.1, newX, newY, newZ, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f);
     }
 
 private:

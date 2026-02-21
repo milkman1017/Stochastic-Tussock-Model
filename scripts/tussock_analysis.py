@@ -1,459 +1,589 @@
-#!/usr/bin/env python3
-
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 
-def compute_tussock_radius(df_t: pd.DataFrame) -> float:
+# ============================================================
+# Globals / constants (match your C++ model)
+# ============================================================
+
+SLA_CM2_PER_G = 98.0
+ROOT_TISSUE_DENSITY_G_CM3 = 0.21
+
+ROOT_LENGTH_CM = 50.0
+MM_TO_CM = 0.1
+
+LEAF_NECRO_REMAIN_FRAC = 0.75  # dead_leaf_area *= 0.75 each year in model
+G_TO_KG = 1e-3
+
+
+def per_root_cone_volume_cm3(diam_mm: float) -> float:
+    """Matches Tiller::perRootConeVolumeCm3 in the C++ model."""
+    if np.isnan(diam_mm) or diam_mm <= 0:
+        return 0.0
+    r_cm = (diam_mm * MM_TO_CM) * 0.5
+    return (1.0 / 3.0) * np.pi * (r_cm ** 2) * ROOT_LENGTH_CM
+
+
+def live_root_volume_cm3(num_roots: float, diam_mm: float) -> float:
+    if np.isnan(num_roots) or np.isnan(diam_mm):
+        return float("nan")
+    if num_roots <= 0:
+        return 0.0
+    return float(num_roots) * per_root_cone_volume_cm3(float(diam_mm))
+
+
+# ============================================================
+# Config / CLI
+# ============================================================
+
+@dataclass(frozen=True)
+class Config:
+    input_dir: Path
+    output_dir: Path
+    n_timepoints: int
+    seed: int
+    pattern: str
+    use_only_alive_for_radius: bool
+    radius_stat: str  # "max" or "p95"
+
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Sample timesteps from sim CSVs and generate plots (PNGs only).")
+    p.add_argument("-i", "--input-dir", required=True, type=Path)
+    p.add_argument("-o", "--output-dir", required=True, type=Path)
+    p.add_argument("--n-timepoints", type=int, default=20)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--pattern", type=str, default="*.csv")
+    p.add_argument("--include-dead", action="store_true",
+                   help="If set, compute tussock radius using all tillers, not just alive.")
+    p.add_argument("--radius-stat", choices=["max", "p95"], default="max")
+
+    a = p.parse_args()
+    if not a.input_dir.exists() or not a.input_dir.is_dir():
+        raise NotADirectoryError(f"Input directory not found or not a directory: {a.input_dir}")
+    a.output_dir.mkdir(parents=True, exist_ok=True)
+
+    return Config(
+        input_dir=a.input_dir,
+        output_dir=a.output_dir,
+        n_timepoints=a.n_timepoints,
+        seed=a.seed,
+        pattern=a.pattern,
+        use_only_alive_for_radius=not a.include_dead,
+        radius_stat=a.radius_stat,
+    )
+
+
+# ============================================================
+# IO / Sampling
+# ============================================================
+
+def list_sim_csvs(input_dir: Path, pattern: str) -> list[Path]:
+    files = sorted(input_dir.glob(pattern))
+    if not files:
+        raise FileNotFoundError(f"No files matched pattern '{pattern}' in {input_dir}")
+    return files
+
+
+def read_sim_csv(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
+def sample_timesteps(timesteps: np.ndarray, n: int, rng: np.random.Generator) -> np.ndarray:
+    timesteps = np.array(timesteps, dtype=int)
+    timesteps = np.unique(timesteps)
+    if timesteps.size == 0:
+        return np.array([], dtype=int)
+    k = min(n, timesteps.size)
+    sampled = rng.choice(timesteps, size=k, replace=False)
+    sampled.sort()
+    return sampled
+
+
+# ============================================================
+# Radius (coords are cm)
+# ============================================================
+
+def radial_distance_xy_cm(sub: pd.DataFrame) -> np.ndarray:
+    if "X" in sub.columns and "Y" in sub.columns:
+        x = sub["X"].to_numpy(dtype=float)
+        y = sub["Y"].to_numpy(dtype=float)
+        return np.sqrt(x * x + y * y)
+    if "X" in sub.columns and "Z" in sub.columns:
+        x = sub["X"].to_numpy(dtype=float)
+        z = sub["Z"].to_numpy(dtype=float)
+        return np.sqrt(x * x + z * z)
+    raise ValueError("Missing coordinate columns: need (X,Y) or (X,Z).")
+
+
+def summarize_radius_cm(r_cm: np.ndarray, stat: str) -> float:
+    if r_cm.size == 0:
+        return float("nan")
+    if stat == "max":
+        return float(np.nanmax(r_cm))
+    if stat == "p95":
+        return float(np.nanpercentile(r_cm, 95))
+    raise ValueError(f"Unknown stat: {stat}")
+
+
+# ============================================================
+# Derived columns (in-memory only)
+# ============================================================
+
+def add_live_root_mass_from_cone(df: pd.DataFrame) -> pd.DataFrame:
+    """Add RootVolLive_cm3 and RootMassLive_g using the cone geometry from your C++ model."""
+    df = df.copy()
+    if {"NumRoots", "RootDiamMM"}.issubset(df.columns):
+        vols = [
+            live_root_volume_cm3(nr, dmm)
+            for nr, dmm in zip(df["NumRoots"].astype(float), df["RootDiamMM"].astype(float))
+        ]
+        df["RootVolLive_cm3"] = np.array(vols, dtype=float)
+        df["RootMassLive_g"] = df["RootVolLive_cm3"] * ROOT_TISSUE_DENSITY_G_CM3
+    else:
+        df["RootVolLive_cm3"] = np.nan
+        df["RootMassLive_g"] = np.nan
+    return df
+
+
+# ============================================================
+# Timestep summary + productivity + decomposition proxies
+# ============================================================
+
+def _pick_id_column(df: pd.DataFrame) -> str | None:
     """
-    Tussock radius at a timestep using ALL tillers (alive + dead):
-      max( sqrt(X^2 + Y^2) + tiller Radius )
+    Try to find a stable tiller identifier column for dead-tiller (count) dynamics.
+    Adjust/extend this list to match your sim output.
     """
-    if len(df_t) == 0:
-        return np.nan
-
-    r_xy = np.sqrt(df_t["X"].to_numpy() ** 2 + df_t["Y"].to_numpy() ** 2)
-    r_tiller = df_t["Radius"].to_numpy()
-    return float(np.max(r_xy + r_tiller))
-
-
-def compute_eta_capacity(tussock_radius: float, mean_diameter: float) -> float:
-    """
-    Hexagonal packing capacity from Curasi et al.:
-      eta(t) = pi * r(t)^2 / (theta^2 * sqrt(12))
-    where theta is mean tiller diameter.
-
-    Returns NaN if inputs are invalid.
-    """
-    if not np.isfinite(tussock_radius) or tussock_radius <= 0:
-        return np.nan
-    if not np.isfinite(mean_diameter) or mean_diameter <= 0:
-        return np.nan
-    return float(np.pi * (tussock_radius ** 2) / ((mean_diameter ** 2) * np.sqrt(12.0)))
+    candidates = ["TillerID", "TillerId", "ID", "Id", "uid", "UID", "tiller_id", "tillerID"]
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
 
-def summarize_by_timestep(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Returns a per-timestep summary with columns:
-      TimeStep, tussock_radius, n_alive, n_total, density, prop_new,
-      mean_diameter, eta_capacity, packing_index_total, packing_index_alive
-
-    - tussock_radius computed from ALL tillers (alive+dead)
-    - n_alive/density/prop_new computed from alive tillers (Status==1)
-    - n_total = total tillers (alive + dead)
-    - density = n_alive / (pi * tussock_radius^2)
-    - prop_new = (# alive with Age==1) / n_alive
-
-    Packing index additions (per Curasi et al.):
-      eta_capacity = pi * r^2 / (theta^2 * sqrt(12))
-      packing_index_total = n_total / eta_capacity
-      packing_index_alive = n_alive / eta_capacity
-    """
-    required = ["TimeStep", "Age", "Radius", "X", "Y", "Status"]
-    missing = [c for c in required if c not in df.columns]
+def build_timestep_summary(df: pd.DataFrame, use_only_alive_for_radius: bool, radius_stat: str) -> pd.DataFrame:
+    required = {"TimeStep", "Status", "RootNecroMass", "RootNecroMassCum", "DeadLeafMass", "LeafArea"}
+    missing = required - set(df.columns)
     if missing:
-        raise ValueError(f"Missing required columns: {missing}")
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-    out_rows = []
-    for t, df_t in df.groupby("TimeStep", sort=True):
-        tuss_r = compute_tussock_radius(df_t)
+    alive_counts = df.groupby("TimeStep")["Status"].apply(lambda s: int((s == 1).sum())).astype(float)
 
-        alive = df_t[df_t["Status"] == 1]
-        n_alive = int(len(alive))
-        n_total = int(len(df_t))
+    radii = {}
+    for t, sub in df.groupby("TimeStep"):
+        sub_for_radius = sub[sub["Status"] == 1] if use_only_alive_for_radius else sub
+        r_cm = radial_distance_xy_cm(sub_for_radius)
+        radii[int(t)] = summarize_radius_cm(r_cm, radius_stat)
 
-        area = np.pi * (tuss_r ** 2) if np.isfinite(tuss_r) and tuss_r > 0 else np.nan
-        density = (n_alive / area) if (np.isfinite(area) and area > 0) else np.nan
+    total_root_necro_g = df.groupby("TimeStep")["RootNecroMass"].sum().astype(float)
+    total_root_necro_cum_g = df.groupby("TimeStep")["RootNecroMassCum"].sum().astype(float)
+    total_dead_leaf_mass_g = df.groupby("TimeStep")["DeadLeafMass"].sum().astype(float)
 
-        n_new = int(len(alive[alive["Age"] == 1])) if n_alive > 0 else 0
-        prop_new = (n_new / n_alive) if n_alive > 0 else np.nan
+    # Total live leaf mass (g): sum LeafArea then divide by SLA
+    total_leaf_mass_g = df.groupby("TimeStep")["LeafArea"].sum().astype(float) / SLA_CM2_PER_G
 
-        # mean tiller diameter theta from the per-tiller Radius column
-        # (assumes Radius is the tiller radius at that timestep)
-        rad = pd.to_numeric(df_t["Radius"], errors="coerce").to_numpy(dtype=float)
-        mean_rad = float(np.nanmean(rad)) if np.isfinite(rad).any() else np.nan
-        mean_diam = 2.0 * mean_rad if np.isfinite(mean_rad) else np.nan
+    if "RootMassLive_g" in df.columns:
+        total_live_root_mass_g = df.groupby("TimeStep")["RootMassLive_g"].sum().astype(float)
+    else:
+        total_live_root_mass_g = pd.Series(index=alive_counts.index, data=np.nan, dtype=float)
 
-        eta = compute_eta_capacity(tuss_r, mean_diam)
+    out = pd.DataFrame({
+        "TimeStep": alive_counts.index.astype(int),
+        "alive_tillers": alive_counts.values,
+        "tussock_radius_cm": pd.Series(radii).reindex(alive_counts.index).values,
+        "total_root_necromass_g": total_root_necro_g.reindex(alive_counts.index).values,
+        "total_root_necromass_kg": (total_root_necro_g.reindex(alive_counts.index).values * G_TO_KG),
+        "total_root_necromasscum_g": total_root_necro_cum_g.reindex(alive_counts.index).values,
+        "total_dead_leaf_mass_g": total_dead_leaf_mass_g.reindex(alive_counts.index).values,
+        "total_leaf_mass_g": total_leaf_mass_g.reindex(alive_counts.index).values,
+        "total_live_root_mass_g": total_live_root_mass_g.reindex(alive_counts.index).values,
+    }).sort_values("TimeStep")
 
-        packing_total = (n_total / eta) if (np.isfinite(eta) and eta > 0) else np.nan
-        packing_alive = (n_alive / eta) if (np.isfinite(eta) and eta > 0) else np.nan
-
-        out_rows.append(
-            {
-                "TimeStep": int(t),
-                "tussock_radius": tuss_r,
-                "n_alive": n_alive,
-                "n_total": n_total,
-                "density": density,
-                "prop_new": prop_new,
-                "mean_diameter": mean_diam,
-                "eta_capacity": eta,
-                "packing_index_total": packing_total,
-                "packing_index_alive": packing_alive,
-            }
-        )
-
-    return pd.DataFrame(out_rows).sort_values("TimeStep").reset_index(drop=True)
+    out["live_root_mass_per_tiller_g"] = out["total_live_root_mass_g"] / out["alive_tillers"].replace(0, np.nan)
+    return out
 
 
-def pick_random_timesteps(summary: pd.DataFrame, n: int, rng: np.random.Generator) -> pd.DataFrame:
-    if len(summary) == 0:
-        return summary
-    if len(summary) <= n:
-        return summary.copy()
-    idx = rng.choice(summary.index.to_numpy(), size=n, replace=False)
-    return summary.loc[np.sort(idx)].copy()
+def add_root_productivity(summary: pd.DataFrame) -> pd.DataFrame:
+    """
+    Turnover-aware productivity proxy (g per tiller per year):
+      RootProd(t) =
+          max(0, LiveRoot_per_tiller(t) - LiveRoot_per_tiller(t-1))
+          + NecromassProduced_per_tiller(t)
+    with NecromassProduced(t) = diff(total RootNecroMassCum).
+    """
+    s = summary.copy()
+    necro_prod_g = s["total_root_necromasscum_g"].diff().clip(lower=0).fillna(0.0)
+    necro_prod_per_tiller_g = necro_prod_g / s["alive_tillers"].replace(0, np.nan)
+    d_live_pos = s["live_root_mass_per_tiller_g"].diff().clip(lower=0)
+    s["root_productivity_g_per_tiller_per_yr"] = d_live_pos + necro_prod_per_tiller_g
+    return s
 
 
-def ecdf(values: np.ndarray):
-    """Return x (sorted) and y (ECDF values) for finite values."""
-    v = np.asarray(values, dtype=float)
-    v = v[np.isfinite(v)]
-    if v.size == 0:
-        return np.array([]), np.array([])
-    x = np.sort(v)
-    y = np.arange(1, x.size + 1) / x.size
-    return x, y
+def add_decomposition_metrics(summary: pd.DataFrame, df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds metrics in BOTH flux form (g/yr, tillers/yr) and first-order rate-constant form (yr^-1).
+
+    ROOT necromass:
+      M(t) = standing pool (g)
+      add(t) = newly produced necromass (g) inferred from cumulative
+      loss_flux(t) = M(t-1) + add(t) - M(t)  (clipped >= 0)
+      k_root(t) = loss_flux(t) / M(t-1)
+
+    DEAD TILLERS (preferred; requires stable tiller ID):
+      ND(t) = count of dead tillers
+      newDead(t) = count of alive->dead transitions between t-1 and t (needs ID)
+      removed(t) = ND(t-1) + newDead(t) - ND(t)  (clipped >= 0)
+      k_dead(t) = removed(t) / ND(t-1)
+
+    LEAF LITTER (fallback if no ID):
+      Uses your remain fraction; k_leaf is constant = -ln(remain_frac).
+    """
+    s = summary.copy()
+
+    # ---- ROOT ----
+    M = s["total_root_necromass_g"].astype(float)
+    add = s["total_root_necromasscum_g"].diff().clip(lower=0).fillna(0.0)
+
+    root_loss_flux_g = (M.shift(1) + add - M).clip(lower=0)
+    s["root_decomp_flux_g_per_yr"] = root_loss_flux_g
+
+    denom_M = M.shift(1)
+    s["k_root_per_yr"] = (root_loss_flux_g / denom_M).where(denom_M > 0)
+
+    # ---- DEAD TILLERS (count pool) if possible ----
+    id_col = _pick_id_column(df_raw)
+    if id_col is not None:
+        # Build per-timestep alive/dead sets using ID
+        t_vals = np.array(sorted(df_raw["TimeStep"].dropna().astype(int).unique()))
+        dead_counts = {}
+        new_dead = {}
+
+        for i, t in enumerate(t_vals):
+            sub = df_raw[df_raw["TimeStep"].astype(int) == int(t)]
+            dead_ids = set(sub.loc[sub["Status"] != 1, id_col].dropna().astype(str).tolist())
+            alive_ids = set(sub.loc[sub["Status"] == 1, id_col].dropna().astype(str).tolist())
+            dead_counts[int(t)] = float(len(dead_ids))
+
+            if i == 0:
+                new_dead[int(t)] = 0.0
+            else:
+                t_prev = int(t_vals[i - 1])
+                sub_prev = df_raw[df_raw["TimeStep"].astype(int) == t_prev]
+                alive_prev = set(sub_prev.loc[sub_prev["Status"] == 1, id_col].dropna().astype(str).tolist())
+
+                # Alive -> Dead transitions
+                new_dead[int(t)] = float(len(alive_prev.intersection(dead_ids)))
+
+        ND = pd.Series(dead_counts).reindex(s["TimeStep"].astype(int)).astype(float)
+        newD = pd.Series(new_dead).reindex(s["TimeStep"].astype(int)).astype(float).fillna(0.0)
+
+        s["dead_tillers"] = ND.values
+        s["new_dead_tillers"] = newD.values
+
+        removed_dead = (ND.shift(1) + newD - ND).clip(lower=0)
+        s["dead_tiller_removed_per_yr"] = removed_dead
+
+        denom_ND = ND.shift(1)
+        s["k_dead_tiller_per_yr"] = (removed_dead / denom_ND).where(denom_ND > 0)
+
+        # For backward compatibility with your plotting variable name:
+        # "tiller decomposition rate density" will now mean k_dead_tiller_per_yr (yr^-1)
+        s["tiller_decomp_rate_for_density"] = s["k_dead_tiller_per_yr"]
+        s["tiller_decomp_density_xlabel"] = "yr$^{-1}$ (dead tiller removal)"
+        s["tiller_decomp_density_title"] = "Dead tiller removal rate constant density"
+
+    else:
+        # ---- Fallback: leaf litter first-order k implied by remain fraction ----
+        # Note: This is NOT the same as paper's dead-tiller removal k_D, but at least it is comparable in units/form.
+        k_leaf = float(-np.log(LEAF_NECRO_REMAIN_FRAC))
+        s["k_leaf_per_yr"] = k_leaf
+
+        # Put into the plotting slot as a constant series so the density panel remains.
+        s["tiller_decomp_rate_for_density"] = k_leaf
+        s["tiller_decomp_density_xlabel"] = "yr$^{-1}$ (leaf litter, implied)"
+        s["tiller_decomp_density_title"] = "Leaf litter decay rate constant density (fallback)"
+
+    return s
 
 
-def plot_radius_vs_time(all_summaries: dict, outdir: Path):
-    all_ts = sorted(set(np.concatenate([s["TimeStep"].to_numpy() for s in all_summaries.values()])))
-    aligned = []
+def root_necromass_bulk_density_g_cm3(total_root_necro_g: float, tussock_radius_cm: float) -> float:
+    """
+    Proxy bulk density: total root necromass (g) / cylinder volume (cm^3) with depth ROOT_LENGTH_CM.
+    """
+    if not np.isfinite(total_root_necro_g) or not np.isfinite(tussock_radius_cm):
+        return float("nan")
+    if tussock_radius_cm <= 0:
+        return float("nan")
+    vol_cm3 = np.pi * (tussock_radius_cm ** 2) * ROOT_LENGTH_CM
+    return float(total_root_necro_g) / vol_cm3
 
-    plt.figure(figsize=(10, 6))
 
-    for s in all_summaries.values():
-        ser = pd.Series(s["tussock_radius"].to_numpy(), index=s["TimeStep"].to_numpy())
-        ser = ser.reindex(all_ts)
-        aligned.append(ser.to_numpy())
-        plt.plot(all_ts, ser.to_numpy(), linewidth=1.0, alpha=0.2)
+# ============================================================
+# Plot helpers
+# ============================================================
 
-    mean_r = np.nanmean(np.vstack(aligned), axis=0)
-    plt.plot(all_ts, mean_r, linewidth=3.0)
+def save_scatter(x, y, xlabel, ylabel, title, outpath: Path):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x = x[ok]
+    y = y[ok]
 
-    plt.xlabel("TimeStep")
-    plt.ylabel("Tussock radius (all tillers)")
-    plt.title("Tussock radius vs TimeStep (per sim + mean)")
+    plt.figure()
+    plt.scatter(x, y, s=20)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
     plt.tight_layout()
-    plt.savefig(outdir / "tussock_radius_vs_time.png", dpi=300)
+    plt.savefig(outpath, dpi=300)
     plt.close()
 
 
-def plot_alive_vs_radius_random(all_summaries: dict, outdir: Path, n_points: int, rng: np.random.Generator):
-    xs, ys = [], []
-    for s in all_summaries.values():
-        sub = pick_random_timesteps(s, n_points, rng)
-        xs.append(sub["tussock_radius"].to_numpy())
-        ys.append(sub["n_alive"].to_numpy())
+def save_scatter_with_regression(x, y, xlabel, ylabel, title, outpath: Path):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x = x[ok]
+    y = y[ok]
 
-    x = np.concatenate(xs) if xs else np.array([])
-    y = np.concatenate(ys) if ys else np.array([])
+    plt.figure()
+    plt.scatter(x, y, s=20)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
 
-    plt.figure(figsize=(8, 6))
-    plt.scatter(x, y, s=20, alpha=0.6)
-    plt.xlabel("Tussock radius (all tillers)")
-    plt.ylabel("Number of alive tillers")
-    plt.title(f"Alive tillers vs radius (random {n_points}/sim)")
+    if x.size >= 2:
+        m, b = np.polyfit(x, y, 1)
+        xs = np.linspace(x.min(), x.max(), 100)
+        ys = m * xs + b
+        plt.plot(xs, ys, linestyle="--")
+
     plt.tight_layout()
-    plt.savefig(outdir / "alive_tillers_vs_radius_scatter.png", dpi=300)
+    plt.savefig(outpath, dpi=300)
     plt.close()
 
 
-def plot_total_vs_radius_random(all_summaries: dict, outdir: Path, n_points: int, rng: np.random.Generator):
-    xs, ys = [], []
-    for s in all_summaries.values():
-        sub = pick_random_timesteps(s, n_points, rng)
-        xs.append(sub["tussock_radius"].to_numpy())
-        ys.append(sub["n_total"].to_numpy())
-
-    x = np.concatenate(xs) if xs else np.array([])
-    y = np.concatenate(ys) if ys else np.array([])
-
-    plt.figure(figsize=(8, 6))
-    plt.scatter(x, y, s=20, alpha=0.6)
-    plt.xlabel("Tussock radius (all tillers)")
-    plt.ylabel("Total number of tillers (alive + dead)")
-    plt.title(f"Total tillers vs radius (random {n_points}/sim)")
+def save_hist_density(x, xlabel, ylabel, title, outpath: Path, bins: int = 30):
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    plt.figure()
+    plt.hist(x, bins=bins, density=True)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
     plt.tight_layout()
-    plt.savefig(outdir / "total_tillers_vs_radius_scatter.png", dpi=300)
+    plt.savefig(outpath, dpi=300)
     plt.close()
 
 
-def plot_density_vs_radius_scatter(all_summaries: dict, outdir: Path, n_points: int, rng: np.random.Generator):
-    xs, ys = [], []
-    for s in all_summaries.values():
-        sub = pick_random_timesteps(s, n_points, rng)
-        good = np.isfinite(sub["tussock_radius"]) & np.isfinite(sub["density"])
-        sub = sub.loc[good]
-        xs.append(sub["tussock_radius"].to_numpy())
-        ys.append(sub["density"].to_numpy())
+def save_hist_panel_one_plot(datasets, titles, xlabels, outpath: Path, bins: int = 30):
+    """
+    Put ALL density histograms (except tussock radius density) on one multi-panel figure.
+    """
+    n = len(datasets)
+    ncols = 3
+    nrows = int(np.ceil(n / ncols))
 
-    x = np.concatenate(xs) if xs else np.array([])
-    y = np.concatenate(ys) if ys else np.array([])
+    fig, axes = plt.subplots(nrows, ncols, figsize=(12, 3.5 * nrows))
+    axes = np.array(axes).ravel()
 
-    plt.figure(figsize=(8, 6))
-    plt.scatter(x, y, s=20, alpha=0.6)
-    plt.xlabel("Tussock radius (all tillers)")
-    plt.ylabel("Tiller density (alive / area)")
-    plt.title(f"Tiller density vs radius (random {n_points}/sim)")
-    plt.tight_layout()
-    plt.savefig(outdir / "density_vs_radius_scatter.png", dpi=300)
-    plt.close()
+    for i in range(nrows * ncols):
+        ax = axes[i]
+        if i >= n:
+            ax.axis("off")
+            continue
 
+        data = np.asarray(datasets[i], dtype=float)
+        data = data[np.isfinite(data)]
+        ax.hist(data, bins=bins, density=True)
+        ax.set_title(titles[i])
+        ax.set_xlabel(xlabels[i])
+        ax.set_ylabel("Density")
 
-def plot_prop_new_vs_radius_random(all_summaries: dict, outdir: Path, n_points: int, rng: np.random.Generator):
-    xs, ys = [], []
-    for s in all_summaries.values():
-        sub = pick_random_timesteps(s, n_points, rng)
-        good = np.isfinite(sub["tussock_radius"]) & np.isfinite(sub["prop_new"])
-        sub = sub.loc[good]
-        xs.append(sub["tussock_radius"].to_numpy())
-        ys.append(sub["prop_new"].to_numpy())
-
-    x = np.concatenate(xs) if xs else np.array([])
-    y = np.concatenate(ys) if ys else np.array([])
-
-    plt.figure(figsize=(8, 6))
-    plt.scatter(x, y, s=20, alpha=0.6)
-    plt.xlabel("Tussock radius (all tillers)")
-    plt.ylabel("Proportion new daughters (Age==1 among alive)")
-    plt.title(f"New daughter proportion vs radius (random {n_points}/sim)")
-    plt.tight_layout()
-    plt.savefig(outdir / "prop_new_daughters_vs_radius_scatter.png", dpi=300)
-    plt.close()
-
-
-def _plot_age_hist(ax, ages: np.ndarray, title: str):
-    ages = ages[np.isfinite(ages)]
-    if len(ages) == 0:
-        ax.set_title(title + " (no data)")
-        ax.set_xlabel("Age")
-        ax.set_ylabel("Count")
-        return
-
-    a_min = int(np.floor(np.min(ages)))
-    a_max = int(np.ceil(np.max(ages)))
-    bins = np.arange(a_min - 0.5, a_max + 1.5, 1.0)
-
-    ax.hist(ages, bins=bins)
-    ax.set_title(title)
-    ax.set_xlabel("Age")
-    ax.set_ylabel("Count")
-
-    mean_age = float(np.mean(ages))
-    ax.axvline(mean_age, color="red", linestyle="--", linewidth=2, label=f"mean: {mean_age:.2f}")
-    ax.legend()
-
-
-def plot_age_distributions_alive_dead(final_alive_ages: np.ndarray, final_dead_ages: np.ndarray, outdir: Path):
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharey=False)
-
-    _plot_age_hist(axes[0], final_alive_ages, "Age distribution (alive tillers; final timestep per sim)")
-    _plot_age_hist(axes[1], final_dead_ages, "Age distribution (dead tillers; final timestep per sim)")
-
-    fig.suptitle("Tiller age distributions")
     fig.tight_layout()
-    fig.savefig(outdir / "age_distributions_alive_vs_dead.png", dpi=300)
+    fig.savefig(outpath, dpi=300)
     plt.close(fig)
 
 
-# -----------------------
-# New plots: packing index
-# -----------------------
-
-def plot_packing_index_vs_time(all_summaries: dict, outdir: Path):
-    all_ts = sorted(set(np.concatenate([s["TimeStep"].to_numpy() for s in all_summaries.values()])))
-    aligned = []
-
-    plt.figure(figsize=(10, 6))
-    for s in all_summaries.values():
-        ser = pd.Series(s["packing_index_total"].to_numpy(), index=s["TimeStep"].to_numpy()).reindex(all_ts)
-        aligned.append(ser.to_numpy())
-        plt.plot(all_ts, ser.to_numpy(), linewidth=1.0, alpha=0.2)
-
-    mean_pi = np.nanmean(np.vstack(aligned), axis=0)
-    plt.plot(all_ts, mean_pi, linewidth=3.0)
-
-    plt.axhline(1.0, color="black", linestyle="--", linewidth=1.5, alpha=0.7)
-    plt.xlabel("TimeStep")
-    plt.ylabel("Packing index (N_total / eta)")
-    plt.title("Packing index vs TimeStep (per sim + mean)")
-    plt.tight_layout()
-    plt.savefig(outdir / "packing_index_vs_time.png", dpi=300)
-    plt.close()
-
-
-def plot_packing_index_vs_radius_random(all_summaries: dict, outdir: Path, n_points: int, rng: np.random.Generator):
-    xs, ys = [], []
-    for s in all_summaries.values():
-        sub = pick_random_timesteps(s, n_points, rng)
-        good = np.isfinite(sub["tussock_radius"]) & np.isfinite(sub["packing_index_total"])
-        sub = sub.loc[good]
-        xs.append(sub["tussock_radius"].to_numpy())
-        ys.append(sub["packing_index_total"].to_numpy())
-
-    x = np.concatenate(xs) if xs else np.array([])
-    y = np.concatenate(ys) if ys else np.array([])
-
-    plt.figure(figsize=(8, 6))
-    plt.scatter(x, y, s=20, alpha=0.6)
-    plt.axhline(1.0, color="black", linestyle="--", linewidth=1.5, alpha=0.7)
-    plt.xlabel("Tussock radius (all tillers)")
-    plt.ylabel("Packing index (N_total / eta)")
-    plt.title(f"Packing index vs radius (random {n_points}/sim)")
-    plt.tight_layout()
-    plt.savefig(outdir / "packing_index_vs_radius_scatter.png", dpi=300)
-    plt.close()
-
-
-def plot_eta_vs_total_tillers(all_summaries: dict, outdir: Path):
-    """
-    Simple diagnostic: for each sim, plot eta_capacity(t) and n_total(t) over time.
-    This shows whether the system approaches the geometric capacity.
-    """
-    plt.figure(figsize=(10, 6))
-    for name, s in all_summaries.items():
-        t = s["TimeStep"].to_numpy()
-        eta = s["eta_capacity"].to_numpy()
-        nt = s["n_total"].to_numpy()
-        # plot faint to avoid clutter
-        plt.plot(t, eta, linewidth=1.0, alpha=0.15)
-        plt.plot(t, nt, linewidth=1.0, alpha=0.15)
-
-    plt.xlabel("TimeStep")
-    plt.ylabel("Count")
-    plt.title("Eta capacity and total tillers vs TimeStep (all sims; faint)\n(each sim contributes two lines: eta and N_total)")
-    plt.tight_layout()
-    plt.savefig(outdir / "eta_capacity_vs_total_tillers.png", dpi=300)
-    plt.close()
-
-
-# -----------------------
-# New plots: ECDFs
-# -----------------------
-
-def plot_final_radius_ecdf(final_radii: np.ndarray, outdir: Path):
-    x, y = ecdf(final_radii)
-    plt.figure(figsize=(8, 6))
-    if x.size > 0:
-        plt.plot(x, y, linewidth=2.0)
-    plt.xlabel("Final tussock radius")
-    plt.ylabel("ECDF")
-    plt.title("ECDF of final tussock radius across simulations")
-    plt.tight_layout()
-    plt.savefig(outdir / "final_radius_ecdf.png", dpi=300)
-    plt.close()
-
-
-def plot_final_packing_index_ecdf(final_pi: np.ndarray, outdir: Path):
-    x, y = ecdf(final_pi)
-    plt.figure(figsize=(8, 6))
-    if x.size > 0:
-        plt.plot(x, y, linewidth=2.0)
-        plt.axvline(1.0, color="black", linestyle="--", linewidth=1.5, alpha=0.7)
-    plt.xlabel("Final packing index (N_total / eta)")
-    plt.ylabel("ECDF")
-    plt.title("ECDF of final packing index across simulations")
-    plt.tight_layout()
-    plt.savefig(outdir / "final_packing_index_ecdf.png", dpi=300)
-    plt.close()
-
+# ============================================================
+# Driver
+# ============================================================
 
 def main():
-    ap = argparse.ArgumentParser(description="Make summary plots from a directory of individual-tiller simulation CSVs.")
-    ap.add_argument("--in_dir", required=True, type=str, help="Directory containing simulation CSV files")
-    ap.add_argument("--out_dir", required=True, type=str, help="Directory to save plots into")
-    ap.add_argument("--n_random", default=20, type=int, help="Random timesteps to sample per sim for scatter plots")
-    ap.add_argument("--seed", default=123, type=int, help="RNG seed for reproducible random sampling")
-    ap.add_argument("--pattern", default="*.csv", type=str, help="Glob pattern for sim files (default: *.csv)")
-    args = ap.parse_args()
+    cfg = parse_args()
+    rng = np.random.default_rng(cfg.seed)
 
-    in_dir = Path(args.in_dir)
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    sim_paths = list_sim_csvs(cfg.input_dir, cfg.pattern)
 
-    rng = np.random.default_rng(args.seed)
+    # Scatter plots (sampled points across sims)
+    alive_x, alive_y = [], []
+    necro_x, necro_y = [], []
+    radius_vals = []
+    prod_x, prod_y = [], []
 
-    files = sorted(in_dir.glob(args.pattern))
-    if len(files) == 0:
-        raise FileNotFoundError(f"No files matched {args.pattern} in {in_dir}")
+    # Density datasets (sampled)
+    # CHANGED: now store *rate constants* (yr^-1) for decomposition to match paper form
+    k_root_rates = []
+    k_tiller_rates = []
 
-    all_summaries = {}
-    final_alive_ages = []
-    final_dead_ages = []
-    final_radii = []
-    final_packing = []
+    tiller_radii = []
+    leaf_sizes = []
+    root_necro_bulk_dens = []
 
-    for f in files:
-        df = pd.read_csv(f)
+    # These let us label the "tiller decomposition" panel appropriately depending on ID availability
+    tiller_decomp_xlabel = None
+    tiller_decomp_title = None
 
-        # Ensure TimeStep is int
-        df["TimeStep"] = pd.to_numeric(df["TimeStep"], errors="coerce").astype("Int64")
-        df = df.dropna(subset=["TimeStep"]).copy()
-        df["TimeStep"] = df["TimeStep"].astype(int)
+    for fp in sim_paths:
+        df = read_sim_csv(fp)
+        df = add_live_root_mass_from_cone(df)
 
-        # Make per-timestep summary (radius/area/packing derived)
-        summary = summarize_by_timestep(df)
-        all_summaries[f.stem] = summary
+        summary = build_timestep_summary(df, cfg.use_only_alive_for_radius, cfg.radius_stat)
+        summary = add_root_productivity(summary)
+        summary = add_decomposition_metrics(summary, df)
 
-        # Age distributions taken at FINAL timestep for each sim (avoids double-counting across time)
-        t_final = int(df["TimeStep"].max())
-        df_final = df[df["TimeStep"] == t_final].copy()
-        df_final["Age"] = pd.to_numeric(df_final["Age"], errors="coerce")
+        # Capture labels once (they'll be consistent unless some files have IDs and some don't)
+        if tiller_decomp_xlabel is None and "tiller_decomp_density_xlabel" in summary.columns:
+            tiller_decomp_xlabel = str(summary["tiller_decomp_density_xlabel"].iloc[0])
+        if tiller_decomp_title is None and "tiller_decomp_density_title" in summary.columns:
+            tiller_decomp_title = str(summary["tiller_decomp_density_title"].iloc[0])
 
-        alive_final = df_final[df_final["Status"] == 1]
-        dead_final = df_final[df_final["Status"] != 1]
+        sampled_ts = sample_timesteps(summary["TimeStep"].values, cfg.n_timepoints, rng)
+        if sampled_ts.size == 0:
+            continue
 
-        final_alive_ages.append(alive_final["Age"].to_numpy(dtype=float))
-        final_dead_ages.append(dead_final["Age"].to_numpy(dtype=float))
+        ss = summary[summary["TimeStep"].isin(sampled_ts)]
 
-        # Final radius / packing index from the timestep summary
-        if len(summary) > 0:
-            final_radii.append(float(summary["tussock_radius"].iloc[-1]))
-            final_packing.append(float(summary["packing_index_total"].iloc[-1]))
+        # --- scatter plots ---
+        alive_x.append(ss["tussock_radius_cm"].to_numpy(float))
+        alive_y.append(ss["alive_tillers"].to_numpy(float))
 
-    # Existing plots
-    plot_radius_vs_time(all_summaries, out_dir)
-    plot_alive_vs_radius_random(all_summaries, out_dir, args.n_random, rng)
-    plot_total_vs_radius_random(all_summaries, out_dir, args.n_random, rng)
-    plot_density_vs_radius_scatter(all_summaries, out_dir, args.n_random, rng)
-    plot_prop_new_vs_radius_random(all_summaries, out_dir, args.n_random, rng)
+        # switched axes: x = necromass (kg), y = radius (cm)
+        necro_x.append(ss["total_root_necromass_kg"].to_numpy(float))
+        necro_y.append(ss["tussock_radius_cm"].to_numpy(float))
 
-    alive_ages = np.concatenate(final_alive_ages) if final_alive_ages else np.array([])
-    dead_ages = np.concatenate(final_dead_ages) if final_dead_ages else np.array([])
-    plot_age_distributions_alive_dead(alive_ages, dead_ages, out_dir)
+        radius_vals.append(ss["tussock_radius_cm"].to_numpy(float))
 
-    # New packing index plots
-    plot_packing_index_vs_time(all_summaries, out_dir)
-    plot_packing_index_vs_radius_random(all_summaries, out_dir, args.n_random, rng)
-    plot_eta_vs_total_tillers(all_summaries, out_dir)
+        ss_prod = ss.dropna(subset=["root_productivity_g_per_tiller_per_yr", "tussock_radius_cm"])
+        prod_x.append(ss_prod["root_productivity_g_per_tiller_per_yr"].to_numpy(float))
+        prod_y.append(ss_prod["tussock_radius_cm"].to_numpy(float))
 
-    # New ECDF plots (final timestep across sims)
-    plot_final_radius_ecdf(np.array(final_radii, dtype=float), out_dir)
-    plot_final_packing_index_ecdf(np.array(final_packing, dtype=float), out_dir)
+        # --- density datasets ---
+        # ROOT decomposition: use k_root_per_yr (yr^-1)
+        if "k_root_per_yr" in ss.columns:
+            k_root_rates.append(ss["k_root_per_yr"].to_numpy(float))
 
-    print(f"Saved plots to: {out_dir.resolve()}")
-    print("Files written:")
-    for p in [
-        # existing
-        "tussock_radius_vs_time.png",
-        "alive_tillers_vs_radius_scatter.png",
-        "total_tillers_vs_radius_scatter.png",
-        "density_vs_radius_scatter.png",
-        "prop_new_daughters_vs_radius_scatter.png",
-        "age_distributions_alive_vs_dead.png",
-        # new
-        "packing_index_vs_time.png",
-        "packing_index_vs_radius_scatter.png",
-        "eta_capacity_vs_total_tillers.png",
-        "final_radius_ecdf.png",
-        "final_packing_index_ecdf.png",
-    ]:
-        print("  -", p)
+        # "Tiller decomposition": use either k_dead_tiller_per_yr (preferred) or fallback k_leaf_per_yr
+        if "tiller_decomp_rate_for_density" in ss.columns:
+            k_tiller_rates.append(ss["tiller_decomp_rate_for_density"].to_numpy(float))
+
+        sub = df[df["TimeStep"].isin(sampled_ts)]
+        sub = sub[sub["Status"] == 1] if cfg.use_only_alive_for_radius else sub
+
+        if "Radius" in sub.columns:
+            tiller_radii.append(sub["Radius"].astype(float).to_numpy())
+        if "LeafArea" in sub.columns:
+            leaf_sizes.append(sub["LeafArea"].astype(float).to_numpy())
+
+        for _, row in ss.iterrows():
+            bd = root_necromass_bulk_density_g_cm3(
+                total_root_necro_g=float(row["total_root_necromass_g"]),
+                tussock_radius_cm=float(row["tussock_radius_cm"]),
+            )
+            root_necro_bulk_dens.append(bd)
+
+    def cat(arrs):
+        return np.concatenate(arrs) if arrs else np.array([], dtype=float)
+
+    x1, y1 = cat(alive_x), cat(alive_y)
+    x2, y2 = cat(necro_x), cat(necro_y)
+    rdist = cat(radius_vals)
+    x4, y4 = cat(prod_x), cat(prod_y)
+
+    h_k_root = cat(k_root_rates)
+    h_k_tiller = cat(k_tiller_rates)
+    h_tiller_radius = cat(tiller_radii)
+    h_leaf_size = cat(leaf_sizes)
+    h_bulk_density = np.asarray(root_necro_bulk_dens, dtype=float)
+    h_bulk_density = h_bulk_density[np.isfinite(h_bulk_density)]
+
+    if x1.size == 0:
+        raise ValueError("No points generated (check required columns and timesteps).")
+
+    # One PNG per main plot (UNCHANGED)
+    save_scatter(
+        x1, y1,
+        xlabel="Tussock radius (cm)",
+        ylabel="Alive tillers (Status == 1)",
+        title="Alive tillers vs tussock radius (20 random timesteps per sim)",
+        outpath=cfg.output_dir / "alive_vs_tussock_radius.png",
+    )
+
+    save_scatter(
+        x2, y2,
+        xlabel="Total root necromass (kg)",
+        ylabel="Tussock radius (cm)",
+        title="Standing root necromass pool vs tussock radius (axes switched)",
+        outpath=cfg.output_dir / "root_necromass_vs_tussock_radius.png",
+    )
+
+    save_hist_density(
+        rdist,
+        xlabel="Tussock radius (cm)",
+        ylabel="Density",
+        title="Distribution of tussock radii (cm) (20 random timesteps per sim)",
+        outpath=cfg.output_dir / "tussock_radius_density_cm.png",
+        bins=30,
+    )
+
+    save_scatter_with_regression(
+        x4, y4,
+        xlabel="Tiller root productivity (g per tiller yr$^{-1}$)",
+        ylabel="Tussock radius (cm)",
+        title="Root productivity vs tussock radius (20 random timesteps per sim)",
+        outpath=cfg.output_dir / "root_productivity_vs_tussock_radius.png",
+    )
+
+    # All other density histograms in ONE panel plot
+    # CHANGED: first two panels now plot yr^-1 rate constants (k), not g yr^-1 fluxes
+    if tiller_decomp_xlabel is None:
+        tiller_decomp_xlabel = "yr$^{-1}$"
+    if tiller_decomp_title is None:
+        tiller_decomp_title = "Tiller decomposition rate constant density"
+
+    save_hist_panel_one_plot(
+        datasets=[
+            h_k_root,
+            h_k_tiller,
+            h_tiller_radius,
+            h_leaf_size,
+            h_bulk_density,
+        ],
+        titles=[
+            "Root decomposition rate constant density",
+            tiller_decomp_title,
+            "Tiller radius density",
+            "Leaf size density",
+            "Root necromass bulk density",
+        ],
+        xlabels=[
+            "yr$^{-1}$",
+            tiller_decomp_xlabel,
+            "cm",
+            "cm$^2$",
+            "g cm$^{-3}$ (proxy)",
+        ],
+        outpath=cfg.output_dir / "density_panels.png",
+        bins=30,
+    )
+
+    print(f"Wrote PNGs to: {cfg.output_dir}")
 
 
 if __name__ == "__main__":
