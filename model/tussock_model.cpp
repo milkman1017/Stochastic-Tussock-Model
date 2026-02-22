@@ -1,4 +1,15 @@
 // main.cpp  (build: g++ -O3 -DNDEBUG -march=native -flto -pthread -std=c++17 -o tussock_model main.cpp)
+//
+// Carbon mechanizes ONLY tissue growth:
+//   - Leaf area next year via SLA + carbon allocation
+//   - Root number + root diameter via carbon allocation
+//   - Stem radius growth via carbon allocation
+//
+// NEW: Carbon storage pool (gC) carried between years, computed from stem volume (radius + age-derived stem length)
+//      using Fetcher stem increment equation with TDD=500, and Chapin stem TNC fraction.
+//      Storage contributes to next year's available carbon.
+//
+// Survival + reproduction are DEMOGRAPHIC ONLY (spatial + size), with no carbon gating.
 
 #include <iostream>
 #include <fstream>
@@ -45,6 +56,10 @@ static inline double clamp01(double p) {
 
 static inline double logistic(double z) {
     return 1.0 / (1.0 + std::exp(-z));
+}
+
+static inline double clamp(double x, double lo, double hi) {
+    return std::max(lo, std::min(hi, x));
 }
 
 static inline bool should_prune_dead(const Tiller& t) {
@@ -158,6 +173,17 @@ struct OverlapStats {
     double ms = 0.0;
 };
 
+// Deterministic "rare" decision (~1/20) without RNG
+static inline bool allow_rare_z_adjust(int i, int j, int pass) {
+    // 64-bit mix (xorshift-ish hashing)
+    std::uint64_t x = 1469598103934665603ULL;
+    x ^= (std::uint64_t)i + 0x9e3779b97f4a7c15ULL; x *= 1099511628211ULL;
+    x ^= (std::uint64_t)j + 0xbf58476d1ce4e5b9ULL; x *= 1099511628211ULL;
+    x ^= (std::uint64_t)pass + 0x94d049bb133111ebULL; x *= 1099511628211ULL;
+    // ~5% chance
+    return (x % 20ULL) == 0ULL;
+}
+
 // Fast overlap resolution
 void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -266,27 +292,31 @@ void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
                         double pen = dist - rsum;
                         stats.max_penetration = std::min(stats.max_penetration, pen);
 
+                        // XY relaxation
                         tillers[i].move(angle,        DAMP * pen);
                         tillers[j].move(angle + M_PI, DAMP * pen);
 
+                        // If still overlapping, VERY RARELY allow Z adjustment (no more Z as universal escape hatch)
                         if (tillers[i].isOverlapping(tillers[j])) {
-                            double dxy2 = dist2_xy(tillers[i], tillers[j]);
-                            if (dxy2 < rsum2) {
-                                double dz_need = std::sqrt(std::max(0.0, rsum2 - dxy2)) + EPS;
+                            if (pass >= 5 && allow_rare_z_adjust(i, j, pass)) {
+                                double dxy2 = dist2_xy(tillers[i], tillers[j]);
+                                if (dxy2 < rsum2) {
+                                    double dz_need = std::sqrt(std::max(0.0, rsum2 - dxy2)) + EPS;
 
-                                int ni = nbr[i];
-                                int nj = nbr[j];
+                                    int ni = nbr[i];
+                                    int nj = nbr[j];
 
-                                auto signed_dz = [&](int n) {
-                                    return (static_cast<double>(n) < mean_nbrs) ? -dz_need : +dz_need;
-                                };
+                                    auto signed_dz = [&](int n) {
+                                        return (static_cast<double>(n) < mean_nbrs) ? -dz_need : +dz_need;
+                                    };
 
-                                if (ni <= nj) {
-                                    tillers[i].addZ(signed_dz(ni));
-                                    stats.z_adjusts++;
-                                } else {
-                                    tillers[j].addZ(signed_dz(nj));
-                                    stats.z_adjusts++;
+                                    if (ni <= nj) {
+                                        tillers[i].addZ(signed_dz(ni));
+                                        stats.z_adjusts++;
+                                    } else {
+                                        tillers[j].addZ(signed_dz(nj));
+                                        stats.z_adjusts++;
+                                    }
                                 }
                             }
                         }
@@ -303,14 +333,14 @@ void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
     stats.ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
+// -------------------- parameter reader --------------------
+// We keep old keys fr_repr / c_daughter for backward compatibility, but they are ignored in this script.
 void readFromFile(const std::string& filename,
                   double& ks, double& kr, double& bs, double& br,
-                  double& g_offset,
                   double& c_space,
-                  double& c_repro,   // NEW: reproduction weight (0..1)
-                  double& fr,
-                  double& fr_repr,
-                  double& c_daughter) {
+                  double& c_repro,   // 0..1 weight between spatial vs size fecundity
+                  double& fr,        // 0..1 fraction of growth carbon to roots
+                  double& f_leaf) {  // 0..1 fraction of growth carbon to leaves (new)
     std::ifstream inputFile(filename);
     if (!inputFile.is_open()) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
@@ -340,19 +370,18 @@ void readFromFile(const std::string& filename,
     if (p.count("bs")) bs = p["bs"];
     if (p.count("br")) br = p["br"];
 
-    if (p.count("g_offset")) g_offset = p["g_offset"];
-
     if (p.count("c_space")) c_space = p["c_space"];
 
-    // NEW canonical name: c_repro (0..1 weight between spatial vs size fecundity)
+    //c_repro (0..1 weight between spatial vs size fecundity)
     if (p.count("c_repro")) c_repro = p["c_repro"];
-    // Back-compat: if old file still uses c_repr, treat it as c_repro
-    if (!p.count("c_repro") && p.count("c_repr")) c_repro = p["c_repr"];
 
     if (p.count("fr")) fr = p["fr"];
 
-    if (p.count("fr_repr")) fr_repr = p["fr_repr"];          // fraction of carbon reserved for reproduction (0..1)
-    if (p.count("c_daughter")) c_daughter = p["c_daughter"]; // gC cost per daughter event (>=0)
+    // New: f_leaf for leaf allocation from growth carbon
+    if (p.count("f_leaf")) f_leaf = p["f_leaf"];
+
+    // Back-compat: ignore these if present
+    // p["fr_repr"], p["c_daughter"]
 }
 
 enum class OutputMode : int { FULL = 0, SUMMARY = 1 };
@@ -390,10 +419,6 @@ struct SimSummary {
     double leafarea_mean_y = std::nan("");
 };
 
-static inline double clamp(double x, double lo, double hi) {
-    return std::max(lo, std::min(hi, x));
-}
-
 void simulate(const int max_sim_time,
               const int sim_id,
               const std::string& outdir,
@@ -403,27 +428,30 @@ void simulate(const int max_sim_time,
               const int alive_overflow_threshold) {
 
     double ks = 0.0, kr = 0.0, bs = 0.0, br = 0.0;
-    double g_offset = 0.0;
 
+    // Survival weight: 1 => spatial only, 0 => size only
     double c_space = 1.0;
 
-    // NEW: c_repro is the *weight* between spatial vs size fecundity (0..1)
-    //   p_event = c_repro * p_repro_spatial + (1 - c_repro) * p_event_size
+    // Repro weight: 1 => spatial only, 0 => size only
     double c_repro = 0.5;
 
-    double fr = 0.5; // fraction of carbon (growth C) to roots
+    // Carbon allocation (growth carbon only):
+    double fr = 0.5;      // roots
+    double f_leaf = 0.3;  // leaves. Remaining goes to stem/radius.
 
-    // reproduction carbon gate params
-    double fr_repr = 0.0;      // fraction of annual carbon reserved for reproduction
-    double c_daughter = 0.0;   // gC cost per daughter event
+    readFromFile(param_file_path, ks, kr, bs, br, c_space, c_repro, fr, f_leaf);
 
-    readFromFile(param_file_path, ks, kr, bs, br, g_offset, c_space, c_repro, fr, fr_repr, c_daughter);
+    c_space = clamp(c_space, 0.0, 1.0);
+    c_repro = clamp(c_repro, 0.0, 1.0);
+    fr      = clamp(fr, 0.0, 1.0);
+    f_leaf  = clamp(f_leaf, 0.0, 1.0);
 
-    fr       = clamp(fr, 0.0, 1.0);
-    fr_repr  = clamp(fr_repr, 0.0, 1.0);
-    c_space  = clamp(c_space, 0.0, 1.0);
-    c_repro  = clamp(c_repro, 0.0, 1.0);
-    if (!std::isfinite(c_daughter) || c_daughter < 0.0) c_daughter = 0.0;
+    // Enforce fr + f_leaf <= 1; if too large, shrink proportionally.
+    if (fr + f_leaf > 1.0) {
+        double s = fr + f_leaf;
+        fr     /= s;
+        f_leaf /= s;
+    }
 
     std::uint64_t t = (std::uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
     std::uint32_t seed = (std::uint32_t)(t ^ (0x9e3779b97f4a7c15ULL + (std::uint64_t)sim_id * 0xBF58476D1CE4E5B9ULL));
@@ -455,7 +483,7 @@ void simulate(const int max_sim_time,
         filebuf.resize(8 * 1024 * 1024);
         outputFile.rdbuf()->pubsetbuf(filebuf.data(), (std::streamsize)filebuf.size());
 
-        // RootDiamMM column
+        // NOTE: keeping columns unchanged to avoid breaking downstream scripts
         outputFile << "TimeStep,Age,Radius,LeafArea,DeadLeafArea,DeadLeafMass,RootNecroVol,RootNecroVolCum,RootNecroMass,RootNecroMassCum,X,Y,Z,NumRoots,RootDiamMM,Status\n";
     }
 
@@ -470,7 +498,7 @@ void simulate(const int max_sim_time,
     // initial tiller
     Tiller first_tiller(
         1,      // age
-        0.1,   // radius
+        0.1,    // radius (cm)
         0.0,    // x
         0.0,    // y
         0.0,    // z
@@ -487,9 +515,7 @@ void simulate(const int max_sim_time,
     previous_step.reserve(1024);
     previous_step.push_back(first_tiller);
 
-    const double MIN_SENTINEL_DIST = 50.0;
-    const double MAX_SENTINEL_DIST = 5000.0;
-    const double SENTINEL_SCALE    = 2000.0;
+    const double SENTINEL_SCALE = 2000.0;
 
     SimSummary ss;
     ss.sim_id = sim_id;
@@ -499,13 +525,6 @@ void simulate(const int max_sim_time,
     static constexpr double LEAFAREA_MIN = 0.0;
     static constexpr double LEAFAREA_MAX = 2500.0;
 
-    const double b0_g = 34.56271744473715;
-    const double b1_g = 1.043331450132405;
-    const double b2_g = -0.00030329319726520824;
-
-    static constexpr double SIGMA_G = 147.7;
-    static constexpr double MAX_DELTA_A = 600.0;
-
     // ---- Carbon budget constants (simple but mechanistic) ----
     static constexpr double ASSIM_C_PER_G_LEAF = 2.0;     // gC / (g leaf) / yr
     static constexpr double CARBON_PER_G_BIOMASS = 0.45;  // gC per g dry mass
@@ -513,9 +532,17 @@ void simulate(const int max_sim_time,
     // Stem tissue density (rough)
     static constexpr double RHO_STEM_G_PER_CM3 = 0.30;
 
-    // ---- Dieback / rebuild assumption (NO fitted params) ----
-    static constexpr double REBUILD_LEAF_FRAC = 1.0;
+    // ---- Dieback / rebuild assumption ----
+    static constexpr double REBUILD_LEAF_FRAC = 0.8;
     static constexpr double REBUILD_ROOT_FRAC = 1.0;
+
+    // ---- Storage constants (stem TNC proxy; Chapin) ----
+    static constexpr double STEM_TNC_FRAC = 0.375; // 35–40% midpoint
+
+    // ---- Fetcher annual stem increment (mm/yr) = 0.0052*TDD - 0.5461 ----
+    static constexpr double TDD_JJA = 500.0;
+    static constexpr double STEM_INC_MM_PER_YR = (0.0052 * TDD_JJA - 0.5461); // 2.0539 mm/yr
+    static constexpr double STEM_INC_CM_PER_YR = (STEM_INC_MM_PER_YR > 0.0 ? STEM_INC_MM_PER_YR / 10.0 : 0.0);
 
     for (int time_step = 0; time_step <= max_sim_time; time_step++) {
         final_t = time_step;
@@ -534,7 +561,7 @@ void simulate(const int max_sim_time,
                 if (!std::isfinite(current_area) || current_area < 0.0) current_area = 0.0;
 
                 // This year's peak leaf area (A_t)
-                const double A_t = current_area;
+                const double A_t = clamp(current_area, LEAFAREA_MIN, LEAFAREA_MAX);
 
                 double prev_area = current_area;
 
@@ -542,7 +569,7 @@ void simulate(const int max_sim_time,
                 const int   prev_roots = tiller.getNumRoots();
                 const float prev_root_diam_mm = tiller.getRootDiamMM();
 
-                // ---------------- Survival ----------------
+                // ---------------- Survival (NO carbon) ----------------
                 double p_spatial = clamp01(logistic(bs - ks * distance));
 
                 const double s0 = -0.4759392738089253;
@@ -550,7 +577,6 @@ void simulate(const int max_sim_time,
                 double eta_size = s0 + s1 * current_area;
                 double p_size = clamp01(logistic(eta_size));
 
-                // c_space is "weight on spatial limitation" (0..1)
                 double w_space = clamp(c_space, 0.0, 1.0);
                 double p_survive = (1.0 - w_space) * p_size + w_space * p_spatial;
                 p_survive = clamp01(p_survive);
@@ -563,10 +589,8 @@ void simulate(const int max_sim_time,
                     // move last year's roots into necromass pools
                     tiller.accumulateRootNecroFromPrevRoots(prev_roots, prev_root_diam_mm);
 
-                    // ---------------- Reproduction: compute p_event only ----------------
-                    // NOTE: no "repro_attempt" persistent state; we decide once, then carbon-gate.
+                    // ---------------- Reproduction probability (NO carbon) ----------------
                     double p_event = 0.0;
-
                     if (!DISABLE_REPRO) {
                         // spatial component (distance-based)
                         double eta_repro_spatial = br - kr * distance;
@@ -583,40 +607,27 @@ void simulate(const int max_sim_time,
                         double eta_f = b0_f + b1_f * A + b2_f * A * A;
                         double p_event_size = clamp01(logistic(eta_f));
 
-                        // c_repro is a WEIGHT (0..1): 1 => all spatial, 0 => all size
                         double w_repro = clamp(c_repro, 0.0, 1.0);
                         p_event = clamp01(w_repro * p_repro_spatial + (1.0 - w_repro) * p_event_size);
+                    }
+
+                    if (!DISABLE_REPRO && (dis(gen) < p_event)) {
+                        newTillers.push_back(tiller.makeDaughter());
                     }
 
                     // ---------------- Growth / maturation ----------------
                     tiller.mature(1);
 
-                    // ---- Carbon supply from THIS year's peak (A_t) ----
+                    // ---------------- Carbon-based tissue growth ----------------
+                    // Carbon supply from THIS year's peak (A_t)
                     double leaf_mass_t_g = (A_t / (double)Tiller::SLA_CM2_PER_G);
                     if (!std::isfinite(leaf_mass_t_g) || leaf_mass_t_g < 0.0) leaf_mass_t_g = 0.0;
 
                     double supply_C = leaf_mass_t_g * ASSIM_C_PER_G_LEAF;
                     if (!std::isfinite(supply_C) || supply_C < 0.0) supply_C = 0.0;
 
-                    // ---- IPM proposal for next year's peak leaf area ----
-                    current_area = std::max(LEAFAREA_MIN, std::min(LEAFAREA_MAX, current_area));
-
-                    double mu = (b0_g + g_offset)
-                              + b1_g * current_area
-                              + b2_g * (current_area * current_area);
-                    if (!std::isfinite(mu)) mu = current_area;
-
-                    std::normal_distribution<double> eps_g(0.0, SIGMA_G);
-                    double A_star = mu + eps_g(gen);
-                    if (!std::isfinite(A_star)) A_star = current_area;
-
-                    double delta = A_star - current_area;
-                    if (delta >  MAX_DELTA_A) A_star = current_area + MAX_DELTA_A;
-                    if (delta < -MAX_DELTA_A) A_star = current_area - MAX_DELTA_A;
-
-                    A_star = std::max(LEAFAREA_MIN, std::min(LEAFAREA_MAX, A_star));
-
-                    // ---- Rebuild/maintenance bill ----
+                    // Rebuild costs (bill) - affects how much is left for growth,
+                    // but DOES NOT directly kill the tiller in this version.
                     auto root_mass_est_g = [&](int n, double dmm) -> double {
                         double vol_cm3 = (double)Tiller::perRootConeVolumeCm3((float)dmm) * (double)n;
                         return vol_cm3 * (double)Tiller::RHO_ROOT_G_PER_CM3;
@@ -630,63 +641,28 @@ void simulate(const int max_sim_time,
                     double C_rebuild = C_rebuild_leaf + C_rebuild_root;
                     if (!std::isfinite(C_rebuild) || C_rebuild < 0.0) C_rebuild = 0.0;
 
-                    if (supply_C < C_rebuild) {
-                        tiller.setStatus(0);
-                        step_data.push_back(tiller);
-                        continue;
-                    }
+                    // NEW: include stored carbon from last year (computed from stem volume)
+                    double C_store_prev = tiller.getCStore();
+                    if (!std::isfinite(C_store_prev) || C_store_prev < 0.0) C_store_prev = 0.0;
 
-                    double C_store = supply_C - C_rebuild;
-                    if (!std::isfinite(C_store)) C_store = 0.0;
-                    if (C_store < 0.0) C_store = 0.0;
+                    double C_avail = supply_C + C_store_prev - C_rebuild;
+                    if (!std::isfinite(C_avail)) C_avail = 0.0;
+                    if (C_avail < 0.0) C_avail = 0.0;
 
-                    // ---- Realize next year's leaf area under carbon constraint ----
-                    double leaf_mass_star_g = (A_star / (double)Tiller::SLA_CM2_PER_G);
-                    if (!std::isfinite(leaf_mass_star_g) || leaf_mass_star_g < 0.0) leaf_mass_star_g = 0.0;
+                    // Allocate growth carbon into leaves, roots, and stem
+                    double C_root = fr * C_avail;
+                    double C_leaf = f_leaf * C_avail;
+                    double C_stem = C_avail - C_root - C_leaf;
+                    if (C_stem < 0.0) C_stem = 0.0;
 
-                    double C_need_for_Astar = leaf_mass_star_g * CARBON_PER_G_BIOMASS;
-                    if (!std::isfinite(C_need_for_Astar) || C_need_for_Astar < 0.0) C_need_for_Astar = 0.0;
+                    // ---- Leaf area next year from C_leaf + SLA ----
+                    double leaf_mass_next_g = (C_leaf / CARBON_PER_G_BIOMASS);
+                    if (!std::isfinite(leaf_mass_next_g) || leaf_mass_next_g < 0.0) leaf_mass_next_g = 0.0;
 
-                    double A_next = A_star;
-                    if (C_need_for_Astar > 0.0 && C_store < C_need_for_Astar) {
-                        double f = C_store / C_need_for_Astar;
-                        f = clamp(f, 0.0, 1.0);
-                        A_next = A_star * f;
-                    }
-                    A_next = std::max(LEAFAREA_MIN, std::min(LEAFAREA_MAX, A_next));
+                    double A_next = leaf_mass_next_g * (double)Tiller::SLA_CM2_PER_G;
+                    if (!std::isfinite(A_next)) A_next = 0.0;
+                    A_next = clamp(A_next, LEAFAREA_MIN, LEAFAREA_MAX);
                     tiller.setLeafArea(static_cast<float>(A_next));
-
-                    // Canopy construction actually spent carbon out of C_store
-                    double leaf_mass_next_g = (A_next / (double)Tiller::SLA_CM2_PER_G);
-                    double C_canopy = leaf_mass_next_g * CARBON_PER_G_BIOMASS;
-                    if (!std::isfinite(C_canopy) || C_canopy < 0.0) C_canopy = 0.0;
-
-                    double C_avail = std::max(0.0, C_store - C_canopy);
-
-                    // ---------------- Reproduction: probability + carbon gate ----------------
-                    // Split available carbon into reserved-for-repro vs everything-else.
-                    // This makes "fr_repr" a REAL allocation, not just a check.
-                    double C_repr  = fr_repr * C_avail;
-                    double C_other = (1.0 - fr_repr) * C_avail;
-
-                    if (!DISABLE_REPRO && (dis(gen) < p_event)) {
-                        if (c_daughter > 0.0) {
-                            if (C_repr >= c_daughter) {
-                                newTillers.push_back(tiller.makeDaughter());
-                                C_repr -= c_daughter;
-                            }
-                        } else {
-                            newTillers.push_back(tiller.makeDaughter());
-                        }
-                    }
-
-// recombine remaining budgets
-C_avail = C_repr + C_other;
-
-
-                    // Partition remaining carbon between roots and shoot
-                    double C_root  = fr * C_avail;
-                    double C_shoot = (1.0 - fr) * C_avail;
 
                     // ---- Roots: sample desired, then downscale to fit C_root ----
                     int n_roots = root_num_dis(gen);
@@ -715,18 +691,21 @@ C_avail = C_repr + C_other;
                     if (C_root <= 0.0) {
                         n_roots = 1;
                         diam_mm = 0.5;
-                        costR = root_cost_C(n_roots, diam_mm);
                     }
 
                     tiller.setRoots(n_roots, (float)diam_mm);
 
-                    // ---- Radius growth: limited by C_shoot ----
+                    // ---- Radius growth: limited by C_stem ----
                     double dr_base = growRadiusDist(gen);
                     if (!std::isfinite(dr_base) || dr_base < 0.0) dr_base = 0.01;
 
                     double r = tiller.getRadius();
-                    double h_cm = 0.2 * (double)tiller.getAge();
-                    h_cm = std::max(0.2, h_cm);
+
+                    // NEW: stem length from Fetcher increment (TDD=500), not 0.2*age
+                    // If STEM_INC_CM_PER_YR is 0 due to negative increment, fall back to small positive
+                    double dh_cm = (STEM_INC_CM_PER_YR > 0.0 ? STEM_INC_CM_PER_YR : 0.01);
+                    double h_cm = dh_cm * (double)tiller.getAge();
+                    h_cm = std::max(dh_cm, h_cm);
 
                     auto stem_cost_C = [&](double dr) -> double {
                         double dV = M_PI * (2.0 * r * dr + dr * dr) * h_cm;
@@ -737,21 +716,36 @@ C_avail = C_repr + C_other;
                     double costS = stem_cost_C(dr_base);
                     double dr_use = dr_base;
 
-                    if (costS > C_shoot && C_shoot > 0.0) {
+                    if (costS > C_stem && C_stem > 0.0) {
                         double K = M_PI * h_cm * RHO_STEM_G_PER_CM3 * CARBON_PER_G_BIOMASS;
-                        double target = C_shoot / std::max(1e-18, K);
+                        double target = C_stem / std::max(1e-18, K);
 
                         double disc = r*r + target;
                         if (disc < 0.0) disc = 0.0;
                         dr_use = -r + std::sqrt(disc);
                         if (!std::isfinite(dr_use) || dr_use < 0.0) dr_use = 0.0;
-                    } else if (C_shoot <= 0.0) {
+                    } else if (C_stem <= 0.0) {
                         dr_use = 0.0;
                     }
 
                     tiller.growRadius(dr_use);
 
+                    // ---- NEW: update stored carbon for next year from stem volume (radius + age-derived h_cm) ----
+                    // Stem volume as cylinder: V = pi r^2 h
+                    double r_cm_now = (double)tiller.getRadius();
+                    double V_stem_cm3 = M_PI * r_cm_now * r_cm_now * h_cm;
+                    if (!std::isfinite(V_stem_cm3) || V_stem_cm3 < 0.0) V_stem_cm3 = 0.0;
+
+                    double M_stem_g = V_stem_cm3 * RHO_STEM_G_PER_CM3;
+                    if (!std::isfinite(M_stem_g) || M_stem_g < 0.0) M_stem_g = 0.0;
+
+                    double C_store_next = STEM_TNC_FRAC * M_stem_g * CARBON_PER_G_BIOMASS;
+                    if (!std::isfinite(C_store_next) || C_store_next < 0.0) C_store_next = 0.0;
+
+                    tiller.setCStore(C_store_next);
+
                 } else {
+                    // died this year (demographic survival only)
                     tiller.accumulateDeadLeafArea(static_cast<float>(prev_area));
                     tiller.accumulateRootNecroFromPrevRoots(prev_roots, prev_root_diam_mm);
                     tiller.setStatus(0);
@@ -760,8 +754,10 @@ C_avail = C_repr + C_other;
                 step_data.push_back(tiller);
 
             } else {
+                // dead tiller decay
                 tiller.decay();
                 tiller.setRoots(0, tiller.getRootDiamMM());
+                tiller.setCStore(0.0); // dead tillers don't carry labile C store
 
                 if (!should_prune_dead(tiller)) {
                     step_data.push_back(tiller);

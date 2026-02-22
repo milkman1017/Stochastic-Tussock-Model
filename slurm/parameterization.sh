@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=growth_test_param
+#SBATCH --job-name=ecotype_param
 #SBATCH --chdir=/home/lucentlab/wmahler/Stochastic-Tussock-Model
-#SBATCH --output=test_param.out
-#SBATCH --error=test_param.err
-#SBATCH --time=48:00:00
-#SBATCH --nodelist=lgmem-01
+#SBATCH --output=eco_param.out
+#SBATCH --error=eco_param.err
+#SBATCH --time=500:00:00
+#SBATCH --nodelist=lgmem-02
 
 set -euo pipefail
 
@@ -42,6 +42,6 @@ if [ -d "$OUTBASE" ]; then
 fi
 
 echo "=== running parameterization ==="
-"$PY" scripts/parameterization.py --sites AK
+"$PY" scripts/parameterization.py --sites Toolik_7
 
 echo "END: $(date)"

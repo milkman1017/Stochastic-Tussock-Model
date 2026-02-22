@@ -170,9 +170,9 @@ def main():
     if timesteps.size == 0:
         raise ValueError("No valid TimeStep rows found after cleaning.")
     
-    xlim = (-30.0, 30.0)
-    ylim = (-30.0, 30.0)
-    zlim = (0.0, 50.0)
+    xlim = (-15.0, 15.0)
+    ylim = (-15.0, 15.0)
+    zlim = (0.0, 25.0)
 
     # 1) Default view (keeps the original angle behavior)
     render_gif(df, timesteps, xlim, ylim, zlim, args, args.out, view_mode="default")

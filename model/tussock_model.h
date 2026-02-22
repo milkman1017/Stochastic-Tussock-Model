@@ -6,6 +6,7 @@
 #include <ctime>
 #include <vector>
 #include <cmath>
+#include <algorithm>
 
 class Tiller {
 public:
@@ -20,7 +21,8 @@ public:
            float dead_leaf_area = 0.0f,
            float root_necro_vol = 0.0f,
            float root_necro_vol_cum = 0.0f,
-           float root_diam_mm = 1.0f)
+           float root_diam_mm = 1.0f,
+           double c_store = 0.0) // NEW
         : age(age),
           radius(radius),
           x(x),
@@ -32,7 +34,8 @@ public:
           dead_leaf_area(dead_leaf_area),
           root_necro_vol(root_necro_vol),
           root_necro_vol_cum(root_necro_vol_cum),
-          root_diam_mm(root_diam_mm) {}
+          root_diam_mm(root_diam_mm),
+          c_store(c_store) {}
 
     double getRadius() const { return radius; }
 
@@ -55,6 +58,10 @@ public:
 
     float getRootDiamMM() const { return root_diam_mm; }
 
+    // NEW: stored carbon pool (gC), carried between years
+    double getCStore() const { return c_store; }
+    void setCStore(double v) { c_store = (std::isfinite(v) && v > 0.0) ? v : 0.0; }
+
     // SLA = 98 cm^2 g^-1  (Schedlbauer et al. 2018)
     static constexpr float SLA_CM2_PER_G = 98.0f;
 
@@ -73,6 +80,7 @@ public:
         return root_necro_vol_cum * RHO_ROOT_G_PER_CM3;
     }
 
+    // ---- growth / state updates ----
     void growRadius(double dRadius) { radius += dRadius; }
 
     void setStatus(bool new_status) { status = new_status; }
@@ -81,17 +89,30 @@ public:
 
     void mature(int age_growth) {
         age += age_growth;
-        z += 0.2; // simulates the growth of the stem base every year
+        z += 0.2; // legacy "stem base growth" marker; geometry now uses Fetcher-based h_cm in main.cpp
     }
 
     void setRoots(int new_roots, float diam_mm) {
         num_roots = new_roots;
         root_diam_mm = diam_mm;
+
         if (num_roots < 0) num_roots = 0;
-        if (root_diam_mm < 0.5f) root_diam_mm = 0.5f;
-        if (root_diam_mm > 5.0f) root_diam_mm = 5.0f;
+
+        // Clamp consistent with your carbon-mechanized model assumptions
+        root_diam_mm = std::max(0.5f, std::min(5.0f, root_diam_mm));
     }
 
+    void setLeafArea(float new_leaf_area) {
+        leaf_area = new_leaf_area;
+        if (leaf_area < 0) leaf_area = 0;
+    }
+
+    void grow_leaves(float area_change) {
+        leaf_area += area_change;
+        if (leaf_area < 0) leaf_area = 0;
+    }
+
+    // ---- geometry / interactions ----
     bool isOverlapping(const Tiller& other) const {
         double distance = std::sqrt(std::pow(x - other.getX(), 2) + std::pow(y - other.getY(), 2));
         double sumOfRadii = getRadius() + other.getRadius();
@@ -110,6 +131,7 @@ public:
         y += move_distance * std::sin(move_angle);
     }
 
+    // ---- necromass bookkeeping ----
     void accumulateDeadLeafArea(float prev_leaf_area) {
         dead_leaf_area = 0.75f * dead_leaf_area + prev_leaf_area;
         if (dead_leaf_area < 0) dead_leaf_area = 0;
@@ -147,6 +169,7 @@ public:
         if (root_necro_vol < 0) root_necro_vol = 0;
     }
 
+    // ---- death decay ----
     void decay() {
         leaf_area = 0.0f;
 
@@ -160,18 +183,11 @@ public:
         if (dead_leaf_area < 0) dead_leaf_area = 0;
         if (root_necro_vol < 0) root_necro_vol = 0;
         if (root_necro_vol_cum < 0) root_necro_vol_cum = 0;
+
+        c_store = 0.0; // stored labile carbon gone
     }
 
-    void grow_leaves(float area_change) {
-        leaf_area += area_change;
-        if (leaf_area < 0) leaf_area = 0;
-    }
-
-    void setLeafArea(float new_leaf_area) {
-        leaf_area = new_leaf_area;
-        if (leaf_area < 0) leaf_area = 0;
-    }
-
+    // ---- reproduction ----
     Tiller makeDaughter() {
         double randomRadius = 1.0 * static_cast<double>(std::rand()) / RAND_MAX;
         double randomAngle  = 2.0 * 3.141 * static_cast<double>(std::rand()) / RAND_MAX;
@@ -184,8 +200,8 @@ public:
         double newY = y + yOffset;
         double newZ = z + zOffset;
 
-        // Daughter tillers start with leaf area = 50
-        return Tiller(1, 0.1, newX, newY, newZ, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f);
+        // Daughter tillers start with leaf area = 50, no stored carbon initially
+        return Tiller(1, 0.1, newX, newY, newZ, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0);
     }
 
 private:
@@ -201,4 +217,6 @@ private:
     float root_necro_vol_cum;
 
     float root_diam_mm;
+
+    double c_store; 
 };

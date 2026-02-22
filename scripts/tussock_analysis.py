@@ -17,7 +17,7 @@ ROOT_TISSUE_DENSITY_G_CM3 = 0.21
 ROOT_LENGTH_CM = 50.0
 MM_TO_CM = 0.1
 
-LEAF_NECRO_REMAIN_FRAC = 0.75  # dead_leaf_area *= 0.75 each year in model
+LEAF_NECRO_REMAIN_FRAC = 0.75  # dead_leaf_area = 0.75*dead_leaf_area + prev_leaf_area each year
 G_TO_KG = 1e-3
 
 
@@ -152,19 +152,84 @@ def add_live_root_mass_from_cone(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# Timestep summary + productivity + decomposition proxies
+# Timestep summary + productivity + decomposition metrics
 # ============================================================
 
-def _pick_id_column(df: pd.DataFrame) -> str | None:
+def compute_packing_metrics_by_timestep(
+    df: pd.DataFrame,
+    use_only_alive_for_radius: bool,
+    radius_stat: str,
+) -> pd.DataFrame:
     """
-    Try to find a stable tiller identifier column for dead-tiller (count) dynamics.
-    Adjust/extend this list to match your sim output.
+    Computes (per timestep):
+      - tussock_radius_cm (from coords)
+      - alive_tillers
+      - packing_density_tillers_per_cm2 = N_alive / (pi*R^2)
+      - packing_fraction_area = sum(pi*r_i^2) / (pi*R^2)  (uses per-tiller Radius)
+      - mean_leaf_area_alive_cm2
+      - mean_tiller_radius_alive_cm
+      - newborn_alive_tillers (proxy = Status==1 & Age==1)
     """
-    candidates = ["TillerID", "TillerId", "ID", "Id", "uid", "UID", "tiller_id", "tillerID"]
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
+    if "TimeStep" not in df.columns or "Status" not in df.columns:
+        raise ValueError("Missing required columns for packing metrics: TimeStep, Status")
+
+    out_rows = []
+    for t, sub in df.groupby("TimeStep"):
+        t_int = int(t)
+
+        sub_alive = sub[sub["Status"] == 1]
+        n_alive = int(sub_alive.shape[0])
+
+        # newborn proxy: Age == 1 among alive
+        if "Age" in sub_alive.columns:
+            newborn = int((sub_alive["Age"].astype(float) == 1.0).sum())
+        else:
+            newborn = np.nan
+
+        # tussock radius from coordinates
+        sub_for_radius = sub_alive if use_only_alive_for_radius else sub
+        r_cm = radial_distance_xy_cm(sub_for_radius) if sub_for_radius.shape[0] > 0 else np.array([], dtype=float)
+        R = summarize_radius_cm(r_cm, radius_stat) if r_cm.size > 0 else float("nan")
+
+        area = np.pi * (R ** 2) if (np.isfinite(R) and R > 0) else float("nan")
+
+        # count density
+        if np.isfinite(area) and area > 0:
+            count_density = n_alive / area
+        else:
+            count_density = float("nan")
+
+        # packing fraction by area of circles
+        if "Radius" in sub_alive.columns and np.isfinite(area) and area > 0:
+            ri = sub_alive["Radius"].astype(float).to_numpy()
+            ri = ri[np.isfinite(ri) & (ri > 0)]
+            sum_area = float(np.sum(np.pi * ri * ri)) if ri.size > 0 else 0.0
+            packing_frac = sum_area / area
+            mean_ri = float(np.mean(ri)) if ri.size > 0 else float("nan")
+        else:
+            packing_frac = float("nan")
+            mean_ri = float("nan")
+
+        # mean leaf area among alive
+        if "LeafArea" in sub_alive.columns:
+            la = sub_alive["LeafArea"].astype(float).to_numpy()
+            la = la[np.isfinite(la)]
+            mean_la = float(np.mean(la)) if la.size > 0 else float("nan")
+        else:
+            mean_la = float("nan")
+
+        out_rows.append({
+            "TimeStep": t_int,
+            "tussock_radius_cm": R,
+            "alive_tillers": float(n_alive),
+            "newborn_alive_tillers": float(newborn) if np.isfinite(newborn) else np.nan,
+            "packing_density_tillers_per_cm2": float(count_density),
+            "packing_fraction_area": float(packing_frac),
+            "mean_leaf_area_alive_cm2": float(mean_la),
+            "mean_tiller_radius_alive_cm": float(mean_ri),
+        })
+
+    return pd.DataFrame(out_rows).sort_values("TimeStep")
 
 
 def build_timestep_summary(df: pd.DataFrame, use_only_alive_for_radius: bool, radius_stat: str) -> pd.DataFrame:
@@ -173,6 +238,7 @@ def build_timestep_summary(df: pd.DataFrame, use_only_alive_for_radius: bool, ra
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
+    # base metrics that were already in your analysis
     alive_counts = df.groupby("TimeStep")["Status"].apply(lambda s: int((s == 1).sum())).astype(float)
 
     radii = {}
@@ -206,6 +272,11 @@ def build_timestep_summary(df: pd.DataFrame, use_only_alive_for_radius: bool, ra
     }).sort_values("TimeStep")
 
     out["live_root_mass_per_tiller_g"] = out["total_live_root_mass_g"] / out["alive_tillers"].replace(0, np.nan)
+
+    # merge in packing metrics (count density + packing fraction + newborn proxy, etc.)
+    pm = compute_packing_metrics_by_timestep(df, use_only_alive_for_radius, radius_stat)
+    out = out.merge(pm, on=["TimeStep", "tussock_radius_cm", "alive_tillers"], how="left")
+
     return out
 
 
@@ -225,89 +296,45 @@ def add_root_productivity(summary: pd.DataFrame) -> pd.DataFrame:
     return s
 
 
-def add_decomposition_metrics(summary: pd.DataFrame, df_raw: pd.DataFrame) -> pd.DataFrame:
+def add_decomposition_metrics_optionA(summary: pd.DataFrame) -> pd.DataFrame:
     """
-    Adds metrics in BOTH flux form (g/yr, tillers/yr) and first-order rate-constant form (yr^-1).
+    Option A: match the paper's "rate constant" form (yr^-1) by computing first-order k
+    from pool balance for BOTH:
+      - root necromass pool (M, g): uses RootNecroMassCum diff as input
+      - leaf necromass pool (D, g): uses last year's live leaf mass as input (litterfall proxy)
 
-    ROOT necromass:
-      M(t) = standing pool (g)
-      add(t) = newly produced necromass (g) inferred from cumulative
-      loss_flux(t) = M(t-1) + add(t) - M(t)  (clipped >= 0)
-      k_root(t) = loss_flux(t) / M(t-1)
+    ROOT:
+      add_root(t) = diff(M_cum) (>=0)
+      loss_root(t) = M(t-1) + add_root(t) - M(t)
+      k_root(t) = loss_root(t) / M(t-1)
 
-    DEAD TILLERS (preferred; requires stable tiller ID):
-      ND(t) = count of dead tillers
-      newDead(t) = count of alive->dead transitions between t-1 and t (needs ID)
-      removed(t) = ND(t-1) + newDead(t) - ND(t)  (clipped >= 0)
-      k_dead(t) = removed(t) / ND(t-1)
-
-    LEAF LITTER (fallback if no ID):
-      Uses your remain fraction; k_leaf is constant = -ln(remain_frac).
+    LEAF NECROMASS:
+      add_leaf(t) ≈ total_leaf_mass_g(t-1)
+      loss_leaf(t) = D(t-1) + add_leaf(t) - D(t)
+      k_leaf(t) = loss_leaf(t) / D(t-1)
     """
     s = summary.copy()
 
     # ---- ROOT ----
     M = s["total_root_necromass_g"].astype(float)
-    add = s["total_root_necromasscum_g"].diff().clip(lower=0).fillna(0.0)
+    add_root = s["total_root_necromasscum_g"].diff().clip(lower=0).fillna(0.0)
+    loss_root = (M.shift(1) + add_root - M).clip(lower=0)
 
-    root_loss_flux_g = (M.shift(1) + add - M).clip(lower=0)
-    s["root_decomp_flux_g_per_yr"] = root_loss_flux_g
-
+    s["root_decomp_flux_g_per_yr"] = loss_root
     denom_M = M.shift(1)
-    s["k_root_per_yr"] = (root_loss_flux_g / denom_M).where(denom_M > 0)
+    s["k_root_per_yr"] = (loss_root / denom_M).where(denom_M > 0)
 
-    # ---- DEAD TILLERS (count pool) if possible ----
-    id_col = _pick_id_column(df_raw)
-    if id_col is not None:
-        # Build per-timestep alive/dead sets using ID
-        t_vals = np.array(sorted(df_raw["TimeStep"].dropna().astype(int).unique()))
-        dead_counts = {}
-        new_dead = {}
+    # ---- LEAF NECROMASS ----
+    D = s["total_dead_leaf_mass_g"].astype(float)
+    add_leaf = s["total_leaf_mass_g"].shift(1).fillna(0.0)
+    loss_leaf = (D.shift(1) + add_leaf - D).clip(lower=0)
 
-        for i, t in enumerate(t_vals):
-            sub = df_raw[df_raw["TimeStep"].astype(int) == int(t)]
-            dead_ids = set(sub.loc[sub["Status"] != 1, id_col].dropna().astype(str).tolist())
-            alive_ids = set(sub.loc[sub["Status"] == 1, id_col].dropna().astype(str).tolist())
-            dead_counts[int(t)] = float(len(dead_ids))
+    s["leaf_decomp_flux_g_per_yr"] = loss_leaf
+    denom_D = D.shift(1)
+    s["k_leaf_per_yr"] = (loss_leaf / denom_D).where(denom_D > 0)
 
-            if i == 0:
-                new_dead[int(t)] = 0.0
-            else:
-                t_prev = int(t_vals[i - 1])
-                sub_prev = df_raw[df_raw["TimeStep"].astype(int) == t_prev]
-                alive_prev = set(sub_prev.loc[sub_prev["Status"] == 1, id_col].dropna().astype(str).tolist())
-
-                # Alive -> Dead transitions
-                new_dead[int(t)] = float(len(alive_prev.intersection(dead_ids)))
-
-        ND = pd.Series(dead_counts).reindex(s["TimeStep"].astype(int)).astype(float)
-        newD = pd.Series(new_dead).reindex(s["TimeStep"].astype(int)).astype(float).fillna(0.0)
-
-        s["dead_tillers"] = ND.values
-        s["new_dead_tillers"] = newD.values
-
-        removed_dead = (ND.shift(1) + newD - ND).clip(lower=0)
-        s["dead_tiller_removed_per_yr"] = removed_dead
-
-        denom_ND = ND.shift(1)
-        s["k_dead_tiller_per_yr"] = (removed_dead / denom_ND).where(denom_ND > 0)
-
-        # For backward compatibility with your plotting variable name:
-        # "tiller decomposition rate density" will now mean k_dead_tiller_per_yr (yr^-1)
-        s["tiller_decomp_rate_for_density"] = s["k_dead_tiller_per_yr"]
-        s["tiller_decomp_density_xlabel"] = "yr$^{-1}$ (dead tiller removal)"
-        s["tiller_decomp_density_title"] = "Dead tiller removal rate constant density"
-
-    else:
-        # ---- Fallback: leaf litter first-order k implied by remain fraction ----
-        # Note: This is NOT the same as paper's dead-tiller removal k_D, but at least it is comparable in units/form.
-        k_leaf = float(-np.log(LEAF_NECRO_REMAIN_FRAC))
-        s["k_leaf_per_yr"] = k_leaf
-
-        # Put into the plotting slot as a constant series so the density panel remains.
-        s["tiller_decomp_rate_for_density"] = k_leaf
-        s["tiller_decomp_density_xlabel"] = "yr$^{-1}$ (leaf litter, implied)"
-        s["tiller_decomp_density_title"] = "Leaf litter decay rate constant density (fallback)"
+    # sanity reference (constant implied by remain fraction)
+    s["k_leaf_implied_from_remainfrac"] = float(-np.log(LEAF_NECRO_REMAIN_FRAC))
 
     return s
 
@@ -411,6 +438,201 @@ def save_hist_panel_one_plot(datasets, titles, xlabels, outpath: Path, bins: int
     plt.close(fig)
 
 
+def save_density_dependence_panels(
+    packing_metric: np.ndarray,
+    yseries: list[np.ndarray],
+    titles: list[str],
+    ylabels: list[str],
+    xlabel: str,
+    outpath: Path,
+):
+    """
+    3-panel scatterplots of putatively density-dependent responses vs a packing metric.
+    """
+    x = np.asarray(packing_metric, dtype=float)
+    okx = np.isfinite(x)
+    x = x[okx]
+
+    n = len(yseries)
+    ncols = 3
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(12, 3.8 * nrows))
+    axes = np.array(axes).ravel()
+
+    for i in range(nrows * ncols):
+        ax = axes[i]
+        if i >= n:
+            ax.axis("off")
+            continue
+
+        y = np.asarray(yseries[i], dtype=float)
+        y = y[okx]
+        ok = np.isfinite(y)
+        xx = x[ok]
+        yy = y[ok]
+
+        ax.scatter(xx, yy, s=18)
+        ax.set_title(titles[i])
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabels[i])
+
+        if xx.size >= 2:
+            m, b = np.polyfit(xx, yy, 1)
+            xs = np.linspace(xx.min(), xx.max(), 100)
+            ys = m * xs + b
+            ax.plot(xs, ys, linestyle="--")
+
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=300)
+    plt.close(fig)
+
+
+def save_spatial_heterogeneity_plot(
+    bin_centers: np.ndarray,
+    mean_annulus_density: np.ndarray,
+    mean_annulus_packing: np.ndarray,
+    mean_leaf_area: np.ndarray,
+    outpath: Path,
+):
+    """
+    Multi-panel plot of spatial heterogeneity vs normalized distance from tussock center.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.0))
+    axes = np.array(axes).ravel()
+
+    x = np.asarray(bin_centers, dtype=float)
+
+    axes[0].plot(x, mean_annulus_density)
+    axes[0].set_xlabel("Normalized distance from center (r / R)")
+    axes[0].set_ylabel("Alive tiller density in annulus (tillers cm$^{-2}$)")
+    axes[0].set_title("Annulus tiller density vs distance")
+
+    axes[1].plot(x, mean_annulus_packing)
+    axes[1].set_xlabel("Normalized distance from center (r / R)")
+    axes[1].set_ylabel("Packing fraction in annulus (area/area)")
+    axes[1].set_title("Annulus packing fraction vs distance")
+
+    axes[2].plot(x, mean_leaf_area)
+    axes[2].set_xlabel("Normalized distance from center (r / R)")
+    axes[2].set_ylabel("Mean leaf area (cm$^2$)")
+    axes[2].set_title("Mean leaf area vs distance")
+
+    fig.tight_layout()
+    fig.savefig(outpath, dpi=300)
+    plt.close(fig)
+
+
+# ============================================================
+# Spatial heterogeneity aggregation
+# ============================================================
+
+def accumulate_annulus_stats(
+    df: pd.DataFrame,
+    timesteps: np.ndarray,
+    use_only_alive_for_radius: bool,
+    radius_stat: str,
+    nbins: int = 12,
+):
+    """
+    For each (sim, timestep) sample:
+      - take alive tillers
+      - compute r = sqrt(x^2+y^2), R = tussock radius
+      - bin by normalized r/R into nbins
+      - per annulus compute:
+          density = count / annulus_area
+          packing = sum(pi*ri^2) / annulus_area
+          mean leaf area
+    Aggregate across all samples by averaging (simple mean) within each bin.
+    """
+    # store lists per bin
+    dens_bins = [[] for _ in range(nbins)]
+    pack_bins = [[] for _ in range(nbins)]
+    leaf_bins = [[] for _ in range(nbins)]
+
+    edges = np.linspace(0.0, 1.0, nbins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    for t in timesteps:
+        sub = df[df["TimeStep"].astype(int) == int(t)]
+        if sub.shape[0] == 0:
+            continue
+
+        alive = sub[sub["Status"] == 1]
+        if alive.shape[0] == 0:
+            continue
+
+        # tussock radius
+        sub_for_radius = alive if use_only_alive_for_radius else sub
+        r_cm_all = radial_distance_xy_cm(sub_for_radius)
+        if r_cm_all.size == 0:
+            continue
+        R = summarize_radius_cm(r_cm_all, radius_stat)
+        if not np.isfinite(R) or R <= 0:
+            continue
+
+        # alive radii from center
+        r_cm = radial_distance_xy_cm(alive)
+        rn = r_cm / R
+        ok = np.isfinite(rn) & (rn >= 0) & (rn <= 1.0)
+        rn = rn[ok]
+        if rn.size == 0:
+            continue
+
+        # per-tiller radius for packing fraction
+        if "Radius" in alive.columns:
+            ri = alive["Radius"].astype(float).to_numpy()[ok]
+            ri = np.where(np.isfinite(ri) & (ri > 0), ri, 0.0)
+        else:
+            ri = np.zeros_like(rn)
+
+        # leaf area
+        if "LeafArea" in alive.columns:
+            la = alive["LeafArea"].astype(float).to_numpy()[ok]
+        else:
+            la = np.full_like(rn, np.nan)
+
+        # assign bins
+        bidx = np.searchsorted(edges, rn, side="right") - 1
+        bidx = np.clip(bidx, 0, nbins - 1)
+
+        # compute per annulus stats
+        for b in range(nbins):
+            mask = (bidx == b)
+            if not np.any(mask):
+                continue
+
+            r0n = edges[b]
+            r1n = edges[b + 1]
+            # annulus area in cm^2
+            ann_area = np.pi * ((r1n * R) ** 2 - (r0n * R) ** 2)
+            if not np.isfinite(ann_area) or ann_area <= 0:
+                continue
+
+            cnt = int(np.sum(mask))
+            dens = cnt / ann_area
+
+            pack = float(np.sum(np.pi * (ri[mask] ** 2))) / ann_area
+
+            la_m = la[mask]
+            la_m = la_m[np.isfinite(la_m)]
+            mean_la = float(np.mean(la_m)) if la_m.size > 0 else float("nan")
+
+            dens_bins[b].append(dens)
+            pack_bins[b].append(pack)
+            leaf_bins[b].append(mean_la)
+
+    def mean_or_nan(xs):
+        xs = np.asarray(xs, dtype=float)
+        xs = xs[np.isfinite(xs)]
+        return float(np.mean(xs)) if xs.size > 0 else float("nan")
+
+    mean_dens = np.array([mean_or_nan(dens_bins[b]) for b in range(nbins)], dtype=float)
+    mean_pack = np.array([mean_or_nan(pack_bins[b]) for b in range(nbins)], dtype=float)
+    mean_leaf = np.array([mean_or_nan(leaf_bins[b]) for b in range(nbins)], dtype=float)
+
+    return centers, mean_dens, mean_pack, mean_leaf
+
+
 # ============================================================
 # Driver
 # ============================================================
@@ -428,17 +650,26 @@ def main():
     prod_x, prod_y = [], []
 
     # Density datasets (sampled)
-    # CHANGED: now store *rate constants* (yr^-1) for decomposition to match paper form
     k_root_rates = []
-    k_tiller_rates = []
-
+    k_leaf_rates = []
     tiller_radii = []
     leaf_sizes = []
     root_necro_bulk_dens = []
 
-    # These let us label the "tiller decomposition" panel appropriately depending on ID availability
-    tiller_decomp_xlabel = None
-    tiller_decomp_title = None
+    # Density dependence data (sampled points across sims)
+    dd_x_packdens = []
+    dd_x_packfrac = []
+    dd_newborn = []
+    dd_alive = []
+    dd_mean_leaf_area = []
+    dd_root_prod = []
+
+    # Spatial heterogeneity aggregation across sims/timesteps
+    # We'll aggregate using the sampled timesteps per sim
+    hetero_centers_accum = None
+    hetero_dens_accum = []
+    hetero_pack_accum = []
+    hetero_leaf_accum = []
 
     for fp in sim_paths:
         df = read_sim_csv(fp)
@@ -446,13 +677,7 @@ def main():
 
         summary = build_timestep_summary(df, cfg.use_only_alive_for_radius, cfg.radius_stat)
         summary = add_root_productivity(summary)
-        summary = add_decomposition_metrics(summary, df)
-
-        # Capture labels once (they'll be consistent unless some files have IDs and some don't)
-        if tiller_decomp_xlabel is None and "tiller_decomp_density_xlabel" in summary.columns:
-            tiller_decomp_xlabel = str(summary["tiller_decomp_density_xlabel"].iloc[0])
-        if tiller_decomp_title is None and "tiller_decomp_density_title" in summary.columns:
-            tiller_decomp_title = str(summary["tiller_decomp_density_title"].iloc[0])
+        summary = add_decomposition_metrics_optionA(summary)
 
         sampled_ts = sample_timesteps(summary["TimeStep"].values, cfg.n_timepoints, rng)
         if sampled_ts.size == 0:
@@ -460,11 +685,10 @@ def main():
 
         ss = summary[summary["TimeStep"].isin(sampled_ts)]
 
-        # --- scatter plots ---
+        # --- original scatter plots ---
         alive_x.append(ss["tussock_radius_cm"].to_numpy(float))
         alive_y.append(ss["alive_tillers"].to_numpy(float))
 
-        # switched axes: x = necromass (kg), y = radius (cm)
         necro_x.append(ss["total_root_necromass_kg"].to_numpy(float))
         necro_y.append(ss["tussock_radius_cm"].to_numpy(float))
 
@@ -474,15 +698,11 @@ def main():
         prod_x.append(ss_prod["root_productivity_g_per_tiller_per_yr"].to_numpy(float))
         prod_y.append(ss_prod["tussock_radius_cm"].to_numpy(float))
 
-        # --- density datasets ---
-        # ROOT decomposition: use k_root_per_yr (yr^-1)
-        if "k_root_per_yr" in ss.columns:
-            k_root_rates.append(ss["k_root_per_yr"].to_numpy(float))
+        # --- decomposition densities (k, yr^-1) ---
+        k_root_rates.append(ss["k_root_per_yr"].to_numpy(float))
+        k_leaf_rates.append(ss["k_leaf_per_yr"].to_numpy(float))
 
-        # "Tiller decomposition": use either k_dead_tiller_per_yr (preferred) or fallback k_leaf_per_yr
-        if "tiller_decomp_rate_for_density" in ss.columns:
-            k_tiller_rates.append(ss["tiller_decomp_rate_for_density"].to_numpy(float))
-
+        # --- density datasets from raw per-tiller values (as before) ---
         sub = df[df["TimeStep"].isin(sampled_ts)]
         sub = sub[sub["Status"] == 1] if cfg.use_only_alive_for_radius else sub
 
@@ -498,6 +718,28 @@ def main():
             )
             root_necro_bulk_dens.append(bd)
 
+        # --- density dependence: packing metrics vs responses ---
+        # use packing fraction (area-based) AND count density as x metrics (both reflect crowding differently)
+        dd_x_packdens.append(ss["packing_density_tillers_per_cm2"].to_numpy(float))
+        dd_x_packfrac.append(ss["packing_fraction_area"].to_numpy(float))
+        dd_newborn.append(ss["newborn_alive_tillers"].to_numpy(float))
+        dd_alive.append(ss["alive_tillers"].to_numpy(float))
+        dd_mean_leaf_area.append(ss["mean_leaf_area_alive_cm2"].to_numpy(float))
+        dd_root_prod.append(ss["root_productivity_g_per_tiller_per_yr"].to_numpy(float))
+
+        # --- spatial heterogeneity: annulus stats vs distance from center ---
+        centers, mdens, mpack, mleaf = accumulate_annulus_stats(
+            df=df,
+            timesteps=sampled_ts,
+            use_only_alive_for_radius=cfg.use_only_alive_for_radius,
+            radius_stat=cfg.radius_stat,
+            nbins=12,
+        )
+        hetero_centers_accum = centers
+        hetero_dens_accum.append(mdens)
+        hetero_pack_accum.append(mpack)
+        hetero_leaf_accum.append(mleaf)
+
     def cat(arrs):
         return np.concatenate(arrs) if arrs else np.array([], dtype=float)
 
@@ -507,7 +749,7 @@ def main():
     x4, y4 = cat(prod_x), cat(prod_y)
 
     h_k_root = cat(k_root_rates)
-    h_k_tiller = cat(k_tiller_rates)
+    h_k_leaf = cat(k_leaf_rates)
     h_tiller_radius = cat(tiller_radii)
     h_leaf_size = cat(leaf_sizes)
     h_bulk_density = np.asarray(root_necro_bulk_dens, dtype=float)
@@ -516,7 +758,9 @@ def main():
     if x1.size == 0:
         raise ValueError("No points generated (check required columns and timesteps).")
 
-    # One PNG per main plot (UNCHANGED)
+    # -------------------------
+    # Original plots (unchanged filenames)
+    # -------------------------
     save_scatter(
         x1, y1,
         xlabel="Tussock radius (cm)",
@@ -550,31 +794,25 @@ def main():
         outpath=cfg.output_dir / "root_productivity_vs_tussock_radius.png",
     )
 
-    # All other density histograms in ONE panel plot
-    # CHANGED: first two panels now plot yr^-1 rate constants (k), not g yr^-1 fluxes
-    if tiller_decomp_xlabel is None:
-        tiller_decomp_xlabel = "yr$^{-1}$"
-    if tiller_decomp_title is None:
-        tiller_decomp_title = "Tiller decomposition rate constant density"
-
+    # Density panels (CHANGED only in first 2 datasets: now k_root and k_leaf, both yr^-1)
     save_hist_panel_one_plot(
         datasets=[
             h_k_root,
-            h_k_tiller,
+            h_k_leaf,
             h_tiller_radius,
             h_leaf_size,
             h_bulk_density,
         ],
         titles=[
             "Root decomposition rate constant density",
-            tiller_decomp_title,
+            "Leaf tissue decomposition rate constant density",
             "Tiller radius density",
             "Leaf size density",
             "Root necromass bulk density",
         ],
         xlabels=[
             "yr$^{-1}$",
-            tiller_decomp_xlabel,
+            "yr$^{-1}$",
             "cm",
             "cm$^2$",
             "g cm$^{-3}$ (proxy)",
@@ -582,6 +820,73 @@ def main():
         outpath=cfg.output_dir / "density_panels.png",
         bins=30,
     )
+
+    # -------------------------
+    # NEW plot 1: Density dependence panels
+    # -------------------------
+    dd_packdens = cat(dd_x_packdens)
+    dd_packfrac = cat(dd_x_packfrac)
+    dd_new = cat(dd_newborn)
+    dd_alv = cat(dd_alive)
+    dd_meanLA = cat(dd_mean_leaf_area)
+    dd_rootP = cat(dd_root_prod)
+
+    # Panel set using packing fraction (more sensitive to variable tiller radii)
+    save_density_dependence_panels(
+        packing_metric=dd_packfrac,
+        yseries=[dd_new, dd_alv, dd_meanLA],
+        titles=[
+            "Newborn alive tillers vs packing fraction",
+            "Alive tillers vs packing fraction",
+            "Mean leaf area vs packing fraction",
+        ],
+        ylabels=[
+            "Newborn alive tillers (Age==1)",
+            "Alive tillers",
+            "Mean leaf area (cm$^2$)",
+        ],
+        xlabel="Packing fraction (sum $\\pi r_i^2$ / $\\pi R^2$)",
+        outpath=cfg.output_dir / "density_dependence_packing_fraction_panels.png",
+    )
+
+    # Optional second density-dependence panel set using count density
+    save_density_dependence_panels(
+        packing_metric=dd_packdens,
+        yseries=[dd_new, dd_rootP, dd_meanLA],
+        titles=[
+            "Newborn alive tillers vs count density",
+            "Root productivity vs count density",
+            "Mean leaf area vs count density",
+        ],
+        ylabels=[
+            "Newborn alive tillers (Age==1)",
+            "Root productivity (g per tiller yr$^{-1}$)",
+            "Mean leaf area (cm$^2$)",
+        ],
+        xlabel="Alive tiller density (tillers cm$^{-2}$) using $\\pi R^2$",
+        outpath=cfg.output_dir / "density_dependence_count_density_panels.png",
+    )
+
+    # -------------------------
+    # NEW plot 2: Spatial heterogeneity vs distance from center
+    # -------------------------
+    if hetero_centers_accum is not None and hetero_dens_accum:
+        dens_mat = np.vstack(hetero_dens_accum)
+        pack_mat = np.vstack(hetero_pack_accum)
+        leaf_mat = np.vstack(hetero_leaf_accum)
+
+        # simple mean across sims (ignores NaNs)
+        mean_dens = np.nanmean(dens_mat, axis=0)
+        mean_pack = np.nanmean(pack_mat, axis=0)
+        mean_leaf = np.nanmean(leaf_mat, axis=0)
+
+        save_spatial_heterogeneity_plot(
+            bin_centers=hetero_centers_accum,
+            mean_annulus_density=mean_dens,
+            mean_annulus_packing=mean_pack,
+            mean_leaf_area=mean_leaf,
+            outpath=cfg.output_dir / "spatial_heterogeneity_vs_distance.png",
+        )
 
     print(f"Wrote PNGs to: {cfg.output_dir}")
 
