@@ -1,29 +1,5 @@
 #!/usr/bin/env python3
 # parameterize_tussock.py
-#
-# Parameterization wrapper for the "growth-only mechanized carbon" C++ model:
-#   - Carbon mechanizes tissue growth ONLY (leaf area via SLA, roots, stem radius)
-#   - Survival + reproduction are DEMOGRAPHIC ONLY (spatial + size), NO carbon gates.
-#
-# Parameter file keys expected by updated C++:
-#   ks, kr, bs, br, c_space, c_repro, fr, f_leaf
-#
-# Constraints (minimal + model-valid):
-#   - ks >= 0   (survival decreases with distance in bs - ks*distance)
-#   - kr >= 0   (reproduction decreases with distance in br - kr*distance)
-#   - c_space in [0,1] (weight between size/spatial survival components)
-#   - c_repro in [0,1] (weight between size/spatial fecundity components)
-#   - fr in [0,1]      (fraction of growth carbon to roots)
-#   - f_leaf in [0,1]  (fraction of growth carbon to leaves)
-#   - enforce fr + f_leaf <= 1 (remainder goes to stem/radius pool)
-#
-# Plotting:
-#   - axis limits are fixed PER SITE from the OBSERVED diameter distribution.
-#     (Modeled distribution can go off-plot; limits remain constant across frames.)
-#
-# Objective:
-#   - Wasserstein distance between observed diameters and simulated final diameters
-#   - plus barrier penalties for degenerate runs and a leaf sanity penalty.
 
 import argparse
 import configparser
@@ -40,46 +16,23 @@ import pandas as pd
 from PIL import Image
 
 try:
-    import seaborn as sns  # optional
+    import seaborn as sns
     _HAS_SNS = True
 except Exception:
     _HAS_SNS = False
 
-
-# ------------------------ CLI / config ------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Tussock model parameterization (Nelder–Mead; minimal constraints + fit)"
     )
 
-    parser.add_argument(
-        "--sites",
-        nargs="*",
-        default=None,
-        help=(
-            "List of sites to parameterize separately. "
-            "Example: --sites SiteA SiteB. "
-            "Use '--sites all' to run each site independently."
-        ),
-    )
-
-    parser.add_argument("--max_evals", type=int, default=200, help="Max objective evaluations per site.")
-    parser.add_argument("--n_init", type=int, default=25, help="Number of random initial trials per site.")
-    parser.add_argument("--tol_f", type=float, default=1e-3, help="Stop if simplex loss spread < tol_f.")
-    parser.add_argument("--tol_x", type=float, default=1e-3, help="Stop if simplex size < tol_x.")
-
-    parser.add_argument(
-        "--init_log10_span",
-        type=float,
-        default=1.0,
-        help=(
-            "Random init multiplicative span around current values (log10-space) for scale-like params. "
-            "Each param is multiplied by 10**U(-span, +span). "
-            "Intercept-like params (bs/br) are jittered additively instead."
-        ),
-    )
-
+    parser.add_argument("--sites", nargs="*", default=None)
+    parser.add_argument("--max_evals", type=int, default=200)
+    parser.add_argument("--n_init", type=int, default=25)
+    parser.add_argument("--tol_f", type=float, default=1e-3)
+    parser.add_argument("--tol_x", type=float, default=1e-3)
+    parser.add_argument("--init_log10_span", type=float, default=1.0)
     parser.add_argument("--step_frac", type=float, default=0.2)
     parser.add_argument("--step_abs", type=float, default=0.3)
 
@@ -91,15 +44,15 @@ def parse_args():
     parser.add_argument("--constraint_pass_frac", type=float, default=0.8)
     parser.add_argument("--alive_overflow_threshold", type=int, default=400)
 
-    # If set: ONLY weights are logit-coded; everything else stays linear.
-    parser.add_argument("--optimize_log_space", action="store_true")
+    parser.add_argument("--hard_fail_on_overflow", action="store_true")
+    parser.add_argument("--require_survive_to_end_for_fit", action="store_true")
 
+    parser.add_argument("--optimize_log_space", action="store_true")
     parser.add_argument("--print_fail_breakdown", action="store_true")
 
     parser.add_argument("--plot_every", type=int, default=10)
     parser.add_argument("--plot_kde", action="store_true")
 
-    # Stall expansion inside Nelder–Mead
     parser.add_argument("--stall_expand_after", type=int, default=30)
     parser.add_argument("--stall_expand_factor", type=float, default=2.0)
 
@@ -121,30 +74,41 @@ def get_param_file_path(config: configparser.ConfigParser) -> str:
     return config.get("Parameterization", "param_file", fallback=os.path.join("parameters", "parameters.txt"))
 
 
-# ------------------------ parameters I/O ------------------------
+def write_cpp_parameterization_ini(
+    project_root: str,
+    param_file_rel_from_root: str,
+    constraint_year: int,
+    alive_overflow_threshold: int,
+):
+    ini_path = os.path.join(project_root, "parameterization.ini")
+
+    cp = configparser.ConfigParser()
+    cp["Parameterization"] = {
+        "param_file": str(param_file_rel_from_root),
+        "constraint_year": str(int(constraint_year)),
+        "alive_overflow_threshold": str(int(alive_overflow_threshold)),
+    }
+
+    with open(ini_path, "w") as f:
+        cp.write(f)
+
 
 def initialize_random_parameters_file(param_file: str, config: configparser.ConfigParser) -> OrderedDict:
-    """
-    Random init that avoids degenerate "never reproduces / 1 tiller forever" regimes.
-
-    Keys expected by C++:
-      ks, kr, bs, br, c_space, c_repro, fr, f_leaf
-    """
     raw_names = config.get(
         "Parameterization",
         "param_names",
-        fallback="ks,kr,bs,br,c_space,c_repro,fr,f_leaf",
+        fallback="ks,kr,bs,br,c_space,c_repro,fr,k_crowd,leaf_offset",
     )
     names = [s.strip() for s in raw_names.split(",") if s.strip()]
     if not names:
-        names = ["ks", "kr", "bs", "br", "c_space", "c_repro", "fr", "f_leaf"]
+        names = ["ks", "kr", "bs", "br", "c_space", "c_repro", "fr", "k_crowd", "leaf_offset"]
 
     def logu(lo, hi):
         return 10 ** random.uniform(math.log10(lo), math.log10(hi))
 
     params = OrderedDict()
     for k in names:
-        if k in {"fr", "f_leaf", "c_repro", "c_space"}:
+        if k in {"fr", "c_repro", "c_space"}:
             params[k] = float(random.uniform(0.0, 1.0))
         elif k in {"bs", "br"}:
             params[k] = float(random.uniform(-3.0, 3.0))
@@ -152,15 +116,15 @@ def initialize_random_parameters_file(param_file: str, config: configparser.Conf
             params[k] = float(logu(1e-3, 100.0))
         elif k == "kr":
             params[k] = float(logu(1e-3, 100.0))
+        elif k == "k_crowd":
+            params[k] = float(logu(1e-4, 10.0))
+        elif k == "leaf_offset":
+            params[k] = float(random.uniform(-200.0, 200.0))
         else:
             params[k] = float(logu(1e-3, 10.0))
 
-    # enforce fr + f_leaf <= 1 (stem gets remainder)
-    if "fr" in params and "f_leaf" in params:
-        s = params["fr"] + params["f_leaf"]
-        if s > 1.0 and s > 0:
-            params["fr"] /= s
-            params["f_leaf"] /= s
+    if "k_crowd" in params:
+        params["k_crowd"] = float(max(0.0, params["k_crowd"]))
 
     _safe_makedirs(os.path.dirname(param_file))
     with open(param_file, "w") as f:
@@ -190,11 +154,6 @@ def read_parameters_file(param_file: str, config: configparser.ConfigParser) -> 
                 continue
             if kl.endswith("_min") or kl.endswith("_max"):
                 continue
-
-            # If user still has old key, fail loudly so it's fixed once.
-            if k == "c_repr":
-                raise ValueError("Found deprecated key 'c_repr' in parameters file. Rename to 'c_repro'.")
-
             params[k] = float(v)
 
     if len(params) == 0:
@@ -203,40 +162,34 @@ def read_parameters_file(param_file: str, config: configparser.ConfigParser) -> 
 
 
 def _ensure_params_present(params: OrderedDict, config: configparser.ConfigParser) -> OrderedDict:
-    # Defaults (only keys C++ reads)
     if "c_space" not in params:
         params["c_space"] = float(config.get("Parameterization", "c_space_default", fallback="1.0"))
     if "c_repro" not in params:
         params["c_repro"] = float(config.get("Parameterization", "c_repro_default", fallback="0.5"))
     if "fr" not in params:
         params["fr"] = float(config.get("Parameterization", "fr_default", fallback="0.5"))
-    if "f_leaf" not in params:
-        params["f_leaf"] = float(config.get("Parameterization", "f_leaf_default", fallback="0.3"))
+    if "k_crowd" not in params:
+        params["k_crowd"] = float(config.get("Parameterization", "k_crowd_default", fallback="0.0"))
+    if "leaf_offset" not in params:
+        params["leaf_offset"] = float(config.get("Parameterization", "leaf_offset_default", fallback="0.0"))
 
     for k in ["ks", "kr", "bs", "br"]:
         if k not in params:
             params[k] = float(config.get("Parameterization", f"{k}_default", fallback="1.0"))
 
-    # Minimal model-valid constraints
     params["ks"] = float(max(0.0, params["ks"]))
     params["kr"] = float(max(0.0, params["kr"]))
+    params["k_crowd"] = float(max(0.0, params["k_crowd"]))
 
-    # Weights/fractions in [0,1]
-    for w in ["c_space", "c_repro", "fr", "f_leaf"]:
+    for w in ["c_space", "c_repro", "fr"]:
         params[w] = float(min(1.0, max(0.0, params[w])))
 
-    # enforce fr + f_leaf <= 1
-    s = params["fr"] + params["f_leaf"]
-    if s > 1.0 and s > 0:
-        params["fr"] /= s
-        params["f_leaf"] /= s
-
-    wanted = ["ks", "kr", "bs", "br", "c_space", "c_repro", "fr", "f_leaf"]
+    wanted = ["ks", "kr", "bs", "br", "c_space", "c_repro", "fr", "k_crowd", "leaf_offset"]
     out = OrderedDict()
     for k in wanted:
         if k in params:
             out[k] = params[k]
-    # carry through extras (won't be read by C++, but preserved)
+
     for k, v in params.items():
         if k not in out:
             out[k] = v
@@ -264,9 +217,7 @@ def vector_to_params(vec: np.ndarray, param_names) -> OrderedDict:
     return OrderedDict((k, float(v)) for k, v in zip(param_names, vec))
 
 
-# ------------------------ model runner ------------------------
-
-def tussock_model(config: configparser.ConfigParser, output_mode: str):
+def tussock_model(config: configparser.ConfigParser, output_mode: str, project_root: str):
     num_sims = int(config.get("Tussock Model", "nsims"))
     outdir = config.get("Tussock Model", "filepath")
     num_threads = int(config.get("Tussock Model", "nthreads"))
@@ -285,9 +236,6 @@ def tussock_model(config: configparser.ConfigParser, output_mode: str):
     if not os.access(exe, os.X_OK):
         raise PermissionError(f"Binary exists but is not executable: {exe}")
 
-    script_dir = os.path.abspath(os.path.dirname(__file__))
-    project_root = os.path.abspath(os.path.join(script_dir, ".."))
-
     p = subprocess.Popen(
         [exe],
         cwd=project_root,
@@ -305,8 +253,6 @@ def tussock_model(config: configparser.ConfigParser, output_mode: str):
             f"stderr:\n{err}\n"
         )
 
-
-# ------------------------ objective / penalties ------------------------
 
 def wasserstein_distance_1d(x, y):
     x = np.asarray(x, dtype=float)
@@ -351,7 +297,7 @@ def wasserstein_distance_1d(x, y):
     return w1
 
 
-def barrier_loss(fail_stats, constraint_year, min_alive, r_cap, overflow_threshold):
+def barrier_loss(fail_stats, constraint_year, min_alive, r_cap):
     T = float(max(1, constraint_year))
 
     v_alive = []
@@ -403,7 +349,7 @@ def barrier_loss(fail_stats, constraint_year, min_alive, r_cap, overflow_thresho
 
     w_alive = 1.0
     w_rad = 1.0
-    w_over = 2.0
+    w_over = 5.0
     w_ext = 2.0
     w_missing = 5.0
 
@@ -513,13 +459,15 @@ def diameter_objective(
     iteration_label,
     training_data,
     frames_dir,
-    axis_limits,  # FIXED per site from observed data
+    axis_limits,
     extinction_weight,
     constraint_year,
     min_alive_tillers,
     radius_cap,
     constraint_pass_frac,
     alive_overflow_threshold,
+    hard_fail_on_overflow,
+    require_survive_to_end_for_fit,
     print_fail_breakdown,
     plot_every,
     plot_kde,
@@ -540,16 +488,26 @@ def diameter_objective(
 
     df = read_sim_summaries(sim_filepath, num_sims=num_sims)
 
-    sim_diameters_final = df["final_diameter"].to_numpy(dtype=float)
-    sim_diameters_final = sim_diameters_final[np.isfinite(sim_diameters_final)]
+    overflow_mask = (df["overflow_t"].to_numpy(dtype=int) >= 0)
+    over_frac = float(np.mean(overflow_mask)) if num_sims > 0 else 0.0
 
     extinct_final = int((df["alive_final"].to_numpy(dtype=int) == 0).sum())
+    extinct_frac = extinct_final / max(1, num_sims)
+
+    if hard_fail_on_overflow and overflow_mask.any():
+        if print_fail_breakdown:
+            print(f"[OVERFLOW_HARD_FAIL] eval={iteration_label} overflow_frac={over_frac:.2%}")
+        return float((1e6 * obs_std) * (1.0 + over_frac))
 
     ok = (
         (df["missing_year"].to_numpy(dtype=int) == 0)
         & (df["alive_y"].to_numpy(dtype=int) >= int(min_alive_tillers))
         & (df["rmax_y"].to_numpy(dtype=float) <= float(radius_cap))
+        & (df["overflow_t"].to_numpy(dtype=int) < 0)
     )
+    if require_survive_to_end_for_fit:
+        ok = ok & (df["alive_final"].to_numpy(dtype=int) > 0)
+
     pass_count = int(ok.sum())
     pass_needed = int(math.ceil(constraint_pass_frac * max(1, num_sims)))
 
@@ -571,17 +529,17 @@ def diameter_objective(
             }
         )
 
-    fit_loss = wasserstein_distance_1d(training_diameters, sim_diameters_final)
+    sim_diam_ok = df.loc[ok, "final_diameter"].to_numpy(dtype=float)
+    sim_diam_ok = sim_diam_ok[np.isfinite(sim_diam_ok)]
+    fit_loss = wasserstein_distance_1d(training_diameters, sim_diam_ok)
 
     bar = barrier_loss(
         fail_stats=fail_stats,
         constraint_year=constraint_year,
         min_alive=min_alive_tillers,
         r_cap=radius_cap,
-        overflow_threshold=alive_overflow_threshold,
     )
 
-    extinct_frac = extinct_final / max(1, num_sims)
     ext_term = float(extinction_weight) * extinct_frac * obs_std
 
     leaf = df["LeafArea"].to_numpy(dtype=float)
@@ -589,23 +547,27 @@ def diameter_objective(
     leaf_bad = leaf_finite & ((leaf <= 0.0) | (leaf >= 2000.0))
     denom = max(1, int(leaf_finite.sum()))
     leaf_bad_frac = float(leaf_bad.sum()) / float(denom)
-
     leaf_penalty_weight = 10.0
     leaf_penalty = leaf_penalty_weight * obs_std * leaf_bad_frac
 
-    if pass_count < pass_needed:
-        loss = (1e3 * obs_std) * (1.0 + bar) + ext_term + leaf_penalty
+    overflow_penalty = (1e4 * obs_std) * over_frac
+
+    if pass_count < pass_needed or not np.isfinite(fit_loss):
+        pass_deficit = (pass_needed - pass_count) / max(1.0, float(pass_needed))
+        loss = (1e3 * obs_std) * (1.0 + bar + 5.0 * pass_deficit) + ext_term + leaf_penalty + overflow_penalty
+
         if print_fail_breakdown:
             missing_n = int((df["missing_year"].to_numpy(dtype=int) == 1).sum())
             min_alive_fail = int(((df["missing_year"] == 0) & (df["alive_y"] < min_alive_tillers)).sum())
             radius_fail = int(((df["missing_year"] == 0) & (df["rmax_y"] > radius_cap)).sum())
             print(
                 f"[HARD_REGION] eval={iteration_label} pass={pass_count}/{num_sims} need>={pass_needed} | "
-                f"missing_year={missing_n}, min_alive={min_alive_fail}, radius={radius_fail} | bar={bar:.4g} "
-                f"| leaf_bad={leaf_bad_frac:.2%}"
+                f"overflow={over_frac:.2%} extinct_final={extinct_final}/{num_sims} | "
+                f"missing_year={missing_n}, min_alive={min_alive_fail}, radius={radius_fail} | "
+                f"bar={bar:.4g} | leaf_bad={leaf_bad_frac:.2%}"
             )
     else:
-        loss = float(fit_loss) + (10.0 * obs_std) * float(bar) + ext_term + leaf_penalty
+        loss = float(fit_loss) + (10.0 * obs_std) * float(bar) + ext_term + leaf_penalty + overflow_penalty
 
     do_plot = (plot_every is not None) and (int(plot_every) > 0) and (iteration_label % int(plot_every) == 0)
     if do_plot:
@@ -614,21 +576,20 @@ def diameter_objective(
 
         if plot_kde and _HAS_SNS:
             sns.kdeplot(training_diameters, label="Observed", linewidth=1, ax=ax)
-            if sim_diameters_final.size > 0:
-                sns.kdeplot(sim_diameters_final, label="Modeled", linewidth=1, ax=ax)
+            if sim_diam_ok.size > 0:
+                sns.kdeplot(sim_diam_ok, label="Modeled (ok subset)", linewidth=1, ax=ax)
         else:
             ax.hist(training_diameters, bins=30, density=True, alpha=0.4, label="Observed")
-            if sim_diameters_final.size > 0:
-                ax.hist(sim_diameters_final, bins=30, density=True, alpha=0.4, label="Modeled")
+            if sim_diam_ok.size > 0:
+                ax.hist(sim_diam_ok, bins=30, density=True, alpha=0.4, label="Modeled (ok subset)")
 
-        # FIXED axes (from observed distribution)
         ax.set_xlim(*axis_limits["xlim"])
         ax.set_ylim(*axis_limits["ylim"])
 
         ax.legend()
         ax.set_title(
             f"Iter: {iteration_label} | loss={loss:.3g} | pass={pass_count}/{num_sims} "
-            f"| bar={bar:.3g} | extinct_final={extinct_final}/{num_sims} | leaf_bad={leaf_bad_frac:.2%}"
+            f"| bar={bar:.3g} | overflow={over_frac:.1%} | extinct_final={extinct_final}/{num_sims} | leaf_bad={leaf_bad_frac:.2%}"
         )
         ax.set_xlabel("Tussock Diameter")
 
@@ -638,8 +599,6 @@ def diameter_objective(
 
     return float(loss)
 
-
-# ------------------------ animation / logging ------------------------
 
 def animate_fitting(frames_dir, iteration_labels, outfilename):
     frames = []
@@ -675,8 +634,6 @@ def write_optimization_results(parameters: OrderedDict, loss: float, iteration_l
             writer.writeheader()
         writer.writerow({**parameters, "loss": float(loss), "iteration": iteration_label})
 
-
-# ------------------------ Nelder–Mead ------------------------
 
 def nelder_mead(
     f,
@@ -813,13 +770,7 @@ def nelder_mead(
     return simplex[order[0]], fvals[order[0]], evals
 
 
-# ------------------------ init jitter ------------------------
-
 def sample_random_params_around(base_params: OrderedDict, log10_span: float) -> OrderedDict:
-    """
-    Jitter around template parameters without imposing hard bounds
-    (except weights + minimal model-valid constraints).
-    """
     def logmul(v, span):
         basep = float(max(1e-12, abs(v)))
         u = random.uniform(-span, span)
@@ -831,36 +782,30 @@ def sample_random_params_around(base_params: OrderedDict, log10_span: float) -> 
             out[k] = float(base + random.uniform(-3.0, 3.0))
             continue
 
-        # weights/fractions (bounded)
-        if k in {"fr", "f_leaf", "c_repro", "c_space"}:
+        if k in {"fr", "c_repro", "c_space"}:
             out[k] = float(min(1.0, max(0.0, base + random.uniform(-0.5, 0.5))))
             continue
 
-        if k in {"ks", "kr"}:
+        if k in {"ks", "kr", "k_crowd"}:
             out[k] = float(logmul(base if base != 0 else 1.0, log10_span))
             continue
 
-        # everything else: multiplicative jitter
+        if k == "leaf_offset":
+            out[k] = float(base + random.uniform(-200.0, 200.0))
+            continue
+
         mag = logmul(base if base != 0 else 1.0, log10_span)
         out[k] = float(math.copysign(mag, base if base != 0 else 1.0))
 
-    # minimal model-valid constraints
     out["ks"] = float(max(0.0, out["ks"]))
     out["kr"] = float(max(0.0, out["kr"]))
+    out["k_crowd"] = float(max(0.0, out["k_crowd"]))
 
-    # clamp weights/fractions again + enforce fr + f_leaf <= 1
-    for w in ["c_space", "c_repro", "fr", "f_leaf"]:
+    for w in ["c_space", "c_repro", "fr"]:
         out[w] = float(min(1.0, max(0.0, out[w])))
-
-    s = out["fr"] + out["f_leaf"]
-    if s > 1.0 and s > 0:
-        out["fr"] /= s
-        out["f_leaf"] /= s
 
     return out
 
-
-# ------------------------ main ------------------------
 
 def main():
     args = parse_args()
@@ -875,22 +820,24 @@ def main():
     else:
         site_list = args.sites
 
+    script_dir = os.path.abspath(os.path.dirname(__file__))
+    project_root = os.path.abspath(os.path.join(script_dir, ".."))
+
     primary_param_file = os.path.abspath(get_param_file_path(config))
     template_params = read_parameters_file(primary_param_file, config)
     template_params = _ensure_params_present(template_params, config)
 
-    # Only optimize the active keys (what C++ reads)
-    active_keys = ["ks", "kr", "bs", "br", "c_space", "c_repro", "fr", "f_leaf"]
+    active_keys = ["ks", "kr", "bs", "br", "c_space", "c_repro", "fr", "k_crowd", "leaf_offset"]
     template_params_active = OrderedDict((k, float(template_params[k])) for k in active_keys)
 
     param_names = list(template_params_active.keys())
 
-    # weights/fractions that must be in [0,1]
-    weight_names = ["c_space", "c_repro", "fr", "f_leaf"]
+    weight_names = ["c_space", "c_repro", "fr"]
     idx_weights = {k: param_names.index(k) for k in weight_names}
 
     idx_ks = param_names.index("ks")
     idx_kr = param_names.index("kr")
+    idx_kcrowd = param_names.index("k_crowd")
 
     nyears = int(config.get("Tussock Model", "nyears"))
     if nyears < args.constraint_year:
@@ -903,35 +850,22 @@ def main():
             x[idx] = float(np.clip(x[idx], 0.0, 1.0))
         return x
 
-    def _enforce_fr_leaf_sum(x: np.ndarray) -> np.ndarray:
-        i_fr = idx_weights["fr"]
-        i_fl = idx_weights["f_leaf"]
-        fr = float(x[i_fr])
-        fl = float(x[i_fl])
-        s = fr + fl
-        if s > 1.0 and s > 0:
-            x[i_fr] = fr / s
-            x[i_fl] = fl / s
-        return x
-
     def project_vec(x: np.ndarray) -> np.ndarray:
         x = np.array(x, dtype=float)
         x[~np.isfinite(x)] = 0.0
 
         if args.optimize_log_space:
-            # weights are logits; keep bounded for stability
             for k, idx in idx_weights.items():
                 x[idx] = float(np.clip(x[idx], -10.0, 10.0))
-            # minimal model-valid constraints in x-space (linear params)
             x[idx_ks] = float(max(0.0, x[idx_ks]))
             x[idx_kr] = float(max(0.0, x[idx_kr]))
+            x[idx_kcrowd] = float(max(0.0, x[idx_kcrowd]))
             return x
 
-        # linear-space: clamp weights + enforce fr+f_leaf<=1 + ks/kr>=0
         x = _clip_weights_linear(x)
-        x = _enforce_fr_leaf_sum(x)
         x[idx_ks] = float(max(0.0, x[idx_ks]))
         x[idx_kr] = float(max(0.0, x[idx_kr]))
+        x[idx_kcrowd] = float(max(0.0, x[idx_kcrowd]))
         return x
 
     def x_to_model_params(x: np.ndarray) -> OrderedDict:
@@ -939,25 +873,21 @@ def main():
 
         if args.optimize_log_space:
             vec = x.copy()
-            # decode weights from logits
             for k, idx in idx_weights.items():
                 vec[idx] = 1.0 / (1.0 + np.exp(-vec[idx]))
-            vec = _enforce_fr_leaf_sum(vec)
             params = vector_to_params(vec, param_names)
         else:
             vec = project_vec(x)
             params = vector_to_params(vec, param_names)
 
-        # insurance constraints
         params["ks"] = float(max(0.0, params["ks"]))
         params["kr"] = float(max(0.0, params["kr"]))
-        for k in ["c_space", "c_repro", "fr", "f_leaf"]:
+        params["k_crowd"] = float(max(0.0, params["k_crowd"]))
+        for k in ["c_space", "c_repro", "fr"]:
             params[k] = float(min(1.0, max(0.0, params[k])))
 
-        s = params["fr"] + params["f_leaf"]
-        if s > 1.0 and s > 0:
-            params["fr"] /= s
-            params["f_leaf"] /= s
+        if not np.isfinite(params["leaf_offset"]):
+            params["leaf_offset"] = 0.0
 
         return params
 
@@ -966,7 +896,6 @@ def main():
 
         if args.optimize_log_space:
             x = vec.copy()
-            # encode weights as logits
             for k, idx in idx_weights.items():
                 p = float(min(1.0, max(0.0, x[idx])))
                 p = min(1.0 - 1e-9, max(1e-9, p))
@@ -987,7 +916,6 @@ def main():
             training_data = full_training_df[full_training_df["site"] == site].copy()
             site_tag = str(site)
 
-        # Precompute fixed axis limits from OBSERVED data for this site
         training_data = training_data.copy()
         training_data["field_davg"] = pd.to_numeric(training_data["diam"], errors="coerce")
         training_diameters = training_data["field_davg"].dropna().values
@@ -1012,6 +940,8 @@ def main():
 
         best_seen = {"loss": float("inf"), "params": None}
 
+        param_file_rel = os.path.relpath(primary_param_file, start=project_root)
+
         def objective_vec(x: np.ndarray) -> float:
             nonlocal eval_label
             eval_label += 1
@@ -1021,7 +951,14 @@ def main():
 
             write_parameters_to_paths(params, primary_param_file, site_outdir)
 
-            tussock_model(config, output_mode="summary")
+            write_cpp_parameterization_ini(
+                project_root=project_root,
+                param_file_rel_from_root=param_file_rel,
+                constraint_year=args.constraint_year,
+                alive_overflow_threshold=args.alive_overflow_threshold,
+            )
+
+            tussock_model(config, output_mode="summary", project_root=project_root)
 
             loss = diameter_objective(
                 config=config,
@@ -1035,6 +972,8 @@ def main():
                 radius_cap=args.radius_cap,
                 constraint_pass_frac=args.constraint_pass_frac,
                 alive_overflow_threshold=args.alive_overflow_threshold,
+                hard_fail_on_overflow=args.hard_fail_on_overflow,
+                require_survive_to_end_for_fit=args.require_survive_to_end_for_fit,
                 print_fail_breakdown=args.print_fail_breakdown,
                 plot_every=args.plot_every,
                 plot_kde=args.plot_kde,
@@ -1056,7 +995,7 @@ def main():
         best_init_loss = float("inf")
         best_init_params = template_params_active
 
-        best_points = []  # (loss, x_trial)
+        best_points = []
 
         for _ in range(args.n_init):
             trial_params = sample_random_params_around(template_params_active, args.init_log10_span)
@@ -1107,12 +1046,19 @@ def main():
 
         write_parameters_to_paths(final_params, primary_param_file, site_outdir)
 
+        write_cpp_parameterization_ini(
+            project_root=project_root,
+            param_file_rel_from_root=param_file_rel,
+            constraint_year=args.constraint_year,
+            alive_overflow_threshold=args.alive_overflow_threshold,
+        )
+
         final_sims_dir = os.path.join(site_outdir, "final_sims")
         os.makedirs(final_sims_dir, exist_ok=True)
         config.set("Tussock Model", "filepath", final_sims_dir)
 
         print(f"[{site_tag}] running final full-output sims into: {final_sims_dir}")
-        tussock_model(config, output_mode="full")
+        tussock_model(config, output_mode="full", project_root=project_root)
 
         if args.plot_every and args.plot_every > 0:
             gif_path = os.path.join(site_outdir, "diameter_dist_fitting.gif")

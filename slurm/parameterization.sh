@@ -5,6 +5,7 @@
 #SBATCH --error=eco_param.err
 #SBATCH --time=500:00:00
 #SBATCH --nodelist=lgmem-02
+#SBATCH --exclusive
 
 set -euo pipefail
 
@@ -42,6 +43,6 @@ if [ -d "$OUTBASE" ]; then
 fi
 
 echo "=== running parameterization ==="
-"$PY" scripts/parameterization.py --sites Toolik_7
+"$PY" scripts/parameterization.py --sites all
 
 echo "END: $(date)"

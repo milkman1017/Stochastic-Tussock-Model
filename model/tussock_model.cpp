@@ -1,15 +1,4 @@
 // main.cpp  (build: g++ -O3 -DNDEBUG -march=native -flto -pthread -std=c++17 -o tussock_model main.cpp)
-//
-// Carbon mechanizes ONLY tissue growth:
-//   - Leaf area next year via SLA + carbon allocation
-//   - Root number + root diameter via carbon allocation
-//   - Stem radius growth via carbon allocation
-//
-// NEW: Carbon storage pool (gC) carried between years, computed from stem volume (radius + age-derived stem length)
-//      using Fetcher stem increment equation with TDD=500, and Chapin stem TNC fraction.
-//      Storage contributes to next year's available carbon.
-//
-// Survival + reproduction are DEMOGRAPHIC ONLY (spatial + size), with no carbon gating.
 
 #include <iostream>
 #include <fstream>
@@ -35,13 +24,9 @@
 #include <limits.h>
 #endif
 
-// -------------------- global helpers --------------------
 static std::mutex g_print_mutex;
-
-// Set to 1 to disable reproduction.
 static constexpr int DISABLE_REPRO = 0;
 
-// -------------------- small helpers --------------------
 static inline std::string trim(const std::string& s) {
     size_t a = 0;
     while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) a++;
@@ -50,17 +35,9 @@ static inline std::string trim(const std::string& s) {
     return s.substr(a, b - a);
 }
 
-static inline double clamp01(double p) {
-    return std::max(0.0, std::min(1.0, p));
-}
-
-static inline double logistic(double z) {
-    return 1.0 / (1.0 + std::exp(-z));
-}
-
-static inline double clamp(double x, double lo, double hi) {
-    return std::max(lo, std::min(hi, x));
-}
+static inline double clamp01(double p) { return std::max(0.0, std::min(1.0, p)); }
+static inline double logistic(double z) { return 1.0 / (1.0 + std::exp(-z)); }
+static inline double clamp(double x, double lo, double hi) { return std::max(lo, std::min(hi, x)); }
 
 static inline bool should_prune_dead(const Tiller& t) {
     constexpr double EPS_R = 1e-6;
@@ -92,8 +69,6 @@ static inline bool should_prune_dead(const Tiller& t) {
     return empty;
 }
 
-// Robustly determine project root independent of current working directory.
-// Assumes binary is located at <root>/model/tussock_model
 static std::filesystem::path get_project_root() {
     try {
 #if defined(__linux__)
@@ -102,18 +77,15 @@ static std::filesystem::path get_project_root() {
         if (len > 0) {
             buf[len] = '\0';
             std::filesystem::path exe_path = std::filesystem::canonical(std::filesystem::path(buf));
-            // .../<root>/model/tussock_model
             return exe_path.parent_path().parent_path();
         }
 #endif
-        // Fallback: use current_path (best effort)
         return std::filesystem::current_path();
     } catch (...) {
         return std::filesystem::current_path();
     }
 }
 
-// Minimal INI reader
 std::string ini_get(
     const std::string& ini_path,
     const std::string& wanted_section,
@@ -152,7 +124,6 @@ double calculater0(const Tiller& tiller) {
     return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY());
 }
 
-// ---- geometry helpers ----
 static inline double dist2_xy(const Tiller& a, const Tiller& b) {
     double dx = a.getX() - b.getX();
     double dy = a.getY() - b.getY();
@@ -163,7 +134,6 @@ static inline std::int64_t cell_key(int cx, int cy) {
     return (static_cast<std::int64_t>(cx) << 32) ^ (static_cast<std::uint32_t>(cy));
 }
 
-// -------------------- overlap stats for logging --------------------
 struct OverlapStats {
     int passes = 0;
     long long candidates = 0;
@@ -173,18 +143,14 @@ struct OverlapStats {
     double ms = 0.0;
 };
 
-// Deterministic "rare" decision (~1/20) without RNG
 static inline bool allow_rare_z_adjust(int i, int j, int pass) {
-    // 64-bit mix (xorshift-ish hashing)
     std::uint64_t x = 1469598103934665603ULL;
     x ^= (std::uint64_t)i + 0x9e3779b97f4a7c15ULL; x *= 1099511628211ULL;
     x ^= (std::uint64_t)j + 0xbf58476d1ce4e5b9ULL; x *= 1099511628211ULL;
     x ^= (std::uint64_t)pass + 0x94d049bb133111ebULL; x *= 1099511628211ULL;
-    // ~5% chance
     return (x % 20ULL) == 0ULL;
 }
 
-// Fast overlap resolution
 void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
     auto t0 = std::chrono::high_resolution_clock::now();
     stats = OverlapStats{};
@@ -292,11 +258,9 @@ void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
                         double pen = dist - rsum;
                         stats.max_penetration = std::min(stats.max_penetration, pen);
 
-                        // XY relaxation
                         tillers[i].move(angle,        DAMP * pen);
                         tillers[j].move(angle + M_PI, DAMP * pen);
 
-                        // If still overlapping, VERY RARELY allow Z adjustment (no more Z as universal escape hatch)
                         if (tillers[i].isOverlapping(tillers[j])) {
                             if (pass >= 5 && allow_rare_z_adjust(i, j, pass)) {
                                 double dxy2 = dist2_xy(tillers[i], tillers[j]);
@@ -333,14 +297,61 @@ void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
     stats.ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
 
-// -------------------- parameter reader --------------------
-// We keep old keys fr_repr / c_daughter for backward compatibility, but they are ignored in this script.
+static std::vector<int> compute_local_crowding_alive(const std::vector<Tiller>& tillers, double R) {
+    const double R2 = R * R;
+    const double CELL = R;
+
+    std::vector<int> crowd(tillers.size(), 0);
+    if (tillers.size() < 2) return crowd;
+
+    std::unordered_map<std::int64_t, std::vector<int>> grid;
+    grid.reserve(tillers.size() * 2);
+
+    auto cell_of = [&](double x, double y) -> std::pair<int,int> {
+        int cx = static_cast<int>(std::floor(x / CELL));
+        int cy = static_cast<int>(std::floor(y / CELL));
+        return {cx, cy};
+    };
+
+    for (int i = 0; i < static_cast<int>(tillers.size()); ++i) {
+        if (tillers[i].getStatus() != 1) continue;
+        auto [cx, cy] = cell_of(tillers[i].getX(), tillers[i].getY());
+        grid[cell_key(cx, cy)].push_back(i);
+    }
+
+    for (int i = 0; i < static_cast<int>(tillers.size()); ++i) {
+        if (tillers[i].getStatus() != 1) { crowd[i] = 0; continue; }
+        auto [cx, cy] = cell_of(tillers[i].getX(), tillers[i].getY());
+
+        int count = 0;
+        for (int dx = -1; dx <= 1; ++dx) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                auto it = grid.find(cell_key(cx + dx, cy + dy));
+                if (it == grid.end()) continue;
+                const auto& bucket = it->second;
+
+                for (int j : bucket) {
+                    if (j == i) continue;
+                    double ddx = tillers[i].getX() - tillers[j].getX();
+                    double ddy = tillers[i].getY() - tillers[j].getY();
+                    double d2 = ddx*ddx + ddy*ddy;
+                    if (d2 <= R2) count++;
+                }
+            }
+        }
+        crowd[i] = count;
+    }
+
+    return crowd;
+}
+
 void readFromFile(const std::string& filename,
                   double& ks, double& kr, double& bs, double& br,
                   double& c_space,
-                  double& c_repro,   // 0..1 weight between spatial vs size fecundity
-                  double& fr,        // 0..1 fraction of growth carbon to roots
-                  double& f_leaf) {  // 0..1 fraction of growth carbon to leaves (new)
+                  double& c_repro,
+                  double& fr,
+                  double& k_crowd,
+                  double& leaf_offset) {
     std::ifstream inputFile(filename);
     if (!inputFile.is_open()) {
         std::lock_guard<std::mutex> lk(g_print_mutex);
@@ -371,17 +382,12 @@ void readFromFile(const std::string& filename,
     if (p.count("br")) br = p["br"];
 
     if (p.count("c_space")) c_space = p["c_space"];
-
-    //c_repro (0..1 weight between spatial vs size fecundity)
     if (p.count("c_repro")) c_repro = p["c_repro"];
 
     if (p.count("fr")) fr = p["fr"];
+    if (p.count("k_crowd")) k_crowd = p["k_crowd"];
 
-    // New: f_leaf for leaf allocation from growth carbon
-    if (p.count("f_leaf")) f_leaf = p["f_leaf"];
-
-    // Back-compat: ignore these if present
-    // p["fr_repr"], p["c_daughter"]
+    if (p.count("leaf_offset")) leaf_offset = p["leaf_offset"];
 }
 
 enum class OutputMode : int { FULL = 0, SUMMARY = 1 };
@@ -419,6 +425,14 @@ struct SimSummary {
     double leafarea_mean_y = std::nan("");
 };
 
+static inline double leaf_ipm_next_mean(double A, double leaf_offset) {
+    // growth_mean: y = b0 + b1*A + b2*A^2 + offset
+    const double b0 = 34.56271744473715;
+    const double b1 = 1.043331450132405;
+    const double b2 = -0.00030329319726520824;
+    return (b0 + b1 * A + b2 * A * A) + leaf_offset;
+}
+
 void simulate(const int max_sim_time,
               const int sim_id,
               const std::string& outdir,
@@ -428,30 +442,20 @@ void simulate(const int max_sim_time,
               const int alive_overflow_threshold) {
 
     double ks = 0.0, kr = 0.0, bs = 0.0, br = 0.0;
-
-    // Survival weight: 1 => spatial only, 0 => size only
     double c_space = 1.0;
-
-    // Repro weight: 1 => spatial only, 0 => size only
     double c_repro = 0.5;
+    double fr = 0.5;
+    double k_crowd = 0.0;
+    double leaf_offset = 0.0;
 
-    // Carbon allocation (growth carbon only):
-    double fr = 0.5;      // roots
-    double f_leaf = 0.3;  // leaves. Remaining goes to stem/radius.
-
-    readFromFile(param_file_path, ks, kr, bs, br, c_space, c_repro, fr, f_leaf);
+    readFromFile(param_file_path, ks, kr, bs, br, c_space, c_repro, fr, k_crowd, leaf_offset);
 
     c_space = clamp(c_space, 0.0, 1.0);
     c_repro = clamp(c_repro, 0.0, 1.0);
     fr      = clamp(fr, 0.0, 1.0);
-    f_leaf  = clamp(f_leaf, 0.0, 1.0);
 
-    // Enforce fr + f_leaf <= 1; if too large, shrink proportionally.
-    if (fr + f_leaf > 1.0) {
-        double s = fr + f_leaf;
-        fr     /= s;
-        f_leaf /= s;
-    }
+    if (!std::isfinite(k_crowd) || k_crowd < 0.0) k_crowd = 0.0;
+    if (!std::isfinite(leaf_offset)) leaf_offset = 0.0;
 
     std::uint64_t t = (std::uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
     std::uint32_t seed = (std::uint32_t)(t ^ (0x9e3779b97f4a7c15ULL + (std::uint64_t)sim_id * 0xBF58476D1CE4E5B9ULL));
@@ -460,9 +464,12 @@ void simulate(const int max_sim_time,
     std::uniform_real_distribution<double> dis(0.0, 1.0);
     std::normal_distribution<double> growRadiusDist(0.01, 0.0025);
 
-    // Root production distribution
     std::uniform_int_distribution<int> root_num_dis(1, 4);
-    std::uniform_real_distribution<double> root_diam_dis(0.5, 5.0); // mm
+    std::uniform_real_distribution<double> root_diam_dis(0.5, 5.0);
+
+    // IPM growth noise (additive on y)
+    const double sigma_leaf = 147.74558691423508;
+    std::normal_distribution<double> leafNoise(0.0, sigma_leaf);
 
     std::filesystem::create_directories(outdir);
     std::string logs_dir = outdir + "/sim_logs";
@@ -483,7 +490,6 @@ void simulate(const int max_sim_time,
         filebuf.resize(8 * 1024 * 1024);
         outputFile.rdbuf()->pubsetbuf(filebuf.data(), (std::streamsize)filebuf.size());
 
-        // NOTE: keeping columns unchanged to avoid breaking downstream scripts
         outputFile << "TimeStep,Age,Radius,LeafArea,DeadLeafArea,DeadLeafMass,RootNecroVol,RootNecroVolCum,RootNecroMass,RootNecroMassCum,X,Y,Z,NumRoots,RootDiamMM,Status\n";
     }
 
@@ -495,20 +501,20 @@ void simulate(const int max_sim_time,
                   "\tOverlap_passes\tCandidates\tOverlapped\tZ_adjusts\tMaxPen\tOverlap_ms\n";
     }
 
-    // initial tiller
     Tiller first_tiller(
-        1,      // age
-        0.1,    // radius (cm)
-        0.0,    // x
-        0.0,    // y
-        0.0,    // z
-        3,      // num_roots
-        1,      // status (alive)
-        50.0f,  // leaf_area
-        0.0f,   // dead_leaf_area
-        0.0f,   // root_necro_vol
-        0.0f,   // root_necro_vol_cum
-        1.0f    // root_diam_mm
+        1,
+        0.1,
+        0.0,
+        0.0,
+        0.0,
+        3,
+        1,
+        50.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+        1.0f,
+        0.0
     );
 
     std::vector<Tiller> previous_step;
@@ -525,34 +531,30 @@ void simulate(const int max_sim_time,
     static constexpr double LEAFAREA_MIN = 0.0;
     static constexpr double LEAFAREA_MAX = 2500.0;
 
-    // ---- Carbon budget constants (simple but mechanistic) ----
-    static constexpr double ASSIM_C_PER_G_LEAF = 2.0;     // gC / (g leaf) / yr
-    static constexpr double CARBON_PER_G_BIOMASS = 0.45;  // gC per g dry mass
+    static constexpr double ASSIM_C_PER_G_LEAF = 2.0;
+    static constexpr double CARBON_PER_G_BIOMASS = 0.45;
 
-    // Stem tissue density (rough)
     static constexpr double RHO_STEM_G_PER_CM3 = 0.30;
+    static constexpr double STEM_TNC_FRAC = 0.375;
 
-    // ---- Dieback / rebuild assumption ----
-    static constexpr double REBUILD_LEAF_FRAC = 0.8;
-    static constexpr double REBUILD_ROOT_FRAC = 1.0;
-
-    // ---- Storage constants (stem TNC proxy; Chapin) ----
-    static constexpr double STEM_TNC_FRAC = 0.375; // 35–40% midpoint
-
-    // ---- Fetcher annual stem increment (mm/yr) = 0.0052*TDD - 0.5461 ----
     static constexpr double TDD_JJA = 500.0;
-    static constexpr double STEM_INC_MM_PER_YR = (0.0052 * TDD_JJA - 0.5461); // 2.0539 mm/yr
+    static constexpr double STEM_INC_MM_PER_YR = (0.0052 * TDD_JJA - 0.5461);
     static constexpr double STEM_INC_CM_PER_YR = (STEM_INC_MM_PER_YR > 0.0 ? STEM_INC_MM_PER_YR / 10.0 : 0.0);
+
+    static constexpr double R_CROWD_CM = 2.0;
 
     for (int time_step = 0; time_step <= max_sim_time; time_step++) {
         final_t = time_step;
+
+        std::vector<int> crowd_prev = compute_local_crowding_alive(previous_step, R_CROWD_CM);
 
         std::vector<Tiller> step_data;
         std::vector<Tiller> newTillers;
         step_data.reserve(previous_step.size() + 256);
         newTillers.reserve(256);
 
-        for (Tiller& tiller : previous_step) {
+        for (int idx = 0; idx < static_cast<int>(previous_step.size()); ++idx) {
+            Tiller& tiller = previous_step[idx];
 
             if (tiller.getStatus() == 1) {
                 double distance = calculater0(tiller);
@@ -560,16 +562,12 @@ void simulate(const int max_sim_time,
                 double current_area = static_cast<double>(tiller.getLeafArea());
                 if (!std::isfinite(current_area) || current_area < 0.0) current_area = 0.0;
 
-                // This year's peak leaf area (A_t)
                 const double A_t = clamp(current_area, LEAFAREA_MIN, LEAFAREA_MAX);
-
                 double prev_area = current_area;
 
-                // capture last year's roots before overwriting them
                 const int   prev_roots = tiller.getNumRoots();
                 const float prev_root_diam_mm = tiller.getRootDiamMM();
 
-                // ---------------- Survival (NO carbon) ----------------
                 double p_spatial = clamp01(logistic(bs - ks * distance));
 
                 const double s0 = -0.4759392738089253;
@@ -583,20 +581,14 @@ void simulate(const int max_sim_time,
 
                 if (dis(gen) < p_survive) {
 
-                    // dead leaf pool update for surviving tiller
                     tiller.accumulateDeadLeafArea(static_cast<float>(prev_area));
-
-                    // move last year's roots into necromass pools
                     tiller.accumulateRootNecroFromPrevRoots(prev_roots, prev_root_diam_mm);
 
-                    // ---------------- Reproduction probability (NO carbon) ----------------
                     double p_event = 0.0;
                     if (!DISABLE_REPRO) {
-                        // spatial component (distance-based)
                         double eta_repro_spatial = br - kr * distance;
                         double p_repro_spatial   = clamp01(logistic(eta_repro_spatial));
 
-                        // size component (leaf-area based)
                         const double b0_f = -4.23966202048902;
                         const double b1_f =  0.01478880984282271;
                         const double b2_f = -1.334715680346952e-05;
@@ -609,62 +601,52 @@ void simulate(const int max_sim_time,
 
                         double w_repro = clamp(c_repro, 0.0, 1.0);
                         p_event = clamp01(w_repro * p_repro_spatial + (1.0 - w_repro) * p_event_size);
+
+                        int Nnbr = 0;
+                        if (idx >= 0 && idx < static_cast<int>(crowd_prev.size())) Nnbr = crowd_prev[idx];
+                        if (Nnbr < 0) Nnbr = 0;
+
+                        if (k_crowd > 0.0 && Nnbr > 0) {
+                            double denom = 1.0 + k_crowd * static_cast<double>(Nnbr);
+                            if (!std::isfinite(denom) || denom <= 0.0) denom = 1.0;
+                            p_event = clamp01(p_event / denom);
+                        }
                     }
 
                     if (!DISABLE_REPRO && (dis(gen) < p_event)) {
                         newTillers.push_back(tiller.makeDaughter());
                     }
 
-                    // ---------------- Growth / maturation ----------------
                     tiller.mature(1);
 
-                    // ---------------- Carbon-based tissue growth ----------------
-                    // Carbon supply from THIS year's peak (A_t)
+                    // Leaf area update from IPM growth function (A_{t+1})
+                    {
+                        double Aclamp = clamp(A_t, 0.0, 2000.0);
+                        double mu = leaf_ipm_next_mean(Aclamp, leaf_offset);
+                        double A_next = mu + leafNoise(gen);
+                        if (!std::isfinite(A_next)) A_next = 0.0;
+                        A_next = clamp(A_next, LEAFAREA_MIN, LEAFAREA_MAX);
+                        tiller.setLeafArea(static_cast<float>(A_next));
+                    }
+
+                    // Carbon supply driven by THIS year's A_t (photosynthesis proxy)
                     double leaf_mass_t_g = (A_t / (double)Tiller::SLA_CM2_PER_G);
                     if (!std::isfinite(leaf_mass_t_g) || leaf_mass_t_g < 0.0) leaf_mass_t_g = 0.0;
 
                     double supply_C = leaf_mass_t_g * ASSIM_C_PER_G_LEAF;
                     if (!std::isfinite(supply_C) || supply_C < 0.0) supply_C = 0.0;
 
-                    // Rebuild costs (bill) - affects how much is left for growth,
-                    // but DOES NOT directly kill the tiller in this version.
-                    auto root_mass_est_g = [&](int n, double dmm) -> double {
-                        double vol_cm3 = (double)Tiller::perRootConeVolumeCm3((float)dmm) * (double)n;
-                        return vol_cm3 * (double)Tiller::RHO_ROOT_G_PER_CM3;
-                    };
-
-                    double C_rebuild_leaf = REBUILD_LEAF_FRAC * leaf_mass_t_g * CARBON_PER_G_BIOMASS;
-
-                    double root_mass_prev_g = root_mass_est_g(prev_roots, (double)prev_root_diam_mm);
-                    double C_rebuild_root = REBUILD_ROOT_FRAC * root_mass_prev_g * CARBON_PER_G_BIOMASS;
-
-                    double C_rebuild = C_rebuild_leaf + C_rebuild_root;
-                    if (!std::isfinite(C_rebuild) || C_rebuild < 0.0) C_rebuild = 0.0;
-
-                    // NEW: include stored carbon from last year (computed from stem volume)
                     double C_store_prev = tiller.getCStore();
                     if (!std::isfinite(C_store_prev) || C_store_prev < 0.0) C_store_prev = 0.0;
 
-                    double C_avail = supply_C + C_store_prev - C_rebuild;
-                    if (!std::isfinite(C_avail)) C_avail = 0.0;
-                    if (C_avail < 0.0) C_avail = 0.0;
+                    double C_avail = supply_C + C_store_prev;
+                    if (!std::isfinite(C_avail) || C_avail < 0.0) C_avail = 0.0;
 
-                    // Allocate growth carbon into leaves, roots, and stem
                     double C_root = fr * C_avail;
-                    double C_leaf = f_leaf * C_avail;
-                    double C_stem = C_avail - C_root - C_leaf;
+                    double C_stem = C_avail - C_root;
                     if (C_stem < 0.0) C_stem = 0.0;
 
-                    // ---- Leaf area next year from C_leaf + SLA ----
-                    double leaf_mass_next_g = (C_leaf / CARBON_PER_G_BIOMASS);
-                    if (!std::isfinite(leaf_mass_next_g) || leaf_mass_next_g < 0.0) leaf_mass_next_g = 0.0;
-
-                    double A_next = leaf_mass_next_g * (double)Tiller::SLA_CM2_PER_G;
-                    if (!std::isfinite(A_next)) A_next = 0.0;
-                    A_next = clamp(A_next, LEAFAREA_MIN, LEAFAREA_MAX);
-                    tiller.setLeafArea(static_cast<float>(A_next));
-
-                    // ---- Roots: sample desired, then downscale to fit C_root ----
+                    // Roots: sample desired, then downscale to fit C_root
                     int n_roots = root_num_dis(gen);
                     double diam_mm = root_diam_dis(gen);
 
@@ -695,14 +677,12 @@ void simulate(const int max_sim_time,
 
                     tiller.setRoots(n_roots, (float)diam_mm);
 
-                    // ---- Radius growth: limited by C_stem ----
+                    // Radius growth: limited by C_stem
                     double dr_base = growRadiusDist(gen);
                     if (!std::isfinite(dr_base) || dr_base < 0.0) dr_base = 0.01;
 
                     double r = tiller.getRadius();
 
-                    // NEW: stem length from Fetcher increment (TDD=500), not 0.2*age
-                    // If STEM_INC_CM_PER_YR is 0 due to negative increment, fall back to small positive
                     double dh_cm = (STEM_INC_CM_PER_YR > 0.0 ? STEM_INC_CM_PER_YR : 0.01);
                     double h_cm = dh_cm * (double)tiller.getAge();
                     h_cm = std::max(dh_cm, h_cm);
@@ -730,8 +710,6 @@ void simulate(const int max_sim_time,
 
                     tiller.growRadius(dr_use);
 
-                    // ---- NEW: update stored carbon for next year from stem volume (radius + age-derived h_cm) ----
-                    // Stem volume as cylinder: V = pi r^2 h
                     double r_cm_now = (double)tiller.getRadius();
                     double V_stem_cm3 = M_PI * r_cm_now * r_cm_now * h_cm;
                     if (!std::isfinite(V_stem_cm3) || V_stem_cm3 < 0.0) V_stem_cm3 = 0.0;
@@ -745,7 +723,6 @@ void simulate(const int max_sim_time,
                     tiller.setCStore(C_store_next);
 
                 } else {
-                    // died this year (demographic survival only)
                     tiller.accumulateDeadLeafArea(static_cast<float>(prev_area));
                     tiller.accumulateRootNecroFromPrevRoots(prev_roots, prev_root_diam_mm);
                     tiller.setStatus(0);
@@ -754,10 +731,9 @@ void simulate(const int max_sim_time,
                 step_data.push_back(tiller);
 
             } else {
-                // dead tiller decay
                 tiller.decay();
                 tiller.setRoots(0, tiller.getRootDiamMM());
-                tiller.setCStore(0.0); // dead tillers don't carry labile C store
+                tiller.setCStore(0.0);
 
                 if (!should_prune_dead(tiller)) {
                     step_data.push_back(tiller);
@@ -781,8 +757,8 @@ void simulate(const int max_sim_time,
             double d = SENTINEL_SCALE / (static_cast<double>(time_step) + 1.0);
             d = std::max(50.0, std::min(5000.0, d));
 
-            step_data.emplace_back(Tiller(1, 0.5,  +d, 0.0, 0.0, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f));
-            step_data.emplace_back(Tiller(1, 0.5,  -d, 0.0, 0.0, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f));
+            step_data.emplace_back(Tiller(1, 0.5,  +d, 0.0, 0.0, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0));
+            step_data.emplace_back(Tiller(1, 0.5,  -d, 0.0, 0.0, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0));
             stop_due_to_overflow = true;
         }
 

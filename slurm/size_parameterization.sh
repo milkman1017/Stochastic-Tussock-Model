@@ -3,8 +3,9 @@
 #SBATCH --chdir=/home/lucentlab/wmahler/Stochastic-Tussock-Model
 #SBATCH --output=size_param.out
 #SBATCH --error=size_param.err
-#SBATCH --time=144:00:00
-#SBATCH --nodelist=lgmem-02
+#SBATCH --time=500:00:00
+#SBATCH --nodelist=lgmem-01
+#SBATCH --exclusive
 
 set -euo pipefail
 
