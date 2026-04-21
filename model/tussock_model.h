@@ -21,8 +21,7 @@ public:
            float dead_leaf_area = 0.0f,
            float root_necro_vol = 0.0f,
            float root_necro_vol_cum = 0.0f,
-           float root_diam_mm = 1.0f,
-           double c_store = 0.0)
+           float root_diam_mm = 1.0f)
         : age(age),
           radius(radius),
           x(x),
@@ -34,8 +33,7 @@ public:
           dead_leaf_area(dead_leaf_area),
           root_necro_vol(root_necro_vol),
           root_necro_vol_cum(root_necro_vol_cum),
-          root_diam_mm(root_diam_mm),
-          c_store(c_store) {}
+          root_diam_mm(root_diam_mm) {}
 
     double getRadius() const { return radius; }
 
@@ -57,9 +55,6 @@ public:
     float getRootNecroVolCum() const { return root_necro_vol_cum; }
 
     float getRootDiamMM() const { return root_diam_mm; }
-
-    double getCStore() const { return c_store; }
-    void setCStore(double v) { c_store = (std::isfinite(v) && v > 0.0) ? v : 0.0; }
 
     static constexpr float SLA_CM2_PER_G = 98.0f;
     static constexpr float RHO_ROOT_G_PER_CM3 = 0.21f;
@@ -135,11 +130,11 @@ public:
 
     static constexpr float ROOT_LENGTH_CM = 50.0f;
 
-    static inline float perRootConeVolumeCm3(float diam_mm) {
+    static inline float perRootConeVolumeCm3(float diam_mm) {  //eventually change to cylinder
         const float r_cm = (diam_mm * 0.1f) * 0.5f;
         const float h_cm = ROOT_LENGTH_CM;
         const float pi = 3.14159265358979323846f;
-        return (1.0f / 3.0f) * pi * r_cm * r_cm * h_cm;
+        return float (1.0f / 3.0f) * pi * r_cm * r_cm * h_cm;
     }
 
     void accumulateRootNecroFromPrevRoots(int prev_roots, float prev_diam_mm) {
@@ -173,7 +168,6 @@ public:
         if (root_necro_vol < 0) root_necro_vol = 0;
         if (root_necro_vol_cum < 0) root_necro_vol_cum = 0;
 
-        c_store = 0.0;
     }
 
     Tiller makeDaughter() {
@@ -188,7 +182,7 @@ public:
         double newY = y + yOffset;
         double newZ = z + zOffset;
 
-        return Tiller(1, 0.1, newX, newY, newZ, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0);
+        return Tiller(1, 0.1, newX, newY, newZ, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f);
     }
 
 private:
@@ -205,5 +199,4 @@ private:
 
     float root_diam_mm;
 
-    double c_store;
 };
