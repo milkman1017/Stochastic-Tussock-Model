@@ -349,7 +349,6 @@ void readFromFile(const std::string& filename,
                   double& ks, double& kr, double& bs, double& br,
                   double& c_space,
                   double& c_repro,
-                  double& fr,
                   double& k_crowd,
                   double& leaf_offset) {
     std::ifstream inputFile(filename);
@@ -384,7 +383,6 @@ void readFromFile(const std::string& filename,
     if (p.count("c_space")) c_space = p["c_space"];
     if (p.count("c_repro")) c_repro = p["c_repro"];
 
-    if (p.count("fr")) fr = p["fr"];
     if (p.count("k_crowd")) k_crowd = p["k_crowd"];
 
     if (p.count("leaf_offset")) leaf_offset = p["leaf_offset"];
@@ -444,15 +442,13 @@ void simulate(const int max_sim_time,
     double ks = 0.0, kr = 0.0, bs = 0.0, br = 0.0;
     double c_space = 1.0;
     double c_repro = 0.5;
-    double fr = 0.5;
     double k_crowd = 0.0;
     double leaf_offset = 0.0;
 
-    readFromFile(param_file_path, ks, kr, bs, br, c_space, c_repro, fr, k_crowd, leaf_offset);
+    readFromFile(param_file_path, ks, kr, bs, br, c_space, c_repro, k_crowd, leaf_offset);
 
     c_space = clamp(c_space, 0.0, 1.0);
     c_repro = clamp(c_repro, 0.0, 1.0);
-    fr      = clamp(fr, 0.0, 1.0);
 
     if (!std::isfinite(k_crowd) || k_crowd < 0.0) k_crowd = 0.0;
     if (!std::isfinite(leaf_offset)) leaf_offset = 0.0;
@@ -465,7 +461,7 @@ void simulate(const int max_sim_time,
     std::normal_distribution<double> growRadiusDist(0.01, 0.0025);
 
     std::uniform_int_distribution<int> root_num_dis(1, 4);
-    std::uniform_real_distribution<double> root_diam_dis(0.5, 5.0);
+    std::uniform_real_distribution<double> root_diam_dis(0.2, 1.5);
 
     // IPM growth noise (additive on y)
     const double sigma_leaf = 147.74558691423508;
@@ -513,8 +509,7 @@ void simulate(const int max_sim_time,
         0.0f,
         0.0f,
         0.0f,
-        1.0f,
-        0.0
+        1.0f
     );
 
     std::vector<Tiller> previous_step;
@@ -531,13 +526,9 @@ void simulate(const int max_sim_time,
     static constexpr double LEAFAREA_MIN = 0.0;
     static constexpr double LEAFAREA_MAX = 2500.0;
 
-    static constexpr double ASSIM_C_PER_G_LEAF = 2.0;
-    static constexpr double CARBON_PER_G_BIOMASS = 0.45;
-
     static constexpr double RHO_STEM_G_PER_CM3 = 0.30;
-    static constexpr double STEM_TNC_FRAC = 0.375;
 
-    static constexpr double TDD_JJA = 500.0;
+    static constexpr double TDD_JJA = 500.0; //avg tdd approxiation
     static constexpr double STEM_INC_MM_PER_YR = (0.0052 * TDD_JJA - 0.5461);
     static constexpr double STEM_INC_CM_PER_YR = (STEM_INC_MM_PER_YR > 0.0 ? STEM_INC_MM_PER_YR / 10.0 : 0.0);
 
@@ -630,50 +621,10 @@ void simulate(const int max_sim_time,
                     }
 
                     // Carbon supply driven by THIS year's A_t (photosynthesis proxy)
-                    double leaf_mass_t_g = (A_t / (double)Tiller::SLA_CM2_PER_G);
-                    if (!std::isfinite(leaf_mass_t_g) || leaf_mass_t_g < 0.0) leaf_mass_t_g = 0.0;
-
-                    double supply_C = leaf_mass_t_g * ASSIM_C_PER_G_LEAF;
-                    if (!std::isfinite(supply_C) || supply_C < 0.0) supply_C = 0.0;
-
-                    double C_store_prev = tiller.getCStore();
-                    if (!std::isfinite(C_store_prev) || C_store_prev < 0.0) C_store_prev = 0.0;
-
-                    double C_avail = supply_C + C_store_prev;
-                    if (!std::isfinite(C_avail) || C_avail < 0.0) C_avail = 0.0;
-
-                    double C_root = fr * C_avail;
-                    double C_stem = C_avail - C_root;
-                    if (C_stem < 0.0) C_stem = 0.0;
-
+                    
                     // Roots: sample desired, then downscale to fit C_root
                     int n_roots = root_num_dis(gen);
                     double diam_mm = root_diam_dis(gen);
-
-                    auto root_cost_C = [&](int n, double dmm) -> double {
-                        double vol_cm3 = (double)Tiller::perRootConeVolumeCm3((float)dmm) * (double)n;
-                        double mass_g = vol_cm3 * (double)Tiller::RHO_ROOT_G_PER_CM3;
-                        return mass_g * CARBON_PER_G_BIOMASS;
-                    };
-
-                    double costR = root_cost_C(n_roots, diam_mm);
-
-                    while (n_roots > 1 && costR > C_root) {
-                        n_roots--;
-                        costR = root_cost_C(n_roots, diam_mm);
-                    }
-
-                    if (costR > C_root && C_root > 0.0) {
-                        double f = std::sqrt(C_root / std::max(1e-18, costR));
-                        diam_mm *= f;
-                        diam_mm = clamp(diam_mm, 0.5, 5.0);
-                        costR = root_cost_C(n_roots, diam_mm);
-                    }
-
-                    if (C_root <= 0.0) {
-                        n_roots = 1;
-                        diam_mm = 0.5;
-                    }
 
                     tiller.setRoots(n_roots, (float)diam_mm);
 
@@ -683,44 +634,14 @@ void simulate(const int max_sim_time,
 
                     double r = tiller.getRadius();
 
-                    double dh_cm = (STEM_INC_CM_PER_YR > 0.0 ? STEM_INC_CM_PER_YR : 0.01);
-                    double h_cm = dh_cm * (double)tiller.getAge();
-                    h_cm = std::max(dh_cm, h_cm);
-
-                    auto stem_cost_C = [&](double dr) -> double {
-                        double dV = M_PI * (2.0 * r * dr + dr * dr) * h_cm;
-                        double mass_g = dV * RHO_STEM_G_PER_CM3;
-                        return mass_g * CARBON_PER_G_BIOMASS;
-                    };
-
-                    double costS = stem_cost_C(dr_base);
-                    double dr_use = dr_base;
-
-                    if (costS > C_stem && C_stem > 0.0) {
-                        double K = M_PI * h_cm * RHO_STEM_G_PER_CM3 * CARBON_PER_G_BIOMASS;
-                        double target = C_stem / std::max(1e-18, K);
-
-                        double disc = r*r + target;
-                        if (disc < 0.0) disc = 0.0;
-                        dr_use = -r + std::sqrt(disc);
-                        if (!std::isfinite(dr_use) || dr_use < 0.0) dr_use = 0.0;
-                    } else if (C_stem <= 0.0) {
-                        dr_use = 0.0;
-                    }
-
-                    tiller.growRadius(dr_use);
+                    tiller.growRadius(dr_base);
 
                     double r_cm_now = (double)tiller.getRadius();
-                    double V_stem_cm3 = M_PI * r_cm_now * r_cm_now * h_cm;
+                    float V_stem_cm3 = tiller.perRootConeVolumeCm3(diam_mm);
                     if (!std::isfinite(V_stem_cm3) || V_stem_cm3 < 0.0) V_stem_cm3 = 0.0;
 
                     double M_stem_g = V_stem_cm3 * RHO_STEM_G_PER_CM3;
                     if (!std::isfinite(M_stem_g) || M_stem_g < 0.0) M_stem_g = 0.0;
-
-                    double C_store_next = STEM_TNC_FRAC * M_stem_g * CARBON_PER_G_BIOMASS;
-                    if (!std::isfinite(C_store_next) || C_store_next < 0.0) C_store_next = 0.0;
-
-                    tiller.setCStore(C_store_next);
 
                 } else {
                     tiller.accumulateDeadLeafArea(static_cast<float>(prev_area));
@@ -733,7 +654,6 @@ void simulate(const int max_sim_time,
             } else {
                 tiller.decay();
                 tiller.setRoots(0, tiller.getRootDiamMM());
-                tiller.setCStore(0.0);
 
                 if (!should_prune_dead(tiller)) {
                     step_data.push_back(tiller);
@@ -757,8 +677,8 @@ void simulate(const int max_sim_time,
             double d = SENTINEL_SCALE / (static_cast<double>(time_step) + 1.0);
             d = std::max(50.0, std::min(5000.0, d));
 
-            step_data.emplace_back(Tiller(1, 0.5,  +d, 0.0, 0.0, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0));
-            step_data.emplace_back(Tiller(1, 0.5,  -d, 0.0, 0.0, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0));
+            step_data.emplace_back(Tiller(1, 0.5,  +d, 0.0, 0.0, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f));
+            step_data.emplace_back(Tiller(1, 0.5,  -d, 0.0, 0.0, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f));
             stop_due_to_overflow = true;
         }
 
