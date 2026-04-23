@@ -55,9 +55,13 @@ static std::filesystem::path get_project_root() {
     }
 }
 
-std::string ini_get(const std::string& ini_path, const std::string& wanted_section, const std::string& wanted_key, const std::string& fallback) {
+std::string ini_get(const std::string& ini_path,
+                    const std::string& wanted_section,
+                    const std::string& wanted_key,
+                    const std::string& fallback) {
     std::ifstream in(ini_path);
     if (!in.is_open()) return fallback;
+
     std::string line, current_section;
     while (std::getline(in, line)) {
         line = trim(line);
@@ -70,17 +74,26 @@ std::string ini_get(const std::string& ini_path, const std::string& wanted_secti
         if (eq == std::string::npos) continue;
         std::string key = trim(line.substr(0, eq));
         std::string val = trim(line.substr(eq + 1));
-        if (current_section == wanted_section && key == wanted_key) return val.empty() ? fallback : val;
+        if (current_section == wanted_section && key == wanted_key) {
+            return val.empty() ? fallback : val;
+        }
     }
     return fallback;
 }
 
-double calculater0(const Tiller& tiller) { return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY()); }
+static bool ini_get_bool(const std::string& ini_path,
+                         const std::string& section,
+                         const std::string& key,
+                         bool fallback) {
+    std::string v = ini_get(ini_path, section, key, fallback ? "true" : "false");
+    std::string lv = trim(v);
+    std::transform(lv.begin(), lv.end(), lv.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return (lv == "1" || lv == "true" || lv == "yes" || lv == "on");
+}
 
-static inline double dist2_xy(const Tiller& a, const Tiller& b) {
-    double dx = a.getX() - b.getX();
-    double dy = a.getY() - b.getY();
-    return dx * dx + dy * dy;
+double calculater0(const Tiller& tiller) {
+    return std::sqrt(tiller.getX() * tiller.getX() + tiller.getY() * tiller.getY());
 }
 
 static inline std::int64_t cell_key(int cx, int cy) {
@@ -111,6 +124,8 @@ struct ModelParams {
     double kr = 0.0;
     double bs = 0.0;
     double br = 0.0;
+    double ke = 0.0;
+    double be = 0.0;
     double c_space_survival = 0.5;
     double c_space_reproduction = 0.5;
     double c_space_establishment = 0.5;
@@ -133,6 +148,37 @@ struct SimSummary {
     int alive_final = 0;
     double leafarea_mean_y = std::nan("");
 };
+
+struct RuntimeConfig {
+    std::filesystem::path config_path;
+    std::filesystem::path project_root;
+    std::filesystem::path config_dir;
+    std::filesystem::path output_root;
+    std::filesystem::path param_file_path;
+    int constraint_year = 25;
+    int alive_overflow_threshold = 600;
+};
+
+static RuntimeConfig load_runtime_config(const std::string& config_path_raw) {
+    RuntimeConfig rc;
+    rc.project_root = get_project_root();
+
+    std::filesystem::path config_path = std::filesystem::path(config_path_raw);
+    if (config_path.is_relative()) config_path = rc.project_root / config_path;
+    rc.config_path = std::filesystem::weakly_canonical(config_path);
+    rc.config_dir = rc.config_path.parent_path();
+
+    std::string output_dir_raw = ini_get(rc.config_path.string(), "Paths", "output_dir", "parameterization_outputs");
+    std::filesystem::path output_root = std::filesystem::path(output_dir_raw);
+    if (output_root.is_relative()) output_root = rc.config_dir / output_root;
+    rc.output_root = output_root;
+
+    rc.param_file_path = rc.output_root / "parameters.txt";
+    rc.constraint_year = std::stoi(ini_get(rc.config_path.string(), "Constraints", "constraint_year", "25"));
+    rc.alive_overflow_threshold = std::stoi(ini_get(rc.config_path.string(), "Constraints", "alive_overflow_threshold", "600"));
+
+    return rc;
+}
 
 static inline bool should_prune_dead(const Tiller& t) {
     constexpr double EPS_R = 1e-6;
@@ -162,16 +208,20 @@ void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
     const double CELL = CUTOFF;
     const double DAMP = 0.7;
     const int MAX_PASSES = 80;
+
     if (tillers.size() < 2) {
         auto t1 = std::chrono::high_resolution_clock::now();
         stats.ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         return;
     }
+
     std::unordered_map<std::int64_t, std::vector<int>> grid;
     grid.reserve(tillers.size() * 2);
+
     auto cell_of = [&](double x, double y) -> std::pair<int, int> {
         return {static_cast<int>(std::floor(x / CELL)), static_cast<int>(std::floor(y / CELL))};
     };
+
     auto rebuild_grid = [&]() {
         grid.clear();
         for (int i = 0; i < static_cast<int>(tillers.size()); ++i) {
@@ -179,9 +229,11 @@ void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
             grid[cell_key(cx, cy)].push_back(i);
         }
     };
+
     for (int pass = 0; pass < MAX_PASSES; ++pass) {
         rebuild_grid();
         bool any_overlap = false;
+
         for (int i = 0; i < static_cast<int>(tillers.size()); ++i) {
             auto [cx, cy] = cell_of(tillers[i].getX(), tillers[i].getY());
             for (int gx = -1; gx <= 1; ++gx) {
@@ -210,9 +262,11 @@ void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
                 }
             }
         }
+
         stats.passes = pass + 1;
         if (!any_overlap) break;
     }
+
     auto t1 = std::chrono::high_resolution_clock::now();
     stats.ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 }
@@ -222,16 +276,20 @@ static std::vector<int> compute_local_crowding_alive(const std::vector<Tiller>& 
     const double CELL = R;
     std::vector<int> crowd(tillers.size(), 0);
     if (tillers.size() < 2) return crowd;
+
     std::unordered_map<std::int64_t, std::vector<int>> grid;
     grid.reserve(tillers.size() * 2);
+
     auto cell_of = [&](double x, double y) -> std::pair<int, int> {
         return {static_cast<int>(std::floor(x / CELL)), static_cast<int>(std::floor(y / CELL))};
     };
+
     for (int i = 0; i < static_cast<int>(tillers.size()); ++i) {
         if (tillers[i].getStatus() != 1) continue;
         auto [cx, cy] = cell_of(tillers[i].getX(), tillers[i].getY());
         grid[cell_key(cx, cy)].push_back(i);
     }
+
     for (int i = 0; i < static_cast<int>(tillers.size()); ++i) {
         if (tillers[i].getStatus() != 1) continue;
         auto [cx, cy] = cell_of(tillers[i].getX(), tillers[i].getY());
@@ -250,6 +308,7 @@ static std::vector<int> compute_local_crowding_alive(const std::vector<Tiller>& 
         }
         crowd[i] = count;
     }
+
     return crowd;
 }
 
@@ -260,6 +319,7 @@ void readFromFile(const std::string& filename, ModelParams& p) {
         std::cerr << "Unable to open file: " << filename << "\n";
         return;
     }
+
     std::unordered_map<std::string, double> kv;
     std::string line;
     while (std::getline(inputFile, line)) {
@@ -267,23 +327,44 @@ void readFromFile(const std::string& filename, ModelParams& p) {
         if (line.empty() || line[0] == '#' || line[0] == ';') continue;
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
-        try { kv[trim(line.substr(0, eq))] = std::stod(trim(line.substr(eq + 1))); } catch (...) {}
+        try {
+            kv[trim(line.substr(0, eq))] = std::stod(trim(line.substr(eq + 1)));
+        } catch (...) {}
     }
-    auto set_if = [&](const char* key, double& ref) { if (kv.count(key)) ref = kv[key]; };
-    set_if("ks", p.ks); set_if("kr", p.kr); set_if("bs", p.bs); set_if("br", p.br);
-    set_if("c_space_survival", p.c_space_survival); set_if("c_space_reproduction", p.c_space_reproduction); set_if("c_space_establishment", p.c_space_establishment);
-    set_if("k_crowd_survival", p.k_crowd_survival); set_if("k_crowd_reproduction", p.k_crowd_reproduction); set_if("k_crowd_establishment", p.k_crowd_establishment);
-    set_if("leaf_offset", p.leaf_offset); set_if("base_establishment", p.base_establishment);
+
+    auto set_if = [&](const char* key, double& ref) {
+        if (kv.count(key)) ref = kv[key];
+    };
+
+    set_if("ks", p.ks);
+    set_if("kr", p.kr);
+    set_if("bs", p.bs);
+    set_if("br", p.br);
+    set_if("c_space_survival", p.c_space_survival);
+    set_if("c_space_reproduction", p.c_space_reproduction);
+    set_if("c_space_establishment", p.c_space_establishment);
+    set_if("k_crowd_survival", p.k_crowd_survival);
+    set_if("k_crowd_reproduction", p.k_crowd_reproduction);
+    set_if("k_crowd_establishment", p.k_crowd_establishment);
+    set_if("leaf_offset", p.leaf_offset);
+    set_if("base_establishment", p.base_establishment);
 }
 
 enum class OutputMode : int { FULL = 0, SUMMARY = 1 };
 
 void input(int& sim_time, int& num_sims, std::string& outdir, unsigned long int& num_threads, OutputMode& mode) {
-    std::cout << "Enter Simulation time in Years: "; std::cin >> sim_time;
-    std::cout << "Enter Number of Simulations: "; std::cin >> num_sims;
-    std::cout << "Enter output (relative) directory: "; std::cin >> outdir; std::filesystem::create_directories(outdir);
-    std::cout << "Enter the number of threads: "; std::cin >> num_threads;
-    int m = 1; std::cout << "Enter output mode (0=full CSV, 1=summary only): "; std::cin >> m;
+    std::cout << "Enter Simulation time in Years: ";
+    std::cin >> sim_time;
+    std::cout << "Enter Number of Simulations: ";
+    std::cin >> num_sims;
+    std::cout << "Enter output directory: ";
+    std::cin >> outdir;
+    std::filesystem::create_directories(outdir);
+    std::cout << "Enter the number of threads: ";
+    std::cin >> num_threads;
+    int m = 1;
+    std::cout << "Enter output mode (0=full CSV, 1=summary only): ";
+    std::cin >> m;
     mode = (m == 0) ? OutputMode::FULL : OutputMode::SUMMARY;
 }
 
@@ -301,7 +382,7 @@ static inline double baseline_survival_ipm(const Tiller& t) {
 }
 
 static inline double spatial_survival_modifier(const Tiller& t, const ModelParams& p) {
-    return clamp01(logistic(p.bs - p.ks * calculater0(t)));
+    return clamp01(p.bs - p.ks * calculater0(t));
 }
 
 static inline double baseline_reproduction_ipm(const Tiller& t) {
@@ -313,15 +394,11 @@ static inline double baseline_reproduction_ipm(const Tiller& t) {
 }
 
 static inline double spatial_reproduction_modifier(const Tiller& t, const ModelParams& p) {
-    return clamp01(logistic(p.br - p.kr * calculater0(t)));
-}
-
-static inline double baseline_establishment_ipm(const ModelParams& p) {
-    return clamp01(p.base_establishment);
+    return clamp01(p.br - p.kr * calculater0(t));
 }
 
 static inline double spatial_establishment_modifier(const Tiller& daughter, const ModelParams& p) {
-    return clamp01(logistic(p.br - p.kr * calculater0(daughter)));
+    return clamp01(p.be - p.ke * calculater0(daughter));
 }
 
 static inline double apply_blend(double base_p, double mod_p, double weight) {
@@ -337,18 +414,12 @@ static inline double apply_crowding_penalty(double p, int nnbr, double k_crowd) 
 
 static MechanismConfig read_mechanisms(const std::string& combined_ini_path) {
     MechanismConfig cfg;
-    auto getb = [&](const std::string& key, bool fallback) {
-        std::string v = ini_get(combined_ini_path, "Mechanisms", key, fallback ? "true" : "false");
-        std::string lv = trim(v);
-        std::transform(lv.begin(), lv.end(), lv.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-        return (lv == "1" || lv == "true" || lv == "yes" || lv == "on");
-    };
-    cfg.use_spatial_survival = getb("use_spatial_survival", false);
-    cfg.use_spatial_reproduction = getb("use_spatial_reproduction", false);
-    cfg.use_spatial_establishment = getb("use_spatial_establishment", false);
-    cfg.use_crowding_survival = getb("use_crowding_survival", false);
-    cfg.use_crowding_reproduction = getb("use_crowding_reproduction", false);
-    cfg.use_crowding_establishment = getb("use_crowding_establishment", false);
+    cfg.use_spatial_survival = ini_get_bool(combined_ini_path, "Mechanisms", "use_spatial_survival", false);
+    cfg.use_spatial_reproduction = ini_get_bool(combined_ini_path, "Mechanisms", "use_spatial_reproduction", false);
+    cfg.use_spatial_establishment = ini_get_bool(combined_ini_path, "Mechanisms", "use_spatial_establishment", false);
+    cfg.use_crowding_survival = ini_get_bool(combined_ini_path, "Mechanisms", "use_crowding_survival", false);
+    cfg.use_crowding_reproduction = ini_get_bool(combined_ini_path, "Mechanisms", "use_crowding_reproduction", false);
+    cfg.use_crowding_establishment = ini_get_bool(combined_ini_path, "Mechanisms", "use_crowding_establishment", false);
     cfg.crowding_radius_cm = std::stod(ini_get(combined_ini_path, "Mechanisms", "crowding_radius_cm", "2.0"));
     return cfg;
 }
@@ -416,36 +487,55 @@ void simulate(const int max_sim_time,
         for (int idx = 0; idx < static_cast<int>(previous_step.size()); ++idx) {
             Tiller& tiller = previous_step[idx];
             int local_crowding = (idx >= 0 && idx < static_cast<int>(crowd_prev.size())) ? crowd_prev[idx] : 0;
+
             if (tiller.getStatus() == 1) {
                 double current_area = std::max(0.0, (double)tiller.getLeafArea());
                 double prev_area = current_area;
                 int prev_roots = tiller.getNumRoots();
                 float prev_root_diam_mm = tiller.getRootDiamMM();
+
                 double p_survive = baseline_survival_ipm(tiller);
-                if (cfg.use_spatial_survival) p_survive = apply_blend(p_survive, spatial_survival_modifier(tiller, params), params.c_space_survival);
-                if (cfg.use_crowding_survival) p_survive = apply_crowding_penalty(p_survive, local_crowding, params.k_crowd_survival);
+                if (cfg.use_spatial_survival) {
+                    p_survive = apply_blend(p_survive, spatial_survival_modifier(tiller, params), params.c_space_survival);
+                }
+                if (cfg.use_crowding_survival) {
+                    p_survive = apply_crowding_penalty(p_survive, local_crowding, params.k_crowd_survival);
+                }
+
                 if (dis(gen) < p_survive) {
                     tiller.accumulateDeadLeafArea((float)prev_area);
                     tiller.accumulateRootNecroFromPrevRoots(prev_roots, prev_root_diam_mm);
+
                     double p_repro = 0.0;
                     if (!DISABLE_REPRO) {
                         p_repro = baseline_reproduction_ipm(tiller);
-                        if (cfg.use_spatial_reproduction) p_repro = apply_blend(p_repro, spatial_reproduction_modifier(tiller, params), params.c_space_reproduction);
-                        if (cfg.use_crowding_reproduction) p_repro = apply_crowding_penalty(p_repro, local_crowding, params.k_crowd_reproduction);
+                        if (cfg.use_spatial_reproduction) {
+                            p_repro = apply_blend(p_repro, spatial_reproduction_modifier(tiller, params), params.c_space_reproduction);
+                        }
+                        if (cfg.use_crowding_reproduction) {
+                            p_repro = apply_crowding_penalty(p_repro, local_crowding, params.k_crowd_reproduction);
+                        }
                     }
+
                     if (!DISABLE_REPRO && (dis(gen) < p_repro)) {
                         Tiller daughter = tiller.makeDaughter(next_tiller_id++);
-                        double p_est = baseline_establishment_ipm(params);
-                        if (cfg.use_spatial_establishment) p_est = apply_blend(p_est, spatial_establishment_modifier(daughter, params), params.c_space_establishment);
-                        if (cfg.use_crowding_establishment) p_est = apply_crowding_penalty(p_est, local_crowding, params.k_crowd_establishment);
+                        double p_est = 0.0;
+                        if (cfg.use_spatial_establishment) {
+                            p_est = spatial_establishment_modifier(daughter, params);
+                        }
+                        if (cfg.use_crowding_establishment) {
+                            p_est = apply_crowding_penalty(p_est, local_crowding, params.k_crowd_establishment);
+                        }
                         if (dis(gen) < p_est) newTillers.push_back(daughter);
                     }
+
                     tiller.mature(1);
                     double Aclamp = clamp(current_area, 0.0, 2000.0);
                     double A_next = leaf_ipm_next_mean(Aclamp, params.leaf_offset) + leafNoise(gen);
                     if (!std::isfinite(A_next)) A_next = 0.0;
                     tiller.setLeafArea((float)clamp(A_next, LEAFAREA_MIN, LEAFAREA_MAX));
                     tiller.setRoots(root_num_dis(gen), (float)root_diam_dis(gen));
+
                     double dr_base = growRadiusDist(gen);
                     if (!std::isfinite(dr_base) || dr_base < 0.0) dr_base = 0.01;
                     tiller.growRadius(dr_base);
@@ -454,6 +544,7 @@ void simulate(const int max_sim_time,
                     tiller.accumulateRootNecroFromPrevRoots(prev_roots, prev_root_diam_mm);
                     tiller.setStatus(0);
                 }
+
                 step_data.push_back(tiller);
             } else {
                 tiller.decay();
@@ -463,12 +554,15 @@ void simulate(const int max_sim_time,
         }
 
         step_data.insert(step_data.end(), newTillers.begin(), newTillers.end());
+
         int n_total = (int)step_data.size();
         int n_alive = 0;
         for (const auto& tt : step_data) n_alive += (tt.getStatus() == 1);
         int n_dead = n_total - n_alive;
+
         if (ss.extinct_t < 0 && n_alive == 0) ss.extinct_t = time_step;
         if (ss.overflow_t < 0 && n_alive > alive_overflow_threshold) ss.overflow_t = time_step;
+
         bool stop_due_to_overflow = false;
         if (n_alive > alive_overflow_threshold) {
             double d = SENTINEL_SCALE / (double(time_step) + 1.0);
@@ -477,18 +571,28 @@ void simulate(const int max_sim_time,
             step_data.emplace_back(Tiller(1, 0.5, -d, 0.0, 0.0, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f, next_tiller_id++, -1));
             stop_due_to_overflow = true;
         }
-        step_data.erase(std::remove_if(step_data.begin(), step_data.end(), [](const Tiller& t) { return t.getRadius() <= 1e-6; }), step_data.end());
+
+        step_data.erase(std::remove_if(step_data.begin(), step_data.end(),
+                                       [](const Tiller& t) { return t.getRadius() <= 1e-6; }),
+                        step_data.end());
+
         OverlapStats ostats;
         resolveOverlaps(step_data, ostats);
 
         if (time_step == constraint_year) {
             ss.missing_year = 0;
             ss.alive_y = n_alive;
-            double rmax = 0.0, leaf_sum = 0.0; int leaf_n = 0;
-            for (const auto& tt : step_data) if (tt.getStatus() == 1) {
-                rmax = std::max(rmax, tt.getRadius());
-                double la = tt.getLeafArea();
-                if (std::isfinite(la)) { leaf_sum += la; leaf_n++; }
+            double rmax = 0.0, leaf_sum = 0.0;
+            int leaf_n = 0;
+            for (const auto& tt : step_data) {
+                if (tt.getStatus() == 1) {
+                    rmax = std::max(rmax, tt.getRadius());
+                    double la = tt.getLeafArea();
+                    if (std::isfinite(la)) {
+                        leaf_sum += la;
+                        leaf_n++;
+                    }
+                }
             }
             ss.rmax_y = rmax;
             ss.leafarea_mean_y = (leaf_n > 0) ? (leaf_sum / (double)leaf_n) : std::nan("");
@@ -498,12 +602,27 @@ void simulate(const int max_sim_time,
             double diam = 0.0;
             if (!step_data.empty()) {
                 double xmin = step_data[0].getX(), xmax = step_data[0].getX();
-                for (const auto& tt : step_data) { xmin = std::min(xmin, tt.getX()); xmax = std::max(xmax, tt.getX()); }
+                for (const auto& tt : step_data) {
+                    xmin = std::min(xmin, tt.getX());
+                    xmax = std::max(xmax, tt.getX());
+                }
                 diam = xmax - xmin;
             }
-            simlog << time_step << "\t" << n_total << "\t" << n_alive << "\t" << n_dead << "\t" << (int)newTillers.size() << "\t" << diam << "\t" << ostats.passes << "\t" << ostats.candidates << "\t" << ostats.overlapped << "\t" << ostats.z_adjusts << "\t" << ostats.max_penetration << "\t" << ostats.ms << "\n";
+
+            simlog << time_step << "\t" << n_total << "\t" << n_alive << "\t" << n_dead << "\t"
+                   << (int)newTillers.size() << "\t" << diam << "\t" << ostats.passes << "\t"
+                   << ostats.candidates << "\t" << ostats.overlapped << "\t" << ostats.z_adjusts
+                   << "\t" << ostats.max_penetration << "\t" << ostats.ms << "\n";
+
             for (const Tiller& data : step_data) {
-                outputFile << time_step << ',' << data.getTillerId() << ',' << data.getParentTillerId() << ',' << data.getAge() << ',' << data.getRadius() << ',' << data.getLeafArea() << ',' << data.getDeadLeafArea() << ',' << data.getDeadLeafMass() << ',' << data.getRootNecroVol() << ',' << data.getRootNecroVolCum() << ',' << data.getRootNecroMass() << ',' << data.getRootNecroMassCum() << ',' << data.getX() << ',' << data.getY() << ',' << data.getZ() << ',' << data.getNumRoots() << ',' << data.getRootDiamMM() << ',' << data.getStatus() << '\n';
+                outputFile << time_step << ',' << data.getTillerId() << ',' << data.getParentTillerId()
+                           << ',' << data.getAge() << ',' << data.getRadius() << ',' << data.getLeafArea()
+                           << ',' << data.getDeadLeafArea() << ',' << data.getDeadLeafMass() << ','
+                           << data.getRootNecroVol() << ',' << data.getRootNecroVolCum() << ','
+                           << data.getRootNecroMass() << ',' << data.getRootNecroMassCum() << ','
+                           << data.getX() << ',' << data.getY() << ',' << data.getZ() << ','
+                           << data.getNumRoots() << ',' << data.getRootDiamMM() << ',' << data.getStatus()
+                           << '\n';
             }
         }
 
@@ -512,49 +631,84 @@ void simulate(const int max_sim_time,
     }
 
     ss.final_t = final_t;
-    int alive_final = 0; for (const auto& tt : previous_step) alive_final += (tt.getStatus() == 1);
+    int alive_final = 0;
+    for (const auto& tt : previous_step) alive_final += (tt.getStatus() == 1);
     ss.alive_final = alive_final;
+
     double final_diam = 0.0;
     if (!previous_step.empty()) {
         double xmin = previous_step[0].getX(), xmax = previous_step[0].getX();
-        for (const auto& tt : previous_step) { xmin = std::min(xmin, tt.getX()); xmax = std::max(xmax, tt.getX()); }
+        for (const auto& tt : previous_step) {
+            xmin = std::min(xmin, tt.getX());
+            xmax = std::max(xmax, tt.getX());
+        }
         final_diam = xmax - xmin;
     }
     ss.final_diameter = final_diam;
-    summary << ss.sim_id << ',' << ss.final_t << ',' << ss.final_diameter << ',' << ss.alive_y << ',' << ss.rmax_y << ',' << ss.overflow_t << ',' << ss.extinct_t << ',' << ss.missing_year << ',' << ss.alive_final << ',';
+
+    summary << ss.sim_id << ',' << ss.final_t << ',' << ss.final_diameter << ',' << ss.alive_y << ','
+            << ss.rmax_y << ',' << ss.overflow_t << ',' << ss.extinct_t << ',' << ss.missing_year
+            << ',' << ss.alive_final << ',';
     if (std::isfinite(ss.leafarea_mean_y)) summary << ss.leafarea_mean_y;
     summary << "\n";
 }
 
-int main() {
+static std::string get_arg_value(int argc, char** argv, const std::string& name) {
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == name && i + 1 < argc) return argv[i + 1];
+        const std::string prefix = name + "=";
+        if (a.rfind(prefix, 0) == 0) return a.substr(prefix.size());
+    }
+    return "";
+}
+
+int main(int argc, char** argv) {
     std::srand((unsigned)std::time(nullptr));
-    int max_sim_time, num_sims; std::string outdir; unsigned long int num_threads; OutputMode mode = OutputMode::SUMMARY;
-    const std::filesystem::path project_root = get_project_root();
-    const std::filesystem::path runtime_ini = project_root / "parameterization.ini";
-    std::string config_file_raw = ini_get(runtime_ini.string(), "Parameterization", "config_file", "");
-    if (config_file_raw.empty()) {
-        std::cerr << "Missing config_file in parameterization.ini\n";
+
+    std::string config_arg = get_arg_value(argc, argv, "--config");
+    if (config_arg.empty()) {
+        std::cerr << "Usage: tussock_model --config path/to/config.ini\n";
         return 1;
     }
-    std::filesystem::path combined_ini = std::filesystem::path(config_file_raw);
-    if (combined_ini.is_relative()) combined_ini = project_root / combined_ini;
-    std::string param_file_raw = ini_get(runtime_ini.string(), "Parameterization", "param_file", "parameters/parameters.txt");
-    std::filesystem::path param_file_path = std::filesystem::path(param_file_raw);
-    if (param_file_path.is_relative()) param_file_path = project_root / param_file_path;
-    const int constraint_year = std::stoi(ini_get(runtime_ini.string(), "Parameterization", "constraint_year", "25"));
-    const int alive_overflow_threshold = std::stoi(ini_get(runtime_ini.string(), "Parameterization", "alive_overflow_threshold", "600"));
+
+    RuntimeConfig runtime = load_runtime_config(config_arg);
+
+    if (!std::filesystem::exists(runtime.config_path)) {
+        std::cerr << "Config file does not exist: " << runtime.config_path << "\n";
+        return 1;
+    }
+
+    int max_sim_time, num_sims;
+    std::string outdir;
+    unsigned long int num_threads;
+    OutputMode mode = OutputMode::SUMMARY;
+
     input(max_sim_time, num_sims, outdir, num_threads, mode);
+
     std::filesystem::path outdir_path = std::filesystem::path(outdir);
-    if (outdir_path.is_relative()) outdir_path = project_root / outdir_path;
+    if (outdir_path.is_relative()) outdir_path = runtime.project_root / outdir_path;
     outdir = outdir_path.string();
+
     std::vector<std::thread> threads;
     threads.reserve((size_t)num_threads);
+
     for (int sim_id = 0; sim_id < num_sims; ++sim_id) {
-        threads.emplace_back(simulate, max_sim_time, sim_id, outdir, combined_ini.string(), param_file_path.string(), mode, constraint_year, alive_overflow_threshold);
+        threads.emplace_back(simulate,
+                             max_sim_time,
+                             sim_id,
+                             outdir,
+                             runtime.config_path.string(),
+                             runtime.param_file_path.string(),
+                             mode,
+                             runtime.constraint_year,
+                             runtime.alive_overflow_threshold);
+
         if ((threads.size() == num_threads) || (sim_id == num_sims - 1)) {
             for (auto& thread : threads) thread.join();
             threads.clear();
         }
     }
+
     return 0;
 }
