@@ -70,6 +70,9 @@ class ConstraintSettings:
     overgrown_radius_threshold: float
     hard_fail_on_overflow: bool
     require_survive_to_end_for_fit: bool
+    live_tiller_radius_prior_weight: float
+    upper_prior_weight: float
+    lower_prior_weight: float
 
 
 @dataclass
@@ -227,6 +230,9 @@ def load_combined_config(config_path: str, cli_sites=None):
         overgrown_radius_threshold=config.getfloat("Constraints", "overgrown_radius_threshold", fallback=2.5),
         hard_fail_on_overflow=read_bool(config, "Constraints", "hard_fail_on_overflow", fallback=False),
         require_survive_to_end_for_fit=read_bool(config, "Constraints", "require_survive_to_end_for_fit", fallback=False),
+        live_tiller_radius_prior_weight=config.getfloat("Constraints", "live_tiller_radius_prior_weight", fallback=5.0),
+        upper_prior_weight=config.getfloat("Constraints", "upper_prior_weight", fallback=2.0),
+        lower_prior_weight=config.getfloat("Constraints", "lower_prior_weight", fallback=1.0),
     )
 
     plotting = PlotSettings(
@@ -490,19 +496,16 @@ def wasserstein_distance_1d(x, y):
 def barrier_loss(fail_stats, constraint_year, min_alive):
     T = float(max(1, constraint_year))
     v_alive = []
-    v_over = []
     v_missing = []
     v_early_ext = []
     for s in fail_stats:
         alive_y = int(s.get("alive_y", 0))
-        overflow_t = s.get("overflow_t", None)
         extinct_t = s.get("extinct_t", None)
         missing_year = bool(s.get("missing_year", False))
         v_alive.append(max(0.0, (min_alive - alive_y) / max(1.0, float(min_alive))))
-        v_over.append(0.0 if overflow_t is None else max(0.0, (T - float(min(constraint_year, overflow_t))) / T))
         v_missing.append(1.0 if missing_year else 0.0)
         v_early_ext.append(0.0 if extinct_t is None else max(0.0, (T - float(min(constraint_year, extinct_t))) / T))
-    return 1.0 * float(np.mean(v_alive)) + 5.0 * float(np.mean(v_over)) + 5.0 * float(np.mean(v_missing)) + 0.5 * float(np.mean(v_early_ext))
+    return 1.0 * float(np.mean(v_alive)) + 5.0 * float(np.mean(v_missing)) + 0.5 * float(np.mean(v_early_ext))
 
 
 def read_sim_summaries(sim_outdir: str | Path, num_sims: int) -> pd.DataFrame:
@@ -552,6 +555,69 @@ def read_sim_summaries(sim_outdir: str | Path, num_sims: int) -> pd.DataFrame:
     return df
 
 
+
+LIVE_TILLER_RADIUS_PRIOR_POINTS = np.array([
+    [1.0,   0.0,   5.0,  15.0],
+    [2.0,   5.0,  15.0,  35.0],
+    [3.0,  10.0,  30.0,  60.0],
+    [4.0,  20.0,  55.0, 100.0],
+    [5.0,  35.0,  90.0, 150.0],
+    [6.0,  55.0, 120.0, 200.0],
+    [7.0,  80.0, 150.0, 250.0],
+    [8.0, 105.0, 180.0, 300.0],
+    [9.0, 125.0, 220.0, 350.0],
+    [10.0, 145.0, 260.0, 400.0],
+    [11.0, 165.0, 300.0, 440.0],
+    [12.0, 175.0, 330.0, 470.0],
+    [13.0, 180.0, 360.0, 500.0],
+    [14.0, 170.0, 390.0, 540.0],
+    [15.0, 120.0, 410.0, 800.0],
+    [16.0,  80.0, 400.0, 1025.0],
+], dtype=float)
+
+
+def live_tiller_radius_prior_loss(sim_df: pd.DataFrame, constraints: ConstraintSettings) -> float:
+    """Soft plausibility prior on live tillers as a function of tussock radius.
+
+    Uses a hand-digitized envelope from the supplied figure:
+    radius_cm, lower, mean, upper.
+    This is a regularizer, not a direct data-fit term.
+    """
+    if sim_df.empty:
+        return 1.0
+
+    pts = LIVE_TILLER_RADIUS_PRIOR_POINTS
+    xp = pts[:, 0]
+    lower_pts = pts[:, 1]
+    upper_pts = pts[:, 3]
+
+    final_diameter = pd.to_numeric(sim_df["final_diameter"], errors="coerce").to_numpy(dtype=float)
+    alive_final = pd.to_numeric(sim_df["alive_final"], errors="coerce").fillna(0).to_numpy(dtype=float)
+
+    penalties = []
+    for diam, alive in zip(final_diameter, alive_final):
+        if (not np.isfinite(diam)) or diam <= 0.0:
+            penalties.append(1.0)
+            continue
+
+        radius = 0.5 * diam
+        radius = float(np.clip(radius, xp.min(), xp.max()))
+        lo = float(np.interp(radius, xp, lower_pts))
+        hi = float(np.interp(radius, xp, upper_pts))
+        width = max(1.0, hi - lo)
+
+        if alive < lo:
+            dev = (lo - alive) / width
+            penalties.append(constraints.lower_prior_weight * dev * dev)
+        elif alive > hi:
+            dev = (alive - hi) / width
+            penalties.append(constraints.upper_prior_weight * dev * dev)
+        else:
+            penalties.append(0.0)
+
+    return float(np.mean(penalties))
+
+
 def write_population_results(sim_df: pd.DataFrame, iteration_label: int, out_csv_path: str | Path, overgrown_radius_threshold: float):
     out_csv_path = Path(out_csv_path)
     _safe_makedirs(out_csv_path.parent)
@@ -596,12 +662,8 @@ def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, fra
     alive_y = df["alive_y"].to_numpy(dtype=float)
     alive_final = df["alive_final"].to_numpy(dtype=int)
     missing_frac = float(np.mean(missing_mask)) if num_sims > 0 else 0.0
-    over_frac = float(np.mean(overflow_mask)) if num_sims > 0 else 0.0
     extinct_final = int((alive_final == 0).sum())
     extinct_frac = extinct_final / max(1, num_sims)
-
-    if constraints.hard_fail_on_overflow and overflow_mask.any():
-        return float((1e6 * obs_std) * (1.0 + over_frac))
 
     ok = (
         (df["missing_year"].to_numpy(dtype=int) == 0) &
@@ -623,17 +685,13 @@ def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, fra
         missing_year = bool(int(row.missing_year))
         fail_stats.append({
             "alive_y": 0 if missing_year else int(row.alive_y),
-            "overflow_t": overflow_t,
             "extinct_t": extinct_t,
             "missing_year": missing_year,
             "alive_final": int(getattr(row, "alive_final", 0)),
             "final_t": int(getattr(row, "final_t", -1)),
         })
 
-    fit_mask = (
-        (df["missing_year"].to_numpy(dtype=int) == 0) &
-        (df["overflow_t"].to_numpy(dtype=int) < 0)
-    )
+    fit_mask = (df["missing_year"].to_numpy(dtype=int) == 0)
     if constraints.require_survive_to_end_for_fit:
         fit_mask = fit_mask & (df["alive_final"].to_numpy(dtype=int) > 0)
 
@@ -658,6 +716,7 @@ def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, fra
         constraint_year=constraints.constraint_year,
         min_alive=constraints.min_alive_tillers,
     )
+    prior_loss = live_tiller_radius_prior_loss(df, constraints)
 
     low_alive_frac = float(np.mean(alive_y < constraints.min_alive_tillers)) if num_sims > 0 else 0.0
     ext_term = float(constraints.extinction_weight) * extinct_frac * obs_std
@@ -672,8 +731,8 @@ def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, fra
         float(fit_loss)
         + 2.0 * obs_std * float(sd_loss)
         + 5.0 * obs_std * float(bar)
+        + constraints.live_tiller_radius_prior_weight * obs_std * float(prior_loss)
         + 2.0 * obs_std * low_alive_frac
-        + 10.0 * obs_std * over_frac
         + 10.0 * obs_std * missing_frac
         + ext_term
         + 10.0 * obs_std * leaf_bad_frac
@@ -698,7 +757,7 @@ def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, fra
         ax.set_title(
             f"Iter: {iteration_label} | loss={loss:.3g} | pass={pass_count}/{num_sims} | "
             f"fit={fit_loss:.3g} | sd={sd_loss:.3g} | bar={bar:.3g} | "
-            f"overflow={over_frac:.1%} | extinct_final={extinct_final}/{num_sims}"
+            f"prior={prior_loss:.3g} | extinct_final={extinct_final}/{num_sims}"
         )
         ax.set_xlabel("Tussock Diameter")
         plt.savefig(Path(frames_dir) / f"Mean_Tuss_diameter_iteration_{iteration_label}.png", dpi=200)

@@ -340,6 +340,8 @@ void readFromFile(const std::string& filename, ModelParams& p) {
     set_if("kr", p.kr);
     set_if("bs", p.bs);
     set_if("br", p.br);
+    set_if("ke", p.ke);
+    set_if("be", p.be);
     set_if("c_space_survival", p.c_space_survival);
     set_if("c_space_reproduction", p.c_space_reproduction);
     set_if("c_space_establishment", p.c_space_establishment);
@@ -474,7 +476,6 @@ void simulate(const int max_sim_time,
     int final_t = -1;
     const double LEAFAREA_MIN = 0.0;
     const double LEAFAREA_MAX = 2500.0;
-    const double SENTINEL_SCALE = 2000.0;
 
     for (int time_step = 0; time_step <= max_sim_time; ++time_step) {
         final_t = time_step;
@@ -519,7 +520,7 @@ void simulate(const int max_sim_time,
 
                     if (!DISABLE_REPRO && (dis(gen) < p_repro)) {
                         Tiller daughter = tiller.makeDaughter(next_tiller_id++);
-                        double p_est = 0.0;
+                        double p_est = 1.0; //default 100% success rate if not on
                         if (cfg.use_spatial_establishment) {
                             p_est = spatial_establishment_modifier(daughter, params);
                         }
@@ -565,10 +566,6 @@ void simulate(const int max_sim_time,
 
         bool stop_due_to_overflow = false;
         if (n_alive > alive_overflow_threshold) {
-            double d = SENTINEL_SCALE / (double(time_step) + 1.0);
-            d = std::max(50.0, std::min(5000.0, d));
-            step_data.emplace_back(Tiller(1, 0.5, +d, 0.0, 0.0, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f, next_tiller_id++, -1));
-            step_data.emplace_back(Tiller(1, 0.5, -d, 0.0, 0.0, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f, next_tiller_id++, -1));
             stop_due_to_overflow = true;
         }
 
