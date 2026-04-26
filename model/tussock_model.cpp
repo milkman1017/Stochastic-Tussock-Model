@@ -453,6 +453,14 @@ void simulate(const int max_sim_time,
     std::ofstream summary(summary_dir + "/summary_" + std::to_string(sim_id) + ".csv", std::ios::trunc);
     summary << "sim_id,final_t,final_diameter,alive_y,rmax_y,overflow_t,extinct_t,missing_year,alive_final,LeafArea\n";
 
+    // Yearly summaries are written in both SUMMARY and FULL mode so that the
+    // Python parameterization script can apply time-series biological priors
+    // without writing the full per-tiller CSV during optimization.
+    std::string yearly_dir = outdir + "/yearly_summaries";
+    std::filesystem::create_directories(yearly_dir);
+    std::ofstream yearly(yearly_dir + "/yearly_summary_" + std::to_string(sim_id) + ".csv", std::ios::trunc);
+    yearly << "sim_id,time_step,n_total,n_alive,n_dead,n_newborn,diameter,radius,leaf_area_mean,overflow\n";
+
     std::ofstream outputFile, simlog;
     std::vector<char> filebuf;
     if (mode == OutputMode::FULL) {
@@ -575,6 +583,36 @@ void simulate(const int max_sim_time,
 
         OverlapStats ostats;
         resolveOverlaps(step_data, ostats);
+
+        // Tussock-level yearly summary used by the Python loss function.
+        // Diameter is measured consistently with the final summary as xmax - xmin.
+        double yearly_diam = 0.0;
+        double yearly_radius = 0.0;
+        double yearly_leaf_sum = 0.0;
+        int yearly_leaf_n = 0;
+        if (!step_data.empty()) {
+            double xmin_y = step_data[0].getX();
+            double xmax_y = step_data[0].getX();
+            for (const auto& tt : step_data) {
+                xmin_y = std::min(xmin_y, tt.getX());
+                xmax_y = std::max(xmax_y, tt.getX());
+                if (tt.getStatus() == 1) {
+                    double la = tt.getLeafArea();
+                    if (std::isfinite(la)) {
+                        yearly_leaf_sum += la;
+                        yearly_leaf_n++;
+                    }
+                }
+            }
+            yearly_diam = xmax_y - xmin_y;
+            yearly_radius = 0.5 * yearly_diam;
+        }
+        double yearly_leaf_mean = (yearly_leaf_n > 0) ? (yearly_leaf_sum / (double)yearly_leaf_n) : std::nan("");
+        int overflow_now = (ss.overflow_t >= 0) ? 1 : 0;
+        yearly << sim_id << ',' << time_step << ',' << n_total << ',' << n_alive << ',' << n_dead << ','
+               << (int)newTillers.size() << ',' << yearly_diam << ',' << yearly_radius << ',';
+        if (std::isfinite(yearly_leaf_mean)) yearly << yearly_leaf_mean;
+        yearly << ',' << overflow_now << "\n";
 
         if (time_step == constraint_year) {
             ss.missing_year = 0;

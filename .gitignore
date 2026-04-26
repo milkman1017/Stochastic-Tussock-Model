@@ -7,3 +7,4 @@ tussock_model
 *.out
 *.err
 !input_data/*
+*/*/resampled_fits/*

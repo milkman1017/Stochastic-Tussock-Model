@@ -39,6 +39,12 @@ ALL_MODEL_PARAM_NAMES = [
 
 
 @dataclass
+class ParameterConstraint:
+    lower: float | None = None
+    upper: float | None = None
+
+
+@dataclass
 class PathSettings:
     output_dir: str
     training_csv: str
@@ -73,6 +79,7 @@ class ConstraintSettings:
     live_tiller_radius_prior_weight: float
     upper_prior_weight: float
     lower_prior_weight: float
+    time_series_prior_start_year: int
 
 
 @dataclass
@@ -114,6 +121,7 @@ class RunSettings:
     mechanisms: MechanismSettings
     resampling: ResamplingSettings
     active_params: list[str]
+    param_constraints: dict[str, ParameterConstraint]
 
 
 def parse_args():
@@ -126,16 +134,6 @@ def parse_args():
 def read_bool(config, section, key, fallback=False):
     return config.getboolean(section, key, fallback=fallback)
 
-
-def positive_param(name: str) -> bool:
-    return name in {
-        "ks", "kr", "ke",
-        "k_crowd_survival", "k_crowd_reproduction", "k_crowd_establishment"
-    }
-
-
-def bounded01_param(name: str) -> bool:
-    return name in {"c_space_survival", "c_space_reproduction"}
 
 
 def resolve_path(base_dir: Path, raw_path: str) -> Path:
@@ -178,6 +176,67 @@ def determine_active_params(config: configparser.ConfigParser) -> list[str]:
             seen.add(x)
             out.append(x)
     return out
+
+
+def parse_parameter_constraint(raw: str) -> ParameterConstraint:
+    """Parse one parameter constraint from the config.
+
+    Supported syntax:
+      blank      -> unconstrained
+      >0 or >=0  -> lower bound only
+      <0 or <=0  -> upper bound only
+      0,1        -> lower and upper bounds
+      ,1         -> upper bound only
+      -5,        -> lower bound only
+    """
+    raw = str(raw).strip()
+    if raw == "":
+        return ParameterConstraint()
+    if raw.startswith(">="):
+        return ParameterConstraint(lower=float(raw[2:].strip()), upper=None)
+    if raw.startswith(">"):
+        return ParameterConstraint(lower=float(raw[1:].strip()), upper=None)
+    if raw.startswith("<="):
+        return ParameterConstraint(lower=None, upper=float(raw[2:].strip()))
+    if raw.startswith("<"):
+        return ParameterConstraint(lower=None, upper=float(raw[1:].strip()))
+    if "," in raw:
+        lo_raw, hi_raw = raw.split(",", 1)
+        lo = float(lo_raw.strip()) if lo_raw.strip() != "" else None
+        hi = float(hi_raw.strip()) if hi_raw.strip() != "" else None
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError(f"Invalid constraint '{raw}': lower bound is greater than upper bound")
+        return ParameterConstraint(lower=lo, upper=hi)
+    raise ValueError(f"Could not parse parameter constraint '{raw}'. Use blank, >0, <0, or lower,upper such as 0,1.")
+
+
+def read_parameter_constraints(config: configparser.ConfigParser) -> dict[str, ParameterConstraint]:
+    constraints = {name: ParameterConstraint() for name in ALL_MODEL_PARAM_NAMES}
+    if not config.has_section("ParameterConstraints"):
+        return constraints
+    for name in ALL_MODEL_PARAM_NAMES:
+        raw = config.get("ParameterConstraints", name, fallback="").strip()
+        constraints[name] = parse_parameter_constraint(raw)
+    return constraints
+
+
+def apply_parameter_constraint(name: str, value: float, param_constraints: dict[str, ParameterConstraint] | None = None) -> float:
+    if not np.isfinite(value):
+        raise ValueError(f"Non-finite value for parameter '{name}': {value}")
+    if param_constraints is None:
+        param_constraints = {}
+    c = param_constraints.get(name, ParameterConstraint())
+    out = float(value)
+    if c.lower is not None:
+        out = max(float(c.lower), out)
+    if c.upper is not None:
+        out = min(float(c.upper), out)
+    return float(out)
+
+
+def has_parameter_constraint(name: str, param_constraints: dict[str, ParameterConstraint]) -> bool:
+    c = param_constraints.get(name, ParameterConstraint())
+    return c.lower is not None or c.upper is not None
 
 
 def load_combined_config(config_path: str, cli_sites=None):
@@ -233,6 +292,7 @@ def load_combined_config(config_path: str, cli_sites=None):
         live_tiller_radius_prior_weight=config.getfloat("Constraints", "live_tiller_radius_prior_weight", fallback=5.0),
         upper_prior_weight=config.getfloat("Constraints", "upper_prior_weight", fallback=2.0),
         lower_prior_weight=config.getfloat("Constraints", "lower_prior_weight", fallback=1.0),
+        time_series_prior_start_year=config.getint("Constraints", "time_series_prior_start_year", fallback=5),
     )
 
     plotting = PlotSettings(
@@ -261,6 +321,7 @@ def load_combined_config(config_path: str, cli_sites=None):
         resampling.random_seed = None
 
     active_params = determine_active_params(config)
+    param_constraints = read_parameter_constraints(config)
     sites = cli_sites if cli_sites is not None else None
 
     run_settings = RunSettings(
@@ -275,6 +336,7 @@ def load_combined_config(config_path: str, cli_sites=None):
         mechanisms=mechanisms,
         resampling=resampling,
         active_params=active_params,
+        param_constraints=param_constraints,
     )
     return config, run_settings
 
@@ -301,17 +363,11 @@ def default_parameter_values() -> OrderedDict:
     ])
 
 
-def coerce_model_param(name: str, value: float) -> float:
-    if not np.isfinite(value):
-        raise ValueError(f"Non-finite value for parameter '{name}': {value}")
-    if positive_param(name):
-        return float(max(0.0, value))
-    if bounded01_param(name):
-        return float(min(1.0, max(0.0, value)))
-    return float(value)
+def coerce_model_param(name: str, value: float, param_constraints: dict[str, ParameterConstraint] | None = None) -> float:
+    return apply_parameter_constraint(name, value, param_constraints)
 
 
-def read_parameter_file(param_file: str | Path) -> OrderedDict:
+def read_parameter_file(param_file: str | Path, param_constraints: dict[str, ParameterConstraint] | None = None) -> OrderedDict:
     params = default_parameter_values()
     param_file = Path(param_file)
     if not param_file.exists():
@@ -326,20 +382,34 @@ def read_parameter_file(param_file: str | Path) -> OrderedDict:
             v = v.strip()
             if k not in params:
                 raise ValueError(f"Unexpected key in parameter file '{param_file}': '{k}'. Allowed keys: {list(params.keys())}")
-            params[k] = coerce_model_param(k, float(v))
+            params[k] = coerce_model_param(k, float(v), param_constraints)
     return params
 
 
-def random_initial_parameters(active_params: list[str]) -> OrderedDict:
+def random_initial_parameters(active_params: list[str], param_constraints: dict[str, ParameterConstraint] | None = None) -> OrderedDict:
     params = default_parameter_values()
+    if param_constraints is None:
+        param_constraints = {}
 
     def logu(lo, hi):
         return 10 ** random.uniform(math.log10(lo), math.log10(hi))
 
+    def maybe_sample_from_finite_bounds(name: str) -> float | None:
+        c = param_constraints.get(name, ParameterConstraint())
+        if c.lower is not None and c.upper is not None and np.isfinite(c.lower) and np.isfinite(c.upper):
+            return random.uniform(float(c.lower), float(c.upper))
+        return None
+
     for name in active_params:
-        if name in {"ks", "kr", "ke"}:
-            params[name] = logu(1e-3, 100.0)
+        bounded_sample = maybe_sample_from_finite_bounds(name)
+        if bounded_sample is not None:
+            params[name] = bounded_sample
+        elif name in {"ks", "kr", "ke"}:
+            # Slopes can be negative unless constrained by [ParameterConstraints].
+            sign = 1.0 if random.random() < 0.5 else -1.0
+            params[name] = sign * logu(1e-3, 100.0)
         elif name in {"k_crowd_survival", "k_crowd_reproduction", "k_crowd_establishment"}:
+            # Crowding coefficients often make biological sense as positive, but are only enforced if constrained.
             params[name] = logu(1e-4, 10.0)
         elif name in {"bs", "br", "be"}:
             params[name] = random.uniform(-3.0, 3.0)
@@ -349,12 +419,16 @@ def random_initial_parameters(active_params: list[str]) -> OrderedDict:
             params[name] = random.uniform(-200.0, 200.0)
 
     for k in params:
-        params[k] = coerce_model_param(k, params[k])
+        params[k] = coerce_model_param(k, params[k], param_constraints)
     return params
 
 
-def initialize_random_parameter_file(param_file: str | Path, active_params: list[str]) -> OrderedDict:
-    params = random_initial_parameters(active_params)
+def initialize_random_parameter_file(
+    param_file: str | Path,
+    active_params: list[str],
+    param_constraints: dict[str, ParameterConstraint] | None = None,
+) -> OrderedDict:
+    params = random_initial_parameters(active_params, param_constraints)
     write_parameter_file(params, param_file)
     return params
 
@@ -382,34 +456,51 @@ def params_to_vector(params: OrderedDict, active_params: list[str]) -> np.ndarra
     return np.array([params[k] for k in active_params], dtype=float)
 
 
-def vector_to_params(vec: np.ndarray, template: OrderedDict, active_params: list[str]) -> OrderedDict:
+def vector_to_params(
+    vec: np.ndarray,
+    template: OrderedDict,
+    active_params: list[str],
+    param_constraints: dict[str, ParameterConstraint] | None = None,
+) -> OrderedDict:
     out = OrderedDict(template)
     for k, v in zip(active_params, vec):
-        out[k] = coerce_model_param(k, float(v))
+        out[k] = coerce_model_param(k, float(v), param_constraints)
     return out
 
 
-def sample_random_params_around(base_params: OrderedDict, active_params: list[str], log10_span: float) -> OrderedDict:
+def sample_random_params_around(
+    base_params: OrderedDict,
+    active_params: list[str],
+    log10_span: float,
+    param_constraints: dict[str, ParameterConstraint] | None = None,
+) -> OrderedDict:
     out = OrderedDict(base_params)
+    if param_constraints is None:
+        param_constraints = {}
 
-    def logmul(v, span):
+    def logmul_preserve_sign(v, span):
         basep = float(max(1e-12, abs(v)))
+        sign = -1.0 if v < 0 else 1.0
+        if abs(v) <= 1e-12 and random.random() < 0.5:
+            sign = -1.0
         u = random.uniform(-span, span)
-        return basep * (10 ** u)
+        return sign * basep * (10 ** u)
 
     for k in active_params:
         base = float(base_params[k])
         if k in {"bs", "br", "be"}:
             out[k] = base + random.uniform(-3.0, 3.0)
-        elif bounded01_param(k):
+        elif k in {"c_space_survival", "c_space_reproduction"}:
             out[k] = base + random.uniform(-0.5, 0.5)
-        elif positive_param(k):
-            out[k] = logmul(base if base > 0 else 1.0, log10_span)
+        elif k in {"ks", "kr", "ke", "k_crowd_survival", "k_crowd_reproduction", "k_crowd_establishment"}:
+            out[k] = logmul_preserve_sign(base if abs(base) > 1e-12 else 1.0, log10_span)
+            if k in {"ks", "kr", "ke"} and not has_parameter_constraint(k, param_constraints) and random.random() < 0.25:
+                out[k] = -out[k]
         elif k == "leaf_offset":
             out[k] = base + random.uniform(-200.0, 200.0)
         else:
             out[k] = base
-        out[k] = coerce_model_param(k, out[k])
+        out[k] = coerce_model_param(k, out[k], param_constraints)
 
     return out
 
@@ -615,6 +706,101 @@ def live_tiller_radius_prior_loss(sim_df: pd.DataFrame, constraints: ConstraintS
         else:
             penalties.append(0.0)
 
+
+    return float(np.mean(penalties))
+
+
+def live_tiller_radius_point_penalty(radius: float, alive: float, constraints: ConstraintSettings) -> float:
+    """Squared-hinge penalty for one radius/live-tiller-count pair."""
+    pts = LIVE_TILLER_RADIUS_PRIOR_POINTS
+    xp = pts[:, 0]
+    lower_pts = pts[:, 1]
+    upper_pts = pts[:, 3]
+
+    if (not np.isfinite(radius)) or radius <= 0.0 or (not np.isfinite(alive)):
+        return 1.0
+
+    radius = float(np.clip(radius, xp.min(), xp.max()))
+    lo = float(np.interp(radius, xp, lower_pts))
+    hi = float(np.interp(radius, xp, upper_pts))
+    width = max(1.0, hi - lo)
+
+    if alive < lo:
+        dev = (lo - alive) / width
+        return float(constraints.lower_prior_weight * dev * dev)
+    if alive > hi:
+        dev = (alive - hi) / width
+        return float(constraints.upper_prior_weight * dev * dev)
+    return 0.0
+
+
+def read_yearly_summaries(sim_outdir: str | Path, num_sims: int) -> pd.DataFrame:
+    """Read per-year tussock summaries written by the C++ model.
+
+    Expected columns:
+    sim_id,time_step,n_total,n_alive,n_dead,n_newborn,diameter,radius,leaf_area_mean,overflow
+    """
+    yearly_dir = Path(sim_outdir) / "yearly_summaries"
+    cols = [
+        "sim_id", "time_step", "n_total", "n_alive", "n_dead",
+        "n_newborn", "diameter", "radius", "leaf_area_mean", "overflow",
+    ]
+
+    if not yearly_dir.is_dir():
+        return pd.DataFrame(columns=cols)
+
+    dfs = []
+    for i in range(num_sims):
+        fn = yearly_dir / f"yearly_summary_{i}.csv"
+        if fn.exists():
+            dfs.append(pd.read_csv(fn))
+
+    if not dfs:
+        return pd.DataFrame(columns=cols)
+
+    df = pd.concat(dfs, ignore_index=True)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = np.nan
+    for c in ["sim_id", "time_step", "n_total", "n_alive", "n_dead", "n_newborn", "diameter", "radius", "leaf_area_mean", "overflow"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df[cols]
+
+
+def live_tiller_radius_timeseries_prior_loss(
+    sim_outdir: str | Path,
+    num_sims: int,
+    constraints: ConstraintSettings,
+) -> float:
+    """Mean live-tiller/radius plausibility penalty across simulations and years.
+
+    This replaces the terminal-only prior. It applies the same soft lower/upper
+    radius-specific envelope at every yearly summary after a configurable burn-in
+    period, so slow-growing trajectories are penalized throughout the run rather
+    than only at the final time point.
+    """
+    df_ts = read_yearly_summaries(sim_outdir, num_sims)
+    if df_ts.empty:
+        return 1.0
+
+    start_year = int(max(0, constraints.time_series_prior_start_year))
+    df_ts = df_ts[
+        (df_ts["time_step"] >= start_year) &
+        np.isfinite(df_ts["radius"]) &
+        np.isfinite(df_ts["n_alive"])
+    ].copy()
+
+    if df_ts.empty:
+        return 1.0
+
+    penalties = [
+        live_tiller_radius_point_penalty(
+            radius=float(row.radius),
+            alive=float(row.n_alive),
+            constraints=constraints,
+        )
+        for row in df_ts.itertuples(index=False)
+    ]
     return float(np.mean(penalties))
 
 
@@ -711,12 +897,14 @@ def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, fra
             sim_sd = 0.0
         sd_loss = abs(sim_sd - obs_sd) / obs_sd
 
-    bar = barrier_loss(
-        fail_stats=fail_stats,
-        constraint_year=constraints.constraint_year,
-        min_alive=constraints.min_alive_tillers,
+    # The old graded barrier term is intentionally no longer used in the scalar loss.
+    # Keep a zero placeholder only so older plot-title/debug code does not break.
+    bar = 0.0
+    prior_loss = live_tiller_radius_timeseries_prior_loss(
+        sim_outdir=sim_outdir,
+        num_sims=num_sims,
+        constraints=constraints,
     )
-    prior_loss = live_tiller_radius_prior_loss(df, constraints)
 
     low_alive_frac = float(np.mean(alive_y < constraints.min_alive_tillers)) if num_sims > 0 else 0.0
     ext_term = float(constraints.extinction_weight) * extinct_frac * obs_std
@@ -727,16 +915,20 @@ def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, fra
     denom = max(1, int(leaf_finite.sum()))
     leaf_bad_frac = float(leaf_bad.sum()) / float(denom)
 
+    w_sd = 1.0
+    w_leaf = 5.0
+    w_ext = 5.0
+    w_over = 5.0
+
+    overgrown_frac = float(np.mean(df["overflow_t"].to_numpy(dtype=int) >= 0)) if num_sims > 0 else 0.0
+
     loss = (
         float(fit_loss)
-        + 2.0 * obs_std * float(sd_loss)
-        + 5.0 * obs_std * float(bar)
+        + w_sd * obs_std * float(sd_loss)
         + constraints.live_tiller_radius_prior_weight * obs_std * float(prior_loss)
-        + 2.0 * obs_std * low_alive_frac
-        + 10.0 * obs_std * missing_frac
-        + ext_term
-        + 10.0 * obs_std * leaf_bad_frac
-        + 5.0 * obs_std * pass_shortfall
+        + w_leaf * obs_std * leaf_bad_frac
+        + w_ext * obs_std * extinct_frac
+        + w_over * obs_std * overgrown_frac
     )
 
     do_plot = plotting.plot_every is not None and int(plotting.plot_every) > 0 and (iteration_label % int(plotting.plot_every) == 0)
@@ -755,9 +947,10 @@ def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, fra
         ax.set_ylim(*axis_limits["ylim"])
         ax.legend()
         ax.set_title(
-            f"Iter: {iteration_label} | loss={loss:.3g} | pass={pass_count}/{num_sims} | "
-            f"fit={fit_loss:.3g} | sd={sd_loss:.3g} | bar={bar:.3g} | "
-            f"prior={prior_loss:.3g} | extinct_final={extinct_final}/{num_sims}"
+            f"Iter: {iteration_label} | loss={loss:.3g} | "
+            f"fit={fit_loss:.3g} | sd={sd_loss:.3g} | "
+            f"ts_prior={prior_loss:.3g} | leaf_bad={leaf_bad_frac:.2f} | "
+            f"extinct={extinct_frac:.2f} | overgrown={overgrown_frac:.2f}"
         )
         ax.set_xlabel("Tussock Diameter")
         plt.savefig(Path(frames_dir) / f"Mean_Tuss_diameter_iteration_{iteration_label}.png", dpi=200)
@@ -887,26 +1080,52 @@ def cma_es_optimize(f, x0, sigma0, max_evals, tol_f, tol_x, project_fn, popsize=
     return best_x, best_f, evals
 
 
-def build_projection_functions(opt_settings: OptimizationSettings, active_params: list[str], template_params: OrderedDict):
-    bounded_idxs = {name: i for i, name in enumerate(active_params) if bounded01_param(name)}
-    positive_idxs = {name: i for i, name in enumerate(active_params) if positive_param(name)}
+def build_projection_functions(
+    opt_settings: OptimizationSettings,
+    active_params: list[str],
+    template_params: OrderedDict,
+    param_constraints: dict[str, ParameterConstraint] | None = None,
+):
+    if param_constraints is None:
+        param_constraints = {}
+
+    constrained_idxs = {
+        name: i
+        for i, name in enumerate(active_params)
+        if has_parameter_constraint(name, param_constraints)
+    }
+
+    # Keep the optional logit transform only for exactly [0, 1] bounded parameters.
+    logit_idxs = {
+        name: i
+        for i, name in enumerate(active_params)
+        if (
+            param_constraints.get(name, ParameterConstraint()).lower == 0.0
+            and param_constraints.get(name, ParameterConstraint()).upper == 1.0
+        )
+    }
+
     leaf_idx = active_params.index("leaf_offset") if "leaf_offset" in active_params else None
 
     def project_vec(x: np.ndarray) -> np.ndarray:
         x = np.array(x, dtype=float)
         x[~np.isfinite(x)] = 0.0
+
         if opt_settings.optimize_log_space:
-            for idx in bounded_idxs.values():
+            # In transformed space, [0,1] parameters are represented on the logit scale.
+            # Other constrained parameters are still projected directly.
+            for idx in logit_idxs.values():
                 x[idx] = float(np.clip(x[idx], -10.0, 10.0))
-            for idx in positive_idxs.values():
-                x[idx] = float(max(0.0, x[idx]))
+            for name, idx in constrained_idxs.items():
+                if name in logit_idxs:
+                    continue
+                x[idx] = apply_parameter_constraint(name, x[idx], param_constraints)
             if leaf_idx is not None and not np.isfinite(x[leaf_idx]):
                 x[leaf_idx] = 0.0
             return x
-        for idx in bounded_idxs.values():
-            x[idx] = float(np.clip(x[idx], 0.0, 1.0))
-        for idx in positive_idxs.values():
-            x[idx] = float(max(0.0, x[idx]))
+
+        for name, idx in constrained_idxs.items():
+            x[idx] = apply_parameter_constraint(name, x[idx], param_constraints)
         if leaf_idx is not None and not np.isfinite(x[leaf_idx]):
             x[leaf_idx] = 0.0
         return x
@@ -914,20 +1133,20 @@ def build_projection_functions(opt_settings: OptimizationSettings, active_params
     def x_to_model_params(x: np.ndarray) -> OrderedDict:
         if opt_settings.optimize_log_space:
             vec = np.array(x, dtype=float).copy()
-            for idx in bounded_idxs.values():
+            for idx in logit_idxs.values():
                 vec[idx] = 1.0 / (1.0 + np.exp(-vec[idx]))
-            return vector_to_params(vec, template_params, active_params)
-        return vector_to_params(project_vec(x), template_params, active_params)
+            return vector_to_params(vec, template_params, active_params, param_constraints)
+        return vector_to_params(project_vec(x), template_params, active_params, param_constraints)
 
     def params_to_x(params: OrderedDict) -> np.ndarray:
         vec = params_to_vector(params, active_params)
         if opt_settings.optimize_log_space:
             x = vec.copy()
-            for idx in bounded_idxs.values():
+            for idx in logit_idxs.values():
                 p = float(min(1.0 - 1e-9, max(1e-9, x[idx])))
                 x[idx] = np.log(p / (1.0 - p))
-            return x
-        return vec
+            return project_vec(x)
+        return project_vec(vec)
 
     return project_vec, x_to_model_params, params_to_x
 
@@ -963,25 +1182,9 @@ def run_one_fit_set(set_idx: int,
                     master_rng: random.Random):
     output_root = Path(run_settings.paths.output_dir).resolve()
     run_group_root = output_root / run_settings.paths.subdir
-    set_root = run_group_root / f"set_{set_idx:03d}"
-    set_root.mkdir(parents=True, exist_ok=True)
+    run_group_root.mkdir(parents=True, exist_ok=True)
 
-    run_param_file = set_root / "parameters.txt"
-    run_config_snapshot = set_root / "config_snapshot.ini"
-    sampled_training_csv = set_root / "sampled_training_data.csv"
-    sampled_training_meta_csv = set_root / "sampled_training_metadata.csv"
-
-    config_for_run = configparser.ConfigParser()
-    for sec in base_config.sections():
-        config_for_run[sec] = dict(base_config[sec])
-
-    if config_for_run.has_option("Paths", "param_file"):
-        config_for_run.remove_option("Paths", "param_file")
-
-    config_for_run.set("Paths", "output_dir", str(set_root))
-    config_for_run.set("Paths", "training_csv", str(sampled_training_csv))
-    write_config_snapshot(config_for_run, run_config_snapshot)
-
+    # One sampled training subset per set, shared across all sites.
     set_seed = master_rng.randrange(0, 2**31 - 1)
     set_rng = random.Random(set_seed)
 
@@ -990,30 +1193,6 @@ def run_one_fit_set(set_idx: int,
         percent=run_settings.resampling.train_percent,
         with_replacement=run_settings.resampling.sample_with_replacement,
         rng=set_rng,
-    )
-    sampled_training_df.to_csv(sampled_training_csv, index=False)
-
-    pd.DataFrame([{
-        "set_idx": set_idx,
-        "seed": set_seed,
-        "n_rows_sampled": len(sampled_training_df),
-        "n_rows_full": len(full_training_df),
-        "train_percent": run_settings.resampling.train_percent,
-        "sample_with_replacement": run_settings.resampling.sample_with_replacement,
-    }]).to_csv(sampled_training_meta_csv, index=False)
-
-    if not run_param_file.exists():
-        print(f"[set {set_idx:03d}] creating random init: {run_param_file}")
-        template_params = initialize_random_parameter_file(run_param_file, run_settings.active_params)
-    else:
-        template_params = read_parameter_file(run_param_file)
-
-    nyears = int(base_config.get("Tussock Model", "nyears"))
-    if nyears < run_settings.constraints.constraint_year:
-        raise ValueError(f"nyears={nyears} < constraint_year={run_settings.constraints.constraint_year}")
-
-    project_vec, x_to_model_params, params_to_x = build_projection_functions(
-        run_settings.optimization, run_settings.active_params, template_params
     )
 
     for site in site_list:
@@ -1034,21 +1213,73 @@ def run_one_fit_set(set_idx: int,
 
         training_data["field_davg"] = pd.to_numeric(training_data["diam"], errors="coerce")
         training_diameters = training_data["field_davg"].dropna().values
+
         if training_diameters.size == 0:
             print(f"[set {set_idx:03d}] site {site_tag} has no valid diam values, skipping")
             continue
 
+        site_root = run_group_root / site_tag
+        set_root = site_root / f"set_{set_idx:03d}"
+        set_root.mkdir(parents=True, exist_ok=True)
+
+        run_param_file = set_root / "parameters.txt"
+        run_config_snapshot = set_root / "config_snapshot.ini"
+        sampled_training_csv = set_root / "sampled_training_data.csv"
+        sampled_training_meta_csv = set_root / "sampled_training_metadata.csv"
+
+        sampled_training_df.to_csv(sampled_training_csv, index=False)
+
+        pd.DataFrame([{
+            "set_idx": set_idx,
+            "site": site_tag,
+            "seed": set_seed,
+            "n_rows_sampled": len(sampled_training_df),
+            "n_rows_site_training": len(training_data),
+            "n_rows_full": len(full_training_df),
+            "train_percent": run_settings.resampling.train_percent,
+            "sample_with_replacement": run_settings.resampling.sample_with_replacement,
+        }]).to_csv(sampled_training_meta_csv, index=False)
+
+        config_for_run = configparser.ConfigParser()
+
+        for sec in base_config.sections():
+            config_for_run[sec] = dict(base_config[sec])
+
+        if config_for_run.has_option("Paths", "param_file"):
+            config_for_run.remove_option("Paths", "param_file")
+
+        config_for_run.set("Paths", "output_dir", str(set_root))
+        config_for_run.set("Paths", "training_csv", str(sampled_training_csv))
+        write_config_snapshot(config_for_run, run_config_snapshot)
+
+        template_params = initialize_random_parameter_file(
+            run_param_file,
+            run_settings.active_params,
+            run_settings.param_constraints,
+        )
+
+        nyears = int(base_config.get("Tussock Model", "nyears"))
+
+        if nyears < run_settings.constraints.constraint_year:
+            raise ValueError(
+                f"nyears={nyears} < constraint_year={run_settings.constraints.constraint_year}"
+            )
+
         axis_limits = fixed_axis_limits_from_observed(training_diameters, bins=30)
 
-        site_outdir = set_root / site_tag
-        site_outdir.mkdir(parents=True, exist_ok=True)
+        project_vec, x_to_model_params, params_to_x = build_projection_functions(
+            run_settings.optimization,
+            run_settings.active_params,
+            template_params,
+            run_settings.param_constraints,
+        )
 
-        cpp_outdir = site_outdir / "simulation_outputs"
+        cpp_outdir = set_root / "simulation_outputs"
         cpp_outdir.mkdir(parents=True, exist_ok=True)
 
-        frames_dir = site_outdir / "mean_diameter_frames"
-        opt_csv_path = site_outdir / "optimization_results.csv"
-        pop_csv_path = site_outdir / "population_results.csv"
+        frames_dir = set_root / "mean_diameter_frames"
+        opt_csv_path = set_root / "optimization_results.csv"
+        pop_csv_path = set_root / "population_results.csv"
 
         for p in (opt_csv_path, pop_csv_path):
             if p.exists():
@@ -1060,12 +1291,13 @@ def run_one_fit_set(set_idx: int,
 
         def objective_vec(x: np.ndarray) -> float:
             nonlocal eval_label
+
             eval_label += 1
             x = project_vec(x)
             params = x_to_model_params(x)
 
             write_parameter_file(params, run_param_file)
-            write_parameter_snapshot(params, site_outdir)
+            write_parameter_snapshot(params, set_root)
 
             tussock_model(
                 config_path=run_config_snapshot,
@@ -1085,13 +1317,32 @@ def run_one_fit_set(set_idx: int,
                 plotting=run_settings.plotting,
             )
 
-            if run_settings.plotting.plot_every and run_settings.plotting.plot_every > 0 and eval_label % run_settings.plotting.plot_every == 0:
+            if (
+                run_settings.plotting.plot_every
+                and run_settings.plotting.plot_every > 0
+                and eval_label % run_settings.plotting.plot_every == 0
+            ):
                 frame_labels.append(eval_label)
 
-            write_optimization_results(params, run_settings.active_params, loss, eval_label, opt_csv_path)
+            write_optimization_results(
+                params,
+                run_settings.active_params,
+                loss,
+                eval_label,
+                opt_csv_path,
+            )
 
-            sim_df = read_sim_summaries(cpp_outdir, num_sims=int(base_config.get("Tussock Model", "nsims")))
-            write_population_results(sim_df, eval_label, pop_csv_path, run_settings.constraints.overgrown_radius_threshold)
+            sim_df = read_sim_summaries(
+                cpp_outdir,
+                num_sims=int(base_config.get("Tussock Model", "nsims")),
+            )
+
+            write_population_results(
+                sim_df,
+                eval_label,
+                pop_csv_path,
+                run_settings.constraints.overgrown_radius_threshold,
+            )
 
             if loss < best_seen["loss"]:
                 best_seen["loss"] = loss
@@ -1103,18 +1354,20 @@ def run_one_fit_set(set_idx: int,
             loss_trial = objective_vec(np.array([], dtype=float))
             best_seen["loss"] = loss_trial
             best_seen["params"] = OrderedDict(template_params)
+
         else:
             best_init_loss = float("inf")
             best_init_params = OrderedDict(template_params)
 
             for _ in range(run_settings.optimization.n_init):
-                trial_params = sample_random_params_around(
-                    template_params,
+                trial_params = random_initial_parameters(
                     run_settings.active_params,
-                    run_settings.optimization.init_log10_span,
+                    run_settings.param_constraints,
                 )
+
                 x_trial = project_vec(params_to_x(trial_params))
                 loss_trial = objective_vec(x_trial)
+
                 if loss_trial < best_init_loss:
                     best_init_loss = loss_trial
                     best_init_params = OrderedDict(trial_params)
@@ -1125,15 +1378,20 @@ def run_one_fit_set(set_idx: int,
                 sigma0 = run_settings.optimization.cma_sigma
             else:
                 step_scales = []
+
                 for i in range(x0.size):
                     mag = abs(x0[i])
                     step_scales.append(
-                        run_settings.optimization.step_frac * mag if mag > 1e-12 else run_settings.optimization.step_abs
+                        run_settings.optimization.step_frac * mag
+                        if mag > 1e-12
+                        else run_settings.optimization.step_abs
                     )
+
                 sigma0 = float(np.median(step_scales)) if step_scales else run_settings.optimization.cma_sigma
                 sigma0 = max(1e-6, sigma0)
 
             remaining_budget = max(0, run_settings.optimization.max_evals - eval_label)
+
             if remaining_budget > 0 and x0.size > 0:
                 best_x, _, _ = cma_es_optimize(
                     objective_vec,
@@ -1146,19 +1404,25 @@ def run_one_fit_set(set_idx: int,
                     run_settings.optimization.cma_popsize,
                     run_settings.optimization.cma_patience,
                 )
+
                 if best_seen["params"] is None:
                     best_seen["params"] = x_to_model_params(best_x)
 
-        final_params = best_seen["params"] if best_seen["params"] is not None else OrderedDict(template_params)
+        final_params = (
+            best_seen["params"]
+            if best_seen["params"] is not None
+            else OrderedDict(template_params)
+        )
 
         print(f"[set {set_idx:03d} | {site_tag}] best loss: {best_seen['loss']:.6g}")
+
         for k in run_settings.active_params:
             print(f"  {k}={final_params[k]}")
 
         write_parameter_file(final_params, run_param_file)
-        write_parameter_snapshot(final_params, site_outdir)
+        write_parameter_snapshot(final_params, set_root)
 
-        final_sims_dir = site_outdir / "final_sims"
+        final_sims_dir = set_root / "final_sims"
         final_sims_dir.mkdir(parents=True, exist_ok=True)
 
         tussock_model(
@@ -1168,16 +1432,31 @@ def run_one_fit_set(set_idx: int,
             project_root=run_settings.project_root,
         )
 
-        final_summary_df = read_sim_summaries(final_sims_dir, num_sims=int(base_config.get("Tussock Model", "nsims")))
-        final_pop_csv_path = site_outdir / "final_population_results.csv"
+        final_summary_df = read_sim_summaries(
+            final_sims_dir,
+            num_sims=int(base_config.get("Tussock Model", "nsims")),
+        )
+
+        final_pop_csv_path = set_root / "final_population_results.csv"
+
         if final_pop_csv_path.exists():
             final_pop_csv_path.unlink()
-        write_population_results(final_summary_df, eval_label, final_pop_csv_path, run_settings.constraints.overgrown_radius_threshold)
+
+        write_population_results(
+            final_summary_df,
+            eval_label,
+            final_pop_csv_path,
+            run_settings.constraints.overgrown_radius_threshold,
+        )
 
         if run_settings.plotting.plot_every and run_settings.plotting.plot_every > 0:
-            animate_fitting(frames_dir, frame_labels, site_outdir / "diameter_dist_fitting.gif")
+            animate_fitting(
+                frames_dir,
+                frame_labels,
+                set_root / "diameter_dist_fitting.gif",
+            )
 
-        print(f"Completed set {set_idx:03d}, site: {site_tag}")
+        print(f"Completed site {site_tag}, set {set_idx:03d}")
 
 
 def main():
@@ -1209,6 +1488,7 @@ def main():
         "sample_with_replacement": run_settings.resampling.sample_with_replacement,
         "subdir": run_settings.paths.subdir,
         "output_root": str(output_root),
+        "output_structure": "<output_root>/<subdir>/<site>/set_###",
     }]).to_csv(group_root / "run_manifest.csv", index=False)
 
     for set_idx in range(1, run_settings.resampling.n_sets + 1):

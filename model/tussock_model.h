@@ -90,16 +90,16 @@ public:
         dead_leaf_area = std::max(0.0f, 0.75f * dead_leaf_area + prev_leaf_area);
     }
 
-    static inline float perRootConeVolumeCm3(float diam_mm) {
+    static inline float perRootCylinderVolumeCm3(float diam_mm) {
         const float r_cm = (diam_mm * 0.1f) * 0.5f;
         const float h_cm = ROOT_LENGTH_CM;
         const float pi = 3.14159265358979323846f;
-        return float(1.0f / 3.0f) * pi * r_cm * r_cm * h_cm;
+        return pi * r_cm * r_cm * h_cm;
     }
 
     void accumulateRootNecroFromPrevRoots(int prev_roots, float prev_diam_mm) {
         if (prev_roots <= 0) return;
-        const float v_per_root = perRootConeVolumeCm3(prev_diam_mm);
+        const float v_per_root = perRootCylinderVolumeCm3(prev_diam_mm);
         const float add = v_per_root * static_cast<float>(prev_roots);
         root_necro_vol = std::max(0.0f, 0.85f * root_necro_vol + add);
         root_necro_vol_cum = std::max(0.0f, root_necro_vol_cum + add);
