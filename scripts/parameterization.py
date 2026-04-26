@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from PIL import Image
+import cma
 
 try:
     import seaborn as sns
@@ -80,6 +81,9 @@ class ConstraintSettings:
     upper_prior_weight: float
     lower_prior_weight: float
     time_series_prior_start_year: int
+    diameter_sd_weight: float
+    extinct_frac_weight: float
+    overflow_frac_weight: float
 
 
 @dataclass
@@ -293,6 +297,9 @@ def load_combined_config(config_path: str, cli_sites=None):
         upper_prior_weight=config.getfloat("Constraints", "upper_prior_weight", fallback=2.0),
         lower_prior_weight=config.getfloat("Constraints", "lower_prior_weight", fallback=1.0),
         time_series_prior_start_year=config.getint("Constraints", "time_series_prior_start_year", fallback=5),
+        diameter_sd_weight=config.getfloat("Constraints", "diameter_sd_weight", fallback=1.0),
+        extinct_frac_weight=config.getfloat("Constraints", "extinct_frac_weight", fallback=5.0),
+        overflow_frac_weight=config.getfloat("Constraints", "overflow_frac_weight", fallback=5.0),
     )
 
     plotting = PlotSettings(
@@ -830,12 +837,40 @@ def write_population_results(sim_df: pd.DataFrame, iteration_label: int, out_csv
         writer.writerow(row)
 
 
-def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, frames_dir, axis_limits, constraints: ConstraintSettings, plotting: PlotSettings):
+def diameter_objective(
+    sim_outdir,
+    num_sims,
+    iteration_label,
+    training_data,
+    frames_dir,
+    axis_limits,
+    constraints: ConstraintSettings,
+    plotting: PlotSettings,
+):
     training_data = training_data.copy()
     training_data["field_davg"] = pd.to_numeric(training_data["diam"], errors="coerce")
     training_diameters = training_data["field_davg"].dropna().values
+
     if training_diameters.size == 0:
-        return float("inf")
+        components = {
+            "loss": float("inf"),
+            "fit_loss_raw": float("inf"),
+            "fit_loss_weighted": float("inf"),
+            "diameter_sd_loss_raw": np.nan,
+            "diameter_sd_loss_weighted": np.nan,
+            "live_tiller_radius_prior_raw": np.nan,
+            "live_tiller_radius_prior_weighted": np.nan,
+            "extinct_frac_raw": np.nan,
+            "extinct_loss_weighted": np.nan,
+            "overflow_frac_raw": np.nan,
+            "overflow_loss_weighted": np.nan,
+            "obs_std": np.nan,
+            "n_fit_sims": 0,
+            "pass_frac": np.nan,
+            "low_alive_frac": np.nan,
+            "missing_frac": np.nan,
+        }
+        return float("inf"), components
 
     obs_std = float(np.std(training_diameters)) if training_diameters.size > 1 else 1.0
     if not np.isfinite(obs_std) or obs_std <= 0:
@@ -843,41 +878,27 @@ def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, fra
 
     df = read_sim_summaries(sim_outdir, num_sims=num_sims)
 
-    missing_mask = (df["missing_year"].to_numpy(dtype=int) == 1)
-    overflow_mask = (df["overflow_t"].to_numpy(dtype=int) >= 0)
+    missing_mask = df["missing_year"].to_numpy(dtype=int) == 1
     alive_y = df["alive_y"].to_numpy(dtype=float)
     alive_final = df["alive_final"].to_numpy(dtype=int)
+
     missing_frac = float(np.mean(missing_mask)) if num_sims > 0 else 0.0
     extinct_final = int((alive_final == 0).sum())
     extinct_frac = extinct_final / max(1, num_sims)
 
     ok = (
-        (df["missing_year"].to_numpy(dtype=int) == 0) &
-        (df["alive_y"].to_numpy(dtype=int) >= constraints.min_alive_tillers) &
-        (df["overflow_t"].to_numpy(dtype=int) < 0)
+        (df["missing_year"].to_numpy(dtype=int) == 0)
+        & (df["alive_y"].to_numpy(dtype=int) >= constraints.min_alive_tillers)
+        & (df["overflow_t"].to_numpy(dtype=int) < 0)
     )
+
     if constraints.require_survive_to_end_for_fit:
         ok = ok & (df["alive_final"].to_numpy(dtype=int) > 0)
 
     pass_count = int(ok.sum())
     pass_frac = pass_count / max(1, num_sims)
-    target_pass_frac = constraints.constraint_pass_frac
-    pass_shortfall = max(0.0, target_pass_frac - pass_frac) / max(1e-12, target_pass_frac)
 
-    fail_stats = []
-    for row in df.itertuples(index=False):
-        overflow_t = None if int(row.overflow_t) < 0 else int(row.overflow_t)
-        extinct_t = None if int(row.extinct_t) < 0 else int(row.extinct_t)
-        missing_year = bool(int(row.missing_year))
-        fail_stats.append({
-            "alive_y": 0 if missing_year else int(row.alive_y),
-            "extinct_t": extinct_t,
-            "missing_year": missing_year,
-            "alive_final": int(getattr(row, "alive_final", 0)),
-            "final_t": int(getattr(row, "final_t", -1)),
-        })
-
-    fit_mask = (df["missing_year"].to_numpy(dtype=int) == 0)
+    fit_mask = df["missing_year"].to_numpy(dtype=int) == 0
     if constraints.require_survive_to_end_for_fit:
         fit_mask = fit_mask & (df["alive_final"].to_numpy(dtype=int) > 0)
 
@@ -889,17 +910,17 @@ def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, fra
         sd_loss = 1.0
     else:
         fit_loss = wasserstein_distance_1d(training_diameters, sim_diam_fit)
+
         obs_sd = float(np.std(training_diameters)) if training_diameters.size > 1 else 1.0
         sim_sd = float(np.std(sim_diam_fit)) if sim_diam_fit.size > 1 else 0.0
+
         if not np.isfinite(obs_sd) or obs_sd <= 0:
             obs_sd = 1.0
         if not np.isfinite(sim_sd):
             sim_sd = 0.0
+
         sd_loss = abs(sim_sd - obs_sd) / obs_sd
 
-    # The old graded barrier term is intentionally no longer used in the scalar loss.
-    # Keep a zero placeholder only so older plot-title/debug code does not break.
-    bar = 0.0
     prior_loss = live_tiller_radius_timeseries_prior_loss(
         sim_outdir=sim_outdir,
         num_sims=num_sims,
@@ -907,34 +928,73 @@ def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, fra
     )
 
     low_alive_frac = float(np.mean(alive_y < constraints.min_alive_tillers)) if num_sims > 0 else 0.0
-    ext_term = float(constraints.extinction_weight) * extinct_frac * obs_std
 
-    leaf = df["LeafArea"].to_numpy(dtype=float)
-    leaf_finite = np.isfinite(leaf)
-    leaf_bad = leaf_finite & ((leaf <= 0.0) | (leaf >= 2000.0))
-    denom = max(1, int(leaf_finite.sum()))
-    leaf_bad_frac = float(leaf_bad.sum()) / float(denom)
-
-    w_sd = 1.0
-    w_leaf = 5.0
-    w_ext = 5.0
-    w_over = 5.0
-
-    overgrown_frac = float(np.mean(df["overflow_t"].to_numpy(dtype=int) >= 0)) if num_sims > 0 else 0.0
-
-    loss = (
-        float(fit_loss)
-        + w_sd * obs_std * float(sd_loss)
-        + constraints.live_tiller_radius_prior_weight * obs_std * float(prior_loss)
-        + w_leaf * obs_std * leaf_bad_frac
-        + w_ext * obs_std * extinct_frac
-        + w_over * obs_std * overgrown_frac
+    overflow_frac = (
+        float(np.mean(df["overflow_t"].to_numpy(dtype=int) >= 0))
+        if num_sims > 0
+        else 0.0
     )
 
-    do_plot = plotting.plot_every is not None and int(plotting.plot_every) > 0 and (iteration_label % int(plotting.plot_every) == 0)
+    w_sd = constraints.diameter_sd_weight
+    w_ext = constraints.extinct_frac_weight
+    w_over = constraints.overflow_frac_weight
+    w_prior = constraints.live_tiller_radius_prior_weight
+
+    fit_loss_weighted = float(fit_loss)
+    sd_loss_weighted = w_sd * obs_std * float(sd_loss)
+    prior_loss_weighted = w_prior * obs_std * float(prior_loss)
+    extinct_loss_weighted = w_ext * obs_std * extinct_frac
+    overflow_loss_weighted = w_over * obs_std * overflow_frac
+
+    loss = (
+        fit_loss_weighted
+        + sd_loss_weighted
+        + prior_loss_weighted
+        + extinct_loss_weighted
+        + overflow_loss_weighted
+    )
+
+    components = {
+        "loss": float(loss),
+
+        # Raw loss/problem terms.
+        "fit_loss_raw": float(fit_loss),
+        "diameter_sd_loss_raw": float(sd_loss),
+        "live_tiller_radius_prior_raw": float(prior_loss),
+        "extinct_frac_raw": float(extinct_frac),
+        "overflow_frac_raw": float(overflow_frac),
+
+        # Weighted terms that actually sum to total loss.
+        "fit_loss_weighted": float(fit_loss_weighted),
+        "diameter_sd_loss_weighted": float(sd_loss_weighted),
+        "live_tiller_radius_prior_weighted": float(prior_loss_weighted),
+        "extinct_loss_weighted": float(extinct_loss_weighted),
+        "overflow_loss_weighted": float(overflow_loss_weighted),
+
+        # Useful diagnostics.
+        "obs_std": float(obs_std),
+        "n_fit_sims": int(sim_diam_fit.size),
+        "pass_frac": float(pass_frac),
+        "low_alive_frac": float(low_alive_frac),
+        "missing_frac": float(missing_frac),
+
+        # Actual weights used this iteration.
+        "diameter_sd_weight": float(w_sd),
+        "live_tiller_radius_prior_weight": float(w_prior),
+        "extinct_frac_weight": float(w_ext),
+        "overflow_frac_weight": float(w_over),
+    }
+
+    do_plot = (
+        plotting.plot_every is not None
+        and int(plotting.plot_every) > 0
+        and iteration_label % int(plotting.plot_every) == 0
+    )
+
     if do_plot:
         Path(frames_dir).mkdir(parents=True, exist_ok=True)
         fig, ax = plt.subplots()
+
         if plotting.plot_kde and _HAS_SNS:
             sns.kdeplot(training_diameters, label="Observed", linewidth=1, ax=ax)
             if sim_diam_fit.size > 0:
@@ -943,21 +1003,21 @@ def diameter_objective(sim_outdir, num_sims, iteration_label, training_data, fra
             ax.hist(training_diameters, bins=30, density=True, alpha=0.4, label="Observed")
             if sim_diam_fit.size > 0:
                 ax.hist(sim_diam_fit, bins=30, density=True, alpha=0.4, label="Modeled (fit subset)")
+
         ax.set_xlim(*axis_limits["xlim"])
         ax.set_ylim(*axis_limits["ylim"])
         ax.legend()
         ax.set_title(
             f"Iter: {iteration_label} | loss={loss:.3g} | "
-            f"fit={fit_loss:.3g} | sd={sd_loss:.3g} | "
-            f"ts_prior={prior_loss:.3g} | leaf_bad={leaf_bad_frac:.2f} | "
-            f"extinct={extinct_frac:.2f} | overgrown={overgrown_frac:.2f}"
+            f"fit={fit_loss_weighted:.3g} | sd={sd_loss_weighted:.3g} | "
+            f"prior={prior_loss_weighted:.3g} | "
+            f"ext={extinct_loss_weighted:.3g} | over={overflow_loss_weighted:.3g}"
         )
         ax.set_xlabel("Tussock Diameter")
         plt.savefig(Path(frames_dir) / f"Mean_Tuss_diameter_iteration_{iteration_label}.png", dpi=200)
         plt.close(fig)
 
-    return float(loss)
-
+    return float(loss), components
 
 def animate_fitting(frames_dir, iteration_labels, outfilename):
     frames = []
@@ -978,104 +1038,113 @@ def animate_fitting(frames_dir, iteration_labels, outfilename):
     frames_dir.rmdir()
 
 
-def write_optimization_results(parameters: OrderedDict, active_params: list[str], loss: float, iteration_label, out_csv_path: str | Path):
+def write_optimization_results(
+    parameters: OrderedDict,
+    active_params: list[str],
+    loss: float,
+    iteration_label,
+    out_csv_path: str | Path,
+    loss_components: dict | None = None,
+):
     out_csv_path = Path(out_csv_path)
     _safe_makedirs(out_csv_path.parent)
+
     file_exists = out_csv_path.exists()
+
     row = {k: parameters[k] for k in active_params}
     row.update({"loss": float(loss), "iteration": iteration_label})
 
+    if loss_components is not None:
+        for k, v in loss_components.items():
+            if k in {"loss", "iteration"}:
+                continue
+            row[k] = v
+
+    fieldnames = active_params + ["loss", "iteration"]
+
+    if loss_components is not None:
+        extra_cols = [k for k in loss_components.keys() if k not in {"loss", "iteration"}]
+        fieldnames.extend(extra_cols)
+
     with out_csv_path.open("a", newline="") as csvfile:
-        fieldnames = active_params + ["loss", "iteration"]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+
         if not file_exists:
             writer.writeheader()
+
         writer.writerow(row)
 
 
-def cma_es_optimize(f, x0, sigma0, max_evals, tol_f, tol_x, project_fn, popsize=0, patience=20):
-    n = x0.size
-    if popsize is None or popsize <= 0:
-        lmbda = 4 + int(3 * np.log(max(1, n)))
-    else:
-        lmbda = int(popsize)
-    mu = max(1, lmbda // 2)
-    weights = np.log(mu + 0.5) - np.log(np.arange(1, mu + 1))
-    weights = weights / np.sum(weights)
-    mueff = 1.0 / np.sum(weights ** 2)
-    cc = (4.0 + mueff / n) / (n + 4.0 + 2.0 * mueff / n)
-    cs = (mueff + 2.0) / (n + mueff + 5.0)
-    c1 = 2.0 / ((n + 1.3) ** 2 + mueff)
-    cmu = min(1.0 - c1, 2.0 * (mueff - 2.0 + 1.0 / mueff) / ((n + 2.0) ** 2 + mueff))
-    damps = 1.0 + 2.0 * max(0.0, np.sqrt((mueff - 1.0) / (n + 1.0)) - 1.0) + cs
-    chi_n = np.sqrt(n) * (1.0 - 1.0 / (4.0 * n) + 1.0 / (21.0 * n * n))
-    m = project_fn(np.array(x0, dtype=float))
-    sigma = float(max(1e-12, sigma0))
-    C = np.eye(n)
-    B = np.eye(n)
-    D = np.ones(n)
-    invsqrtC = np.eye(n)
-    pc = np.zeros(n)
-    ps = np.zeros(n)
-    evals = 0
-    generation = 0
-    best_x = m.copy()
-    best_f = float("inf")
-    stall = 0
 
-    while evals < max_evals:
-        generation += 1
-        remaining = max_evals - evals
-        cur_lambda = min(lmbda, remaining)
-        if cur_lambda <= 0:
-            break
-        arz = np.random.randn(n, cur_lambda)
-        ary = (B @ (D[:, None] * arz)).T
-        arx = np.array([project_fn(m + sigma * ary[k]) for k in range(cur_lambda)])
-        fvals = np.empty(cur_lambda, dtype=float)
-        for k in range(cur_lambda):
-            fvals[k] = f(arx[k])
+def pycma_optimize(f, x0, sigma0, max_evals, tol_f, tol_x, project_fn, popsize=0, patience=20):
+    """Run CMA-ES using pycma's maintained CMAEvolutionStrategy.
+
+    The objective `f` should accept an already-projected vector. We still call
+    project_fn before evaluation because this model uses custom parameter
+    constraints/transforms outside of pycma's native bounds system.
+    """
+    x0 = project_fn(np.array(x0, dtype=float))
+    sigma0 = float(max(1e-12, sigma0))
+    max_evals = int(max(1, max_evals))
+
+    opts = {
+        "maxfevals": max_evals,
+        "tolfun": float(tol_f),
+        "tolx": float(tol_x),
+        "verb_disp": 1,
+        "verbose": -9,
+    }
+
+    if popsize is not None and int(popsize) > 0:
+        opts["popsize"] = int(popsize)
+
+    es = cma.CMAEvolutionStrategy(x0.tolist(), sigma0, opts)
+
+    best_x = x0.copy()
+    best_f = float("inf")
+    evals = 0
+    generations_without_improvement = 0
+
+    while not es.stop() and evals < max_evals:
+        xs = es.ask()
+
+        xs_projected = []
+        fvals = []
+
+        generation_best = float("inf")
+
+        for x in xs:
+            if evals >= max_evals:
+                break
+
+            x_proj = project_fn(np.array(x, dtype=float))
+            fx = float(f(x_proj))
+
+            xs_projected.append(x_proj)
+            fvals.append(fx)
+
             evals += 1
-            if fvals[k] < best_f:
-                best_f = float(fvals[k])
-                best_x = arx[k].copy()
-        order = np.argsort(fvals)
-        arx = arx[order]
-        ary = ary[order]
-        fvals = fvals[order]
-        use_mu = min(mu, cur_lambda)
-        w = weights[:use_mu]
-        w = w / np.sum(w)
-        m = np.sum(arx[:use_mu] * w[:, None], axis=0)
-        y_w = np.sum(ary[:use_mu] * w[:, None], axis=0)
-        ps = (1.0 - cs) * ps + np.sqrt(cs * (2.0 - cs) * mueff) * (invsqrtC @ y_w)
-        norm_ps = np.linalg.norm(ps)
-        left = norm_ps / np.sqrt(1.0 - (1.0 - cs) ** (2.0 * generation))
-        right = (1.4 + 2.0 / (n + 1.0)) * chi_n
-        hsig = 1.0 if left < right else 0.0
-        pc = (1.0 - cc) * pc + hsig * np.sqrt(cc * (2.0 - cc) * mueff) * y_w
-        rank_mu = np.zeros((n, n))
-        for i in range(use_mu):
-            rank_mu += w[i] * np.outer(ary[i], ary[i])
-        C = ((1.0 - c1 - cmu) * C + c1 * (np.outer(pc, pc) + (1.0 - hsig) * cc * (2.0 - cc) * C) + cmu * rank_mu)
-        sigma = sigma * np.exp((cs / damps) * (norm_ps / chi_n - 1.0))
-        sigma = float(max(1e-12, sigma))
-        C = 0.5 * (C + C.T)
-        eigvals, eigvecs = np.linalg.eigh(C + 1e-12 * np.eye(n))
-        eigvals = np.maximum(eigvals, 1e-20)
-        D = np.sqrt(eigvals)
-        B = eigvecs
-        invsqrtC = B @ np.diag(1.0 / D) @ B.T
-        f_spread = float(np.max(fvals) - np.min(fvals)) if cur_lambda > 1 else 0.0
-        x_spread = float(sigma * np.max(D))
-        if fvals[0] <= best_f + 1e-12:
-            stall += 1
+
+            if fx < best_f:
+                best_f = fx
+                best_x = x_proj.copy()
+
+            if fx < generation_best:
+                generation_best = fx
+
+        if not fvals:
+            break
+
+        es.tell(xs_projected, fvals)
+
+        if generation_best < best_f + 1e-12:
+            generations_without_improvement = 0
         else:
-            stall = 0
-        if f_spread < tol_f and x_spread < tol_x:
-            break
-        if patience is not None and patience > 0 and stall >= patience:
-            break
+            generations_without_improvement += 1
+
+        if patience is not None and int(patience) > 0:
+            if generations_without_improvement >= int(patience):
+                break
 
     return best_x, best_f, evals
 
@@ -1218,6 +1287,8 @@ def run_one_fit_set(set_idx: int,
             print(f"[set {set_idx:03d}] site {site_tag} has no valid diam values, skipping")
             continue
 
+        # NEW OUTPUT STRUCTURE:
+        #   <output_root>/<subdir>/<site>/set_001/
         site_root = run_group_root / site_tag
         set_root = site_root / f"set_{set_idx:03d}"
         set_root.mkdir(parents=True, exist_ok=True)
@@ -1306,7 +1377,7 @@ def run_one_fit_set(set_idx: int,
                 project_root=run_settings.project_root,
             )
 
-            loss = diameter_objective(
+            loss, loss_components = diameter_objective(
                 sim_outdir=cpp_outdir,
                 num_sims=int(base_config.get("Tussock Model", "nsims")),
                 iteration_label=eval_label,
@@ -1330,6 +1401,7 @@ def run_one_fit_set(set_idx: int,
                 loss,
                 eval_label,
                 opt_csv_path,
+                loss_components=loss_components,
             )
 
             sim_df = read_sim_summaries(
@@ -1393,7 +1465,7 @@ def run_one_fit_set(set_idx: int,
             remaining_budget = max(0, run_settings.optimization.max_evals - eval_label)
 
             if remaining_budget > 0 and x0.size > 0:
-                best_x, _, _ = cma_es_optimize(
+                best_x, _, _ = pycma_optimize(
                     objective_vec,
                     x0,
                     sigma0,
