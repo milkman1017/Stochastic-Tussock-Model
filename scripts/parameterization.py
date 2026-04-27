@@ -1082,6 +1082,7 @@ def pycma_optimize(f, x0, sigma0, max_evals, tol_f, tol_x, project_fn, popsize=0
     The objective `f` should accept an already-projected vector. We still call
     project_fn before evaluation because this model uses custom parameter
     constraints/transforms outside of pycma's native bounds system.
+
     """
     x0 = project_fn(np.array(x0, dtype=float))
     sigma0 = float(max(1e-12, sigma0))
@@ -1108,15 +1109,23 @@ def pycma_optimize(f, x0, sigma0, max_evals, tol_f, tol_x, project_fn, popsize=0
     while not es.stop() and evals < max_evals:
         xs = es.ask()
 
+        # pycma tell() requires at least mu solutions. Do not do a partial
+        # generation if the remaining evaluation budget is too small.
+        mu = int(es.sp.weights.mu)
+        remaining = max_evals - evals
+
+        if remaining < mu:
+            break
+        if remaining < len(xs):
+            break
+
         xs_projected = []
         fvals = []
 
+        previous_best_f = best_f
         generation_best = float("inf")
 
         for x in xs:
-            if evals >= max_evals:
-                break
-
             x_proj = project_fn(np.array(x, dtype=float))
             fx = float(f(x_proj))
 
@@ -1132,12 +1141,12 @@ def pycma_optimize(f, x0, sigma0, max_evals, tol_f, tol_x, project_fn, popsize=0
             if fx < generation_best:
                 generation_best = fx
 
-        if not fvals:
+        if len(fvals) < mu:
             break
 
         es.tell(xs_projected, fvals)
 
-        if generation_best < best_f + 1e-12:
+        if best_f < previous_best_f - 1e-12:
             generations_without_improvement = 0
         else:
             generations_without_improvement += 1

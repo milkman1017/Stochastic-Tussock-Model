@@ -59,6 +59,29 @@ AUDIT_OUTPUT_FILENAMES = {
     "final_population_results_compiled.csv",
 }
 
+MODEL_PARAMETER_COLUMNS = [
+    "ks",
+    "kr",
+    "ke",
+    "bs",
+    "br",
+    "be",
+    "c_space_survival",
+    "c_space_reproduction",
+    "k_crowd_survival",
+    "k_crowd_reproduction",
+    "k_crowd_establishment",
+    "leaf_offset",
+]
+
+WEIGHTED_LOSS_COMPONENT_COLUMNS = [
+    "fit_loss_weighted",
+    "diameter_sd_loss_weighted",
+    "live_tiller_radius_prior_weighted",
+    "extinct_loss_weighted",
+    "overflow_loss_weighted",
+]
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -1107,36 +1130,24 @@ def load_final_population_results(hypothesis_dir: Path) -> pd.DataFrame:
 
 
 def numeric_optimized_parameter_columns(opt_df: pd.DataFrame) -> List[str]:
+    """
+    Return only actual optimized model parameter columns from optimization_results.csv.
+
+    This intentionally excludes total loss, raw loss terms, weighted loss terms,
+    diagnostics, and stored loss weights.
+    """
     if opt_df.empty:
         return []
 
-    exclude = {
-        "model_family",
-        "set_id",
-        "site",
-        "optimization_file",
-        "iteration",
-        "loss",
-        "objective",
-        "score",
-        "rank",
-        "seed",
-        "sim_id",
-        "status",
-        "success",
-        "message",
-    }
-
     cols = []
 
-    for col in opt_df.columns:
-        if col in exclude:
+    for col in MODEL_PARAMETER_COLUMNS:
+        if col not in opt_df.columns:
             continue
 
         vals = pd.to_numeric(opt_df[col], errors="coerce")
-        finite_count = int(np.isfinite(vals).sum())
 
-        if finite_count > 0:
+        if np.isfinite(vals).any():
             cols.append(col)
 
     return cols
@@ -1196,41 +1207,47 @@ def save_empty_plot(path: Path, title: str, message: str, dpi: int) -> None:
     plt.close(fig)
 
 
-def plot_optimization_traces(
+def plot_optimization_parameter_traces(
     opt_df: pd.DataFrame,
     out_path: Path,
     dpi: int,
 ) -> None:
+    """
+    Plot total loss plus optimized model parameters.
+
+    One subplot per variable. One line per set/site/model_family optimization run.
+    This plot intentionally excludes raw loss components, weighted loss components,
+    diagnostics, and stored weight columns.
+    """
     if opt_df.empty:
         save_empty_plot(
             out_path,
-            "Optimization traces",
+            "Optimization traces: loss and parameters",
             "No optimization_results.csv files were found.",
             dpi,
         )
         return
 
-    plot_cols = numeric_optimized_parameter_columns(opt_df)
+    plot_cols = []
 
     if "loss" in opt_df.columns:
         loss_vals = pd.to_numeric(opt_df["loss"], errors="coerce")
-
         if np.isfinite(loss_vals).any():
-            plot_cols = ["loss"] + plot_cols
+            plot_cols.append("loss")
 
+    plot_cols.extend(numeric_optimized_parameter_columns(opt_df))
     plot_cols = list(dict.fromkeys(plot_cols))
 
     if not plot_cols:
         save_empty_plot(
             out_path,
-            "Optimization traces",
-            "No numeric optimization columns were found.",
+            "Optimization traces: loss and parameters",
+            "No total loss or optimized parameter columns were found.",
             dpi,
         )
         return
 
     nrows, ncols = choose_subplot_grid(len(plot_cols))
-
     fig_width = max(10, 4.2 * ncols)
     fig_height = max(6, 3.2 * nrows)
 
@@ -1271,10 +1288,117 @@ def plot_optimization_traces(
     for ax in axes_flat[len(plot_cols):]:
         ax.axis("off")
 
-    fig.suptitle("Optimization traces: all sets", y=0.995)
+    fig.suptitle("Optimization traces: total loss and optimized parameters", y=0.995)
     fig.tight_layout()
     fig.savefig(out_path, dpi=dpi)
     plt.close(fig)
+
+
+def plot_optimization_weighted_loss_traces(
+    opt_df: pd.DataFrame,
+    out_path: Path,
+    dpi: int,
+) -> None:
+    """
+    Plot total loss plus weighted individual loss components.
+
+    This intentionally includes only:
+      - loss
+      - selected *_weighted component columns
+
+    It excludes raw terms, diagnostic terms, weights, and parameters.
+    """
+    if opt_df.empty:
+        save_empty_plot(
+            out_path,
+            "Optimization traces: weighted loss components",
+            "No optimization_results.csv files were found.",
+            dpi,
+        )
+        return
+
+    plot_cols = []
+
+    if "loss" in opt_df.columns:
+        loss_vals = pd.to_numeric(opt_df["loss"], errors="coerce")
+        if np.isfinite(loss_vals).any():
+            plot_cols.append("loss")
+
+    for col in WEIGHTED_LOSS_COMPONENT_COLUMNS:
+        if col not in opt_df.columns:
+            continue
+
+        vals = pd.to_numeric(opt_df[col], errors="coerce")
+        if np.isfinite(vals).any():
+            plot_cols.append(col)
+
+    plot_cols = list(dict.fromkeys(plot_cols))
+
+    if not plot_cols:
+        save_empty_plot(
+            out_path,
+            "Optimization traces: weighted loss components",
+            "No total loss or weighted loss component columns were found.",
+            dpi,
+        )
+        return
+
+    nrows, ncols = choose_subplot_grid(len(plot_cols))
+    fig_width = max(10, 4.2 * ncols)
+    fig_height = max(6, 3.2 * nrows)
+
+    fig, axes = plt.subplots(
+        nrows=nrows,
+        ncols=ncols,
+        figsize=(fig_width, fig_height),
+        squeeze=False,
+    )
+
+    axes_flat = axes.ravel()
+    group_cols = ["model_family", "site", "set_id", "optimization_file"]
+
+    for ax, col in zip(axes_flat, plot_cols):
+        for _, g in opt_df.groupby(group_cols, dropna=False):
+            x = pd.to_numeric(g["iteration"], errors="coerce")
+            y = pd.to_numeric(g[col], errors="coerce")
+
+            keep = np.isfinite(x) & np.isfinite(y)
+
+            if keep.sum() == 0:
+                continue
+
+            gg = pd.DataFrame({"x": x[keep], "y": y[keep]}).sort_values("x")
+
+            ax.plot(
+                gg["x"].to_numpy(),
+                gg["y"].to_numpy(),
+                linewidth=0.9,
+                alpha=0.65,
+            )
+
+        ax.set_title(col)
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel(col)
+        ax.grid(True, alpha=0.25)
+
+    for ax in axes_flat[len(plot_cols):]:
+        ax.axis("off")
+
+    fig.suptitle("Optimization traces: total loss and weighted loss components", y=0.995)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def plot_optimization_traces(
+    opt_df: pd.DataFrame,
+    out_path: Path,
+    dpi: int,
+) -> None:
+    """
+    Backward-compatible wrapper. New scripts should call the two split trace plots.
+    """
+    plot_optimization_parameter_traces(opt_df=opt_df, out_path=out_path, dpi=dpi)
 
 
 def plot_optimized_parameter_distributions(
@@ -1639,9 +1763,15 @@ def make_all_plots(
     plot_dir = out_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    plot_optimization_traces(
+    plot_optimization_parameter_traces(
         opt_df=opt_df,
-        out_path=plot_dir / "optimization_trace_by_parameter.png",
+        out_path=plot_dir / "optimization_trace_loss_and_parameters.png",
+        dpi=dpi,
+    )
+
+    plot_optimization_weighted_loss_traces(
+        opt_df=opt_df,
+        out_path=plot_dir / "optimization_trace_weighted_loss_components.png",
         dpi=dpi,
     )
 
@@ -1764,7 +1894,8 @@ def main() -> None:
     if not args.no_plots:
         print("")
         print("Plots:")
-        print(f"  {out_dir / 'plots' / 'optimization_trace_by_parameter.png'}")
+        print(f"  {out_dir / 'plots' / 'optimization_trace_loss_and_parameters.png'}")
+        print(f"  {out_dir / 'plots' / 'optimization_trace_weighted_loss_components.png'}")
         print(f"  {out_dir / 'plots' / 'optimized_parameter_distributions.png'}")
         print(f"  {out_dir / 'plots' / 'final_population_stats.png'}")
         print(f"  {out_dir / 'plots' / 'final_population_outcomes.png'}")
