@@ -102,6 +102,9 @@ class MechanismSettings:
     use_crowding_reproduction: bool
     use_crowding_establishment: bool
     crowding_radius_cm: float
+    spatial_survival_form: str
+    spatial_reproduction_form: str
+    spatial_establishment_form: str
 
 
 @dataclass
@@ -316,6 +319,9 @@ def load_combined_config(config_path: str, cli_sites=None):
         use_crowding_reproduction=read_bool(config, "Mechanisms", "use_crowding_reproduction", fallback=False),
         use_crowding_establishment=read_bool(config, "Mechanisms", "use_crowding_establishment", fallback=False),
         crowding_radius_cm=config.getfloat("Mechanisms", "crowding_radius_cm", fallback=2.0),
+        spatial_survival_form=config.get("Mechanisms", "spatial_survival_form", fallback="linear"),
+        spatial_reproduction_form=config.get("Mechanisms", "spatial_reproduction_form", fallback="linear"),
+        spatial_establishment_form=config.get("Mechanisms", "spatial_establishment_form", fallback="linear"),
     )
 
     resampling = ResamplingSettings(

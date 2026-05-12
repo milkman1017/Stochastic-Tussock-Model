@@ -92,9 +92,10 @@ def parse_args() -> argparse.Namespace:
     )
 
     p.add_argument(
-        "--hypothesis-dir",
+        "--hypothesis-dirs",
+        nargs="*",
         required=True,
-        help="Directory to crawl. Can be the whole output/subdir directory, a site directory, or one mechanism directory.",
+        help="Directories to evaluate/compare. Can be the whole output/subdir directory, a site directory, or one mechanism directory.",
     )
     p.add_argument(
         "--out-dir",
@@ -1752,11 +1753,140 @@ def plot_final_population_outcome_summary(
     plt.close(fig)
 
 
+def plot_final_population_counts(
+    final_pop_df: pd.DataFrame,
+    out_path: Path,
+    dpi: int,
+    hypothesis_label: str,
+) -> None:
+    if final_pop_df.empty:
+        save_empty_plot(
+            out_path,
+            "Final population counts",
+            "No final population data found.",
+            dpi,
+        )
+        return
+
+    df = final_pop_df.copy()
+
+    grouped = pd.DataFrame([{
+        'hypothesis': hypothesis_label,
+        'alive_tussocks_final': float(df['alive_tussocks_final'].mean(skipna=True)),
+        'extinct_tussocks_final': float(df['extinct_tussocks_final'].mean(skipna=True)),
+        'overflow_tussocks': float(df['overflow_tussocks'].mean(skipna=True)),
+    }])
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    x = np.arange(len(grouped))
+    width = 0.25
+
+    ax.bar(x - width, grouped['alive_tussocks_final'], width, label='Alive', alpha=0.8)
+    ax.bar(x, grouped['extinct_tussocks_final'], width, label='Extinct', alpha=0.8)
+    ax.bar(x + width, grouped['overflow_tussocks'], width, label='Overflow', alpha=0.8)
+
+    ax.set_xlabel('Hypothesis')
+    ax.set_ylabel('Average Count')
+    ax.set_title('Final Population Counts by Hypothesis')
+    ax.set_xticks(x)
+    ax.set_xticklabels(grouped['hypothesis'], rotation=45, ha='right')
+    ax.legend()
+    ax.grid(True, alpha=0.25)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
+def plot_time_series(
+    final_pop_df: pd.DataFrame,
+    out_path: Path,
+    dpi: int,
+    hypothesis_label: str,
+) -> None:
+    if final_pop_df.empty:
+        save_empty_plot(
+            out_path,
+            "Time series of population outcomes",
+            "No final population data found.",
+            dpi,
+        )
+        return
+
+    df = final_pop_df.copy()
+
+    for col in [
+        "iteration",
+        "prop_alive",
+        "prop_extinct",
+        "prop_overgrown",
+        "prop_overflow",
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    fig, axes = plt.subplots(nrows=2, ncols=2, figsize=(12, 9))
+    ax1, ax2, ax3, ax4 = axes.ravel()
+
+    group_cols = ["model_family", "site", "set_id", "final_population_result_file"]
+
+    outcome_specs = [
+        ("prop_alive", "Alive tussocks", ax1),
+        ("prop_extinct", "Extinct tussocks", ax2),
+        ("prop_overgrown", "Overgrown tussocks", ax3),
+        ("prop_overflow", "Overflow tussocks", ax4),
+    ]
+
+    for prop_col, title, ax in outcome_specs:
+        if prop_col not in df.columns:
+            ax.set_title(title)
+            ax.text(
+                0.5,
+                0.5,
+                f"{prop_col} not found",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            continue
+
+        for _, g in df.groupby(group_cols, dropna=False):
+            x = pd.to_numeric(g["iteration"], errors="coerce")
+            y = pd.to_numeric(g[prop_col], errors="coerce")
+
+            keep = np.isfinite(x) & np.isfinite(y)
+
+            if keep.sum() == 0:
+                continue
+
+            gg = pd.DataFrame({"x": x[keep], "y": y[keep]}).sort_values("x")
+
+            ax.plot(
+                gg["x"].to_numpy(),
+                gg["y"].to_numpy(),
+                linewidth=1.0,
+                alpha=0.65,
+            )
+
+        ax.set_title(title)
+        ax.set_xlabel("Iteration")
+        ax.set_ylabel("Proportion")
+        ax.set_ylim(-0.02, 1.02)
+        ax.grid(True, alpha=0.25)
+
+    fig.suptitle(f"Time series: {hypothesis_label}", y=0.995)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+
+
 def make_all_plots(
     raw_pop_df: pd.DataFrame,
     final_params: pd.DataFrame,
     opt_df: pd.DataFrame,
     final_pop_df: pd.DataFrame,
+    hypothesis_dir: Path,
     out_dir: Path,
     dpi: int,
 ) -> None:
@@ -1788,33 +1918,61 @@ def make_all_plots(
         dpi=dpi,
     )
 
-    plot_final_population_outcomes(
-        final_pop_df=final_pop_df,
-        out_path=plot_dir / "final_population_outcomes.png",
-        dpi=dpi,
-    )
-
     plot_final_population_outcome_summary(
         final_pop_df=final_pop_df,
         out_path=plot_dir / "final_population_outcome_summary.png",
         dpi=dpi,
     )
 
+    plot_final_population_counts(
+        final_pop_df=final_pop_df,
+        out_path=plot_dir / "final_population_counts.png",
+        dpi=dpi,
+        hypothesis_label=hypothesis_dir.name,
+    )
+
+    plot_time_series(
+        final_pop_df=final_pop_df,
+        out_path=plot_dir / "time_series.png",
+        dpi=dpi,
+        hypothesis_label=hypothesis_dir.name,
+    )
+
+
 
 def main() -> None:
     args = parse_args()
 
-    hypothesis_dir = Path(args.hypothesis_dir).resolve()
+    hypothesis_dirs = [Path(d).resolve() for d in args.hypothesis_dirs]
 
-    if not hypothesis_dir.exists():
-        raise FileNotFoundError(f"Hypothesis directory does not exist: {hypothesis_dir}")
+    for d in hypothesis_dirs:
+        if not d.exists():
+            raise FileNotFoundError(f"Hypothesis directory does not exist: {d}")
 
-    out_dir = (
-        Path(args.out_dir).resolve()
-        if args.out_dir
-        else hypothesis_dir / "audit_summary"
-    )
+    if len(hypothesis_dirs) == 1:
+        # Single hypothesis evaluation
+        hypothesis_dir = hypothesis_dirs[0]
+        out_dir = (
+            Path(args.out_dir).resolve()
+            if args.out_dir
+            else hypothesis_dir / "audit_summary"
+        )
+        evaluate_single_hypothesis(hypothesis_dir, out_dir, args)
+    else:
+        # Comparison
+        out_dir = (
+            Path(args.out_dir).resolve()
+            if args.out_dir
+            else Path("comparison")
+        )
+        # First, evaluate each hypothesis individually in subdirs
+        for d in hypothesis_dirs:
+            single_out = out_dir / d.name
+            evaluate_single_hypothesis(d, single_out, args)
+        # Then, compare
+        compare_hypotheses(hypothesis_dirs, out_dir, args)
 
+def evaluate_single_hypothesis(hypothesis_dir: Path, out_dir: Path, args) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     obs, all_obs_diams = load_observed_diameters(
@@ -1875,6 +2033,7 @@ def main() -> None:
             final_params=final_params,
             opt_df=all_opt,
             final_pop_df=final_pop_df,
+            hypothesis_dir=hypothesis_dir,
             out_dir=out_dir,
             dpi=args.plot_dpi,
         )
@@ -1898,12 +2057,224 @@ def main() -> None:
         print(f"  {out_dir / 'plots' / 'optimization_trace_weighted_loss_components.png'}")
         print(f"  {out_dir / 'plots' / 'optimized_parameter_distributions.png'}")
         print(f"  {out_dir / 'plots' / 'final_population_stats.png'}")
-        print(f"  {out_dir / 'plots' / 'final_population_outcomes.png'}")
         print(f"  {out_dir / 'plots' / 'final_population_outcome_summary.png'}")
+        print(f"  {out_dir / 'plots' / 'final_population_counts.png'}")
+        print(f"  {out_dir / 'plots' / 'time_series.png'}")
 
     print("")
     print("Top-level summary:")
     print(family_summary.to_string(index=False))
+
+
+def find_final_population_results_compiled(hypothesis_dir: Path) -> Optional[Path]:
+    candidate = hypothesis_dir / "final_population_results_compiled.csv"
+    if candidate.exists():
+        return candidate
+
+    candidate = hypothesis_dir / "audit_summary" / "final_population_results_compiled.csv"
+    if candidate.exists():
+        return candidate
+
+    candidates = list(hypothesis_dir.rglob("final_population_results_compiled.csv"))
+    if not candidates:
+        return None
+
+    return min(candidates, key=lambda p: len(p.relative_to(hypothesis_dir).parts))
+
+
+def collect_hypothesis_stats(hypothesis_dir: Path) -> Optional[pd.Series]:
+    final_pop_path = find_final_population_results_compiled(hypothesis_dir)
+    if final_pop_path is not None:
+        df = pd.read_csv(final_pop_path)
+        if not df.empty and {
+            'alive_tussocks_final', 'extinct_tussocks_final', 'overflow_tussocks', 'prop_alive', 'avg_tussock_diameter'
+        }.issubset(df.columns):
+            return pd.Series({
+                'alive_mean': float(df['alive_tussocks_final'].mean()),
+                'alive_std': float(df['alive_tussocks_final'].std(ddof=1)) if len(df) > 1 else 0.0,
+                'extinct_mean': float(df['extinct_tussocks_final'].mean()),
+                'extinct_std': float(df['extinct_tussocks_final'].std(ddof=1)) if len(df) > 1 else 0.0,
+                'overflow_mean': float(df['overflow_tussocks'].mean()),
+                'overflow_std': float(df['overflow_tussocks'].std(ddof=1)) if len(df) > 1 else 0.0,
+                'prop_alive_mean': float(df['prop_alive'].mean()),
+                'prop_alive_std': float(df['prop_alive'].std(ddof=1)) if len(df) > 1 else 0.0,
+                'prop_extinct_mean': float(df['prop_extinct'].mean()),
+                'prop_extinct_std': float(df['prop_extinct'].std(ddof=1)) if len(df) > 1 else 0.0,
+                'prop_overgrown_mean': float(df['prop_overgrown'].mean()),
+                'prop_overgrown_std': float(df['prop_overgrown'].std(ddof=1)) if len(df) > 1 else 0.0,
+                'prop_overflow_mean': float(df['prop_overflow'].mean()),
+                'prop_overflow_std': float(df['prop_overflow'].std(ddof=1)) if len(df) > 1 else 0.0,
+                'avg_diam_mean': float(df['avg_tussock_diameter'].mean()),
+                'avg_diam_std': float(df['avg_tussock_diameter'].std(ddof=1)) if len(df) > 1 else 0.0,
+            })
+
+    files = list(hypothesis_dir.rglob("final_population_results.csv"))
+    if not files:
+        return None
+
+    dfs = []
+    for p in files:
+        df = pd.read_csv(p)
+        if not df.empty and {
+            'alive_tussocks_final', 'extinct_tussocks_final', 'overflow_tussocks', 'prop_alive', 'avg_tussock_diameter'
+        }.issubset(df.columns):
+            dfs.append(df[['alive_tussocks_final', 'extinct_tussocks_final', 'overflow_tussocks', 'prop_alive', 'prop_extinct', 'prop_overgrown', 'prop_overflow', 'avg_tussock_diameter']])
+
+    if not dfs:
+        return None
+
+    df = pd.concat(dfs, ignore_index=True)
+    return pd.Series({
+        'alive_mean': float(df['alive_tussocks_final'].mean()),
+        'alive_std': float(df['alive_tussocks_final'].std(ddof=1)) if len(df) > 1 else 0.0,
+        'extinct_mean': float(df['extinct_tussocks_final'].mean()),
+        'extinct_std': float(df['extinct_tussocks_final'].std(ddof=1)) if len(df) > 1 else 0.0,
+        'overflow_mean': float(df['overflow_tussocks'].mean()),
+        'overflow_std': float(df['overflow_tussocks'].std(ddof=1)) if len(df) > 1 else 0.0,
+        'prop_alive_mean': float(df['prop_alive'].mean()),
+        'prop_alive_std': float(df['prop_alive'].std(ddof=1)) if len(df) > 1 else 0.0,
+        'prop_extinct_mean': float(df['prop_extinct'].mean()),
+        'prop_extinct_std': float(df['prop_extinct'].std(ddof=1)) if len(df) > 1 else 0.0,
+        'prop_overgrown_mean': float(df['prop_overgrown'].mean()),
+        'prop_overgrown_std': float(df['prop_overgrown'].std(ddof=1)) if len(df) > 1 else 0.0,
+        'prop_overflow_mean': float(df['prop_overflow'].mean()),
+        'prop_overflow_std': float(df['prop_overflow'].std(ddof=1)) if len(df) > 1 else 0.0,
+        'avg_diam_mean': float(df['avg_tussock_diameter'].mean()),
+        'avg_diam_std': float(df['avg_tussock_diameter'].std(ddof=1)) if len(df) > 1 else 0.0,
+    })
+
+
+def compare_hypotheses(hypothesis_dirs: list[Path], out_dir: Path, args) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    all_data = []
+    labels = []
+    
+    for d in hypothesis_dirs:
+        stats = collect_hypothesis_stats(d)
+        if stats is None:
+            print(f"Warning: no final population stats found for {d}")
+            continue
+
+        all_data.append(stats)
+        labels.append(d.name)
+    
+    if not all_data:
+        print("No data found in provided directories.")
+        return
+    
+    df_stats = pd.DataFrame(all_data, index=labels)
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    x = np.arange(len(df_stats))
+    width = 0.25
+    
+    alive = df_stats['alive_mean'].to_numpy()
+    alive_err = df_stats['alive_std'].to_numpy()
+    extinct = df_stats['extinct_mean'].to_numpy()
+    extinct_err = df_stats['extinct_std'].to_numpy()
+    overflow = df_stats['overflow_mean'].to_numpy()
+    overflow_err = df_stats['overflow_std'].to_numpy()
+    
+    ax.bar(x - width, alive, width, yerr=alive_err, capsize=4, label='Alive', alpha=0.8)
+    ax.bar(x, extinct, width, yerr=extinct_err, capsize=4, label='Extinct', alpha=0.8)
+    ax.bar(x + width, overflow, width, yerr=overflow_err, capsize=4, label='Overflow', alpha=0.8)
+    
+    ax.set_xlabel('Hypothesis')
+    ax.set_ylabel('Average Count')
+    ax.set_title('Final Population Counts Comparison')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha='right')
+    ax.legend()
+    ax.grid(True, alpha=0.25)
+    
+    fig.tight_layout()
+    plt.savefig(out_dir / "hypothesis_comparison_counts.png", dpi=args.plot_dpi)
+    plt.close()
+    
+    # Plot 2: Viability Summary (prop_alive)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    prop_alive = df_stats['prop_alive_mean'].to_numpy()
+    prop_alive_err = df_stats['prop_alive_std'].to_numpy()
+    
+    ax.bar(x, prop_alive, width=0.5, yerr=prop_alive_err, capsize=4, alpha=0.8, color='green')
+    
+    ax.set_xlabel('Hypothesis')
+    ax.set_ylabel('Proportion Alive')
+    ax.set_title('Viability Summary: Proportion of Alive Tussocks')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha='right')
+    ax.grid(True, alpha=0.25)
+    
+    fig.tight_layout()
+    plt.savefig(out_dir / "hypothesis_comparison_viability.png", dpi=args.plot_dpi)
+    plt.close()
+    
+    # Plot 3: Tussock Size Comparison
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    diam = df_stats['avg_diam_mean'].to_numpy()
+    diam_err = df_stats['avg_diam_std'].to_numpy()
+    
+    ax.bar(x, diam, width=0.5, yerr=diam_err, capsize=4, alpha=0.8, color='blue')
+    
+    ax.set_xlabel('Hypothesis')
+    ax.set_ylabel('Average Tussock Diameter')
+    ax.set_title('Tussock Size Comparison')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha='right')
+    ax.grid(True, alpha=0.25)
+    
+    fig.tight_layout()
+    plt.savefig(out_dir / "hypothesis_comparison_size.png", dpi=args.plot_dpi)
+    plt.close()
+    
+    # Plot 4: Population Composition Stacked Bars
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    prop_alive_vals = df_stats['prop_alive_mean'].to_numpy()
+    prop_extinct_vals = df_stats['prop_extinct_mean'].to_numpy()
+    prop_overgrown_vals = df_stats['prop_overgrown_mean'].to_numpy()
+    prop_overflow_vals = df_stats['prop_overflow_mean'].to_numpy()
+    
+    ax.bar(x, prop_alive_vals, width=0.5, label='Alive', alpha=0.8, color='green')
+    ax.bar(x, prop_extinct_vals, width=0.5, bottom=prop_alive_vals, label='Extinct', alpha=0.8, color='red')
+    ax.bar(x, prop_overgrown_vals, width=0.5, bottom=prop_alive_vals + prop_extinct_vals, label='Overgrown', alpha=0.8, color='orange')
+    ax.bar(x, prop_overflow_vals, width=0.5, bottom=prop_alive_vals + prop_extinct_vals + prop_overgrown_vals, label='Overflow', alpha=0.8, color='purple')
+    
+    ax.set_xlabel('Hypothesis')
+    ax.set_ylabel('Proportion')
+    ax.set_title('Population Composition')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha='right')
+    ax.legend()
+    ax.grid(True, alpha=0.25)
+    
+    fig.tight_layout()
+    plt.savefig(out_dir / "hypothesis_comparison_composition.png", dpi=args.plot_dpi)
+    plt.close()
+    
+    # Plot 5: Composite Score Ranking (simple: prop_alive * avg_diam / 100)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    score = prop_alive * diam / 100  # arbitrary composite score
+    
+    ax.bar(x, score, width=0.5, alpha=0.8, color='purple')
+    
+    ax.set_xlabel('Hypothesis')
+    ax.set_ylabel('Composite Score')
+    ax.set_title('Composite Score Ranking (Viability × Size)')
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha='right')
+    ax.grid(True, alpha=0.25)
+    
+    fig.tight_layout()
+    plt.savefig(out_dir / "hypothesis_comparison_ranking.png", dpi=args.plot_dpi)
+    plt.close()
+    
+    print(f"Comparison plots saved in {out_dir}")
 
 
 if __name__ == "__main__":

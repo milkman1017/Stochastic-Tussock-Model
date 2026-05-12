@@ -15,8 +15,11 @@
 #include <sstream>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <deque>
 #if defined(__linux__)
 #include <unistd.h>
 #endif
@@ -117,6 +120,9 @@ struct MechanismConfig {
     bool use_crowding_reproduction = false;
     bool use_crowding_establishment = false;
     double crowding_radius_cm = 2.0;
+    std::string spatial_survival_form = "linear";
+    std::string spatial_reproduction_form = "linear";
+    std::string spatial_establishment_form = "linear";
 };
 
 struct ModelParams {
@@ -200,14 +206,9 @@ static inline bool should_prune_dead(const Tiller& t) {
 
 void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
     auto t0 = std::chrono::high_resolution_clock::now();
+
     stats = OverlapStats{};
     stats.max_penetration = 0.0;
-    const double CUTOFF = 3.5;
-    const double CUTOFF2 = CUTOFF * CUTOFF;
-    const double EPS = 1e-6;
-    const double CELL = CUTOFF;
-    const double DAMP = 0.7;
-    const int MAX_PASSES = 80;
 
     if (tillers.size() < 2) {
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -215,56 +216,106 @@ void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
         return;
     }
 
-    std::unordered_map<std::int64_t, std::vector<int>> grid;
-    grid.reserve(tillers.size() * 2);
+    const int MAX_PASSES = 8;
+    const double PEN_TOL = 1e-7;
+    const double SLOP = 1e-4;
+    const double STIFFNESS = 0.7;
+    const double STOP_TOTAL_CORRECTION = 1e-4;
+    const double EPS = 1e-12;
+
+    double max_rsum = 0.0;
+    for (const auto& t : tillers) {
+        max_rsum = std::max(max_rsum, 2.0 * t.getRadius());
+    }
+
+    const double CELL = std::max(3.5, max_rsum);
 
     auto cell_of = [&](double x, double y) -> std::pair<int, int> {
-        return {static_cast<int>(std::floor(x / CELL)), static_cast<int>(std::floor(y / CELL))};
+        return {
+            static_cast<int>(std::floor(x / CELL)),
+            static_cast<int>(std::floor(y / CELL))
+        };
     };
 
-    auto rebuild_grid = [&]() {
-        grid.clear();
+    for (int pass = 0; pass < MAX_PASSES; ++pass) {
+        std::unordered_map<std::int64_t, std::vector<int>> grid;
+        grid.reserve(tillers.size() * 2);
+
         for (int i = 0; i < static_cast<int>(tillers.size()); ++i) {
             auto [cx, cy] = cell_of(tillers[i].getX(), tillers[i].getY());
             grid[cell_key(cx, cy)].push_back(i);
         }
-    };
 
-    for (int pass = 0; pass < MAX_PASSES; ++pass) {
-        rebuild_grid();
-        bool any_overlap = false;
+        long long overlaps_this_pass = 0;
+        double total_correction = 0.0;
+        double max_pen_this_pass = 0.0;
 
-        for (int i = 0; i < static_cast<int>(tillers.size()); ++i) {
-            auto [cx, cy] = cell_of(tillers[i].getX(), tillers[i].getY());
-            for (int gx = -1; gx <= 1; ++gx) {
-                for (int gy = -1; gy <= 1; ++gy) {
-                    auto it = grid.find(cell_key(cx + gx, cy + gy));
-                    if (it == grid.end()) continue;
-                    for (int j : it->second) {
-                        if (j <= i) continue;
-                        stats.candidates++;
-                        double dx = tillers[j].getX() - tillers[i].getX();
-                        double dy = tillers[j].getY() - tillers[i].getY();
-                        double d2 = dx * dx + dy * dy;
-                        if (d2 >= CUTOFF2) continue;
-                        double rsum = tillers[i].getRadius() + tillers[j].getRadius();
-                        if (d2 >= rsum * rsum) continue;
-                        if (!tillers[i].isOverlapping(tillers[j])) continue;
-                        any_overlap = true;
-                        stats.overlapped++;
-                        double angle = std::atan2(dy, dx);
-                        double dist = std::sqrt(std::max(d2, EPS));
-                        double pen = dist - rsum;
-                        stats.max_penetration = std::min(stats.max_penetration, pen);
-                        tillers[i].move(angle, DAMP * pen);
-                        tillers[j].move(angle + M_PI, DAMP * pen);
+        for (const auto& kv : grid) {
+            std::int64_t key = kv.first;
+            const std::vector<int>& ids = kv.second;
+
+            int cx = static_cast<int>(key >> 32);
+            int cy = static_cast<int>(static_cast<std::int32_t>(key & 0xffffffff));
+
+            for (int i : ids) {
+                for (int gx = -1; gx <= 1; ++gx) {
+                    for (int gy = -1; gy <= 1; ++gy) {
+                        auto it = grid.find(cell_key(cx + gx, cy + gy));
+                        if (it == grid.end()) continue;
+
+                        for (int j : it->second) {
+                            if (j <= i) continue;
+
+                            double dx = tillers[j].getX() - tillers[i].getX();
+                            double dy = tillers[j].getY() - tillers[i].getY();
+
+                            double d2 = dx * dx + dy * dy;
+                            double rsum = tillers[i].getRadius() + tillers[j].getRadius();
+
+                            if (rsum <= 0.0) continue;
+                            if (d2 >= rsum * rsum) continue;
+
+                            double dist = std::sqrt(std::max(d2, EPS));
+                            double penetration = rsum - dist;
+
+                            if (penetration <= PEN_TOL) continue;
+                            if (penetration <= SLOP) continue;
+
+                            if (!tillers[i].isOverlapping(tillers[j])) continue;
+
+                            double angle;
+
+                            if (d2 <= EPS) {
+                                // Perfectly coincident centers: choose a deterministic direction
+                                // based on indices so the pair can separate.
+                                double theta = 2.39996322972865332 * static_cast<double>(i + j + 1);
+                                angle = theta;
+                            } else {
+                                angle = std::atan2(dy, dx);
+                            }
+
+                            double correction = STIFFNESS * (penetration - SLOP);
+                            double step = 0.5 * correction;
+
+                            tillers[i].move(angle + M_PI, step);
+                            tillers[j].move(angle, step);
+
+                            overlaps_this_pass++;
+                            total_correction += correction;
+                            max_pen_this_pass = std::max(max_pen_this_pass, penetration);
+                        }
                     }
                 }
             }
         }
 
         stats.passes = pass + 1;
-        if (!any_overlap) break;
+        stats.overlapped += overlaps_this_pass;
+        stats.max_penetration = std::max(stats.max_penetration, max_pen_this_pass);
+
+        if (overlaps_this_pass == 0 || total_correction < STOP_TOTAL_CORRECTION) {
+            break;
+        }
     }
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -383,8 +434,24 @@ static inline double baseline_survival_ipm(const Tiller& t) {
     return clamp01(logistic(s0 + s1 * std::max(0.0, (double)t.getLeafArea())));
 }
 
-static inline double spatial_survival_modifier(const Tiller& t, const ModelParams& p) {
-    return clamp01(p.bs - p.ks * calculater0(t));
+static inline double apply_spatial_modifier(const std::string& form, double a, double b, double r0) {
+    std::string lf = form;
+    std::transform(lf.begin(), lf.end(), lf.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    
+    if (lf == "logit") {
+        return clamp01(logistic(a + b * r0));
+    } else if (lf == "inverse") {
+        return clamp01(a + b / (r0 + 1.0));
+    } else if (lf == "exponential" || lf == "exp") {
+        return clamp01(std::exp(a - b * r0));
+    }
+    // default linear
+    return clamp01(a - b * r0);
+}
+
+static inline double spatial_survival_modifier(const Tiller& t, const ModelParams& p, const std::string& form) {
+    return apply_spatial_modifier(form, p.bs, p.ks, calculater0(t));
 }
 
 static inline double baseline_reproduction_ipm(const Tiller& t) {
@@ -395,12 +462,12 @@ static inline double baseline_reproduction_ipm(const Tiller& t) {
     return clamp01(logistic(b0 + b1 * A + b2 * A * A));
 }
 
-static inline double spatial_reproduction_modifier(const Tiller& t, const ModelParams& p) {
-    return clamp01(p.br - p.kr * calculater0(t));
+static inline double spatial_reproduction_modifier(const Tiller& t, const ModelParams& p, const std::string& form) {
+    return apply_spatial_modifier(form, p.br, p.kr, calculater0(t));
 }
 
-static inline double spatial_establishment_modifier(const Tiller& daughter, const ModelParams& p) {
-    return clamp01(p.be - p.ke * calculater0(daughter));
+static inline double spatial_establishment_modifier(const Tiller& daughter, const ModelParams& p, const std::string& form) {
+    return apply_spatial_modifier(form, p.be, p.ke, calculater0(daughter));
 }
 
 static inline double apply_blend(double base_p, double mod_p, double weight) {
@@ -423,6 +490,9 @@ static MechanismConfig read_mechanisms(const std::string& combined_ini_path) {
     cfg.use_crowding_reproduction = ini_get_bool(combined_ini_path, "Mechanisms", "use_crowding_reproduction", false);
     cfg.use_crowding_establishment = ini_get_bool(combined_ini_path, "Mechanisms", "use_crowding_establishment", false);
     cfg.crowding_radius_cm = std::stod(ini_get(combined_ini_path, "Mechanisms", "crowding_radius_cm", "2.0"));
+    cfg.spatial_survival_form = trim(ini_get(combined_ini_path, "Mechanisms", "spatial_survival_form", "linear"));
+    cfg.spatial_reproduction_form = trim(ini_get(combined_ini_path, "Mechanisms", "spatial_reproduction_form", "linear"));
+    cfg.spatial_establishment_form = trim(ini_get(combined_ini_path, "Mechanisms", "spatial_establishment_form", "linear"));
     return cfg;
 }
 
@@ -505,7 +575,7 @@ void simulate(const int max_sim_time,
 
                 double p_survive = baseline_survival_ipm(tiller);
                 if (cfg.use_spatial_survival) {
-                    p_survive = apply_blend(p_survive, spatial_survival_modifier(tiller, params), params.c_space_survival);
+                    p_survive = apply_blend(p_survive, spatial_survival_modifier(tiller, params, cfg.spatial_survival_form), params.c_space_survival);
                 }
                 if (cfg.use_crowding_survival) {
                     p_survive = apply_crowding_penalty(p_survive, local_crowding, params.k_crowd_survival);
@@ -519,7 +589,7 @@ void simulate(const int max_sim_time,
                     if (!DISABLE_REPRO) {
                         p_repro = baseline_reproduction_ipm(tiller);
                         if (cfg.use_spatial_reproduction) {
-                            p_repro = apply_blend(p_repro, spatial_reproduction_modifier(tiller, params), params.c_space_reproduction);
+                            p_repro = apply_blend(p_repro, spatial_reproduction_modifier(tiller, params, cfg.spatial_reproduction_form), params.c_space_reproduction);
                         }
                         if (cfg.use_crowding_reproduction) {
                             p_repro = apply_crowding_penalty(p_repro, local_crowding, params.k_crowd_reproduction);
@@ -530,7 +600,7 @@ void simulate(const int max_sim_time,
                         Tiller daughter = tiller.makeDaughter(next_tiller_id++);
                         double p_est = 1.0; //default 100% success rate if not on
                         if (cfg.use_spatial_establishment) {
-                            p_est = spatial_establishment_modifier(daughter, params);
+                            p_est = spatial_establishment_modifier(daughter, params, cfg.spatial_establishment_form);
                         }
                         if (cfg.use_crowding_establishment) {
                             p_est = apply_crowding_penalty(p_est, local_crowding, params.k_crowd_establishment);

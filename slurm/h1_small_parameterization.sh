@@ -5,7 +5,7 @@
 #SBATCH --output=h1_small.out
 #SBATCH --error=h1_small.err
 #SBATCH --time=1000:00:00
-#SBATCH --nodelist=lgmem-02
+#SBATCH --nodelist=lgmem-01
 #SBATCH --exclusive
 
 set -euo pipefail
