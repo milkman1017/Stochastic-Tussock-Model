@@ -194,14 +194,17 @@ def parse_args() -> argparse.Namespace:
         default=250,
         help="DPI for saved plots. Default: 250.",
     )
+    p.add_argument(
+        "--comparison-only",
+        action="store_true",
+        help="Skip per-simulation evaluation and only do high-level hypothesis comparison. Useful for comparing multiple completed hypothesis runs.",
+    )
 
     return p.parse_args()
 
-
-def wasserstein_distance_1d(x: Iterable[float], y: Iterable[float]) -> float:
-    """Small dependency-free 1D Wasserstein distance."""
-    x = np.asarray(list(x), dtype=float)
-    y = np.asarray(list(y), dtype=float)
+def wasserstein_distance_1d(x, y) -> float:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
 
     x = x[np.isfinite(x)]
     y = y[np.isfinite(y)]
@@ -244,6 +247,65 @@ def wasserstein_distance_1d(x: Iterable[float], y: Iterable[float]) -> float:
         prev = nxt
 
     return float(w1)
+
+
+def read_final_sim_diameters_for_set(set_dir: Path) -> np.ndarray:
+    summary_dir = set_dir / "final_sims" / "summaries"
+
+    if not summary_dir.is_dir():
+        return np.array([], dtype=float)
+
+    vals = []
+
+    for summary_file in sorted(summary_dir.glob("summary_*.csv")):
+        try:
+            df = pd.read_csv(summary_file)
+        except Exception:
+            continue
+
+        if "final_diameter" not in df.columns:
+            continue
+
+        diam = pd.to_numeric(df["final_diameter"], errors="coerce").to_numpy(dtype=float)
+        vals.extend(diam[np.isfinite(diam)].tolist())
+
+    return np.asarray(vals, dtype=float)
+
+
+def read_training_diameters_for_set(set_dir: Path, ecotype: str) -> np.ndarray:
+    training_file = set_dir / "sampled_training_data.csv"
+
+    if not training_file.exists():
+        return np.array([], dtype=float)
+
+    try:
+        df = pd.read_csv(training_file)
+    except Exception:
+        return np.array([], dtype=float)
+
+    if "diam" not in df.columns:
+        return np.array([], dtype=float)
+
+    if ecotype and ecotype != "ALL" and "site" in df.columns:
+        df = df[df["site"].astype(str) == str(ecotype)].copy()
+
+    diam = pd.to_numeric(df["diam"], errors="coerce").to_numpy(dtype=float)
+    return diam[np.isfinite(diam)]
+
+
+def compute_set_diameter_wasserstein(result_file: Path, ecotype: str) -> dict[str, float]:
+    set_dir = result_file.parent
+
+    sim_diameters = read_final_sim_diameters_for_set(set_dir)
+    training_diameters = read_training_diameters_for_set(set_dir, ecotype)
+
+    w1 = wasserstein_distance_1d(training_diameters, sim_diameters)
+
+    return {
+        "diameter_wasserstein_1d": float(w1) if np.isfinite(w1) else np.nan,
+        "n_training_diameters_for_wasserstein": int(training_diameters.size),
+        "n_sim_diameters_for_wasserstein": int(sim_diameters.size),
+    }
 
 
 def is_set_dir_name(name: str) -> bool:
@@ -1949,7 +2011,19 @@ def main() -> None:
         if not d.exists():
             raise FileNotFoundError(f"Hypothesis directory does not exist: {d}")
 
-    if len(hypothesis_dirs) == 1:
+    if args.comparison_only:
+        # Skip per-simulation evaluation, go straight to comparison
+        if len(hypothesis_dirs) < 2:
+            print("Error: --comparison-only requires at least 2 hypothesis directories.")
+            return
+        
+        out_dir = (
+            Path(args.out_dir).resolve()
+            if args.out_dir
+            else Path("comparison")
+        )
+        compare_hypotheses(hypothesis_dirs, out_dir, args)
+    elif len(hypothesis_dirs) == 1:
         # Single hypothesis evaluation
         hypothesis_dir = hypothesis_dirs[0]
         out_dir = (
@@ -2083,32 +2157,13 @@ def find_final_population_results_compiled(hypothesis_dir: Path) -> Optional[Pat
 
 
 def collect_hypothesis_stats(hypothesis_dir: Path) -> Optional[pd.Series]:
-    final_pop_path = find_final_population_results_compiled(hypothesis_dir)
-    if final_pop_path is not None:
-        df = pd.read_csv(final_pop_path)
-        if not df.empty and {
-            'alive_tussocks_final', 'extinct_tussocks_final', 'overflow_tussocks', 'prop_alive', 'avg_tussock_diameter'
-        }.issubset(df.columns):
-            return pd.Series({
-                'alive_mean': float(df['alive_tussocks_final'].mean()),
-                'alive_std': float(df['alive_tussocks_final'].std(ddof=1)) if len(df) > 1 else 0.0,
-                'extinct_mean': float(df['extinct_tussocks_final'].mean()),
-                'extinct_std': float(df['extinct_tussocks_final'].std(ddof=1)) if len(df) > 1 else 0.0,
-                'overflow_mean': float(df['overflow_tussocks'].mean()),
-                'overflow_std': float(df['overflow_tussocks'].std(ddof=1)) if len(df) > 1 else 0.0,
-                'prop_alive_mean': float(df['prop_alive'].mean()),
-                'prop_alive_std': float(df['prop_alive'].std(ddof=1)) if len(df) > 1 else 0.0,
-                'prop_extinct_mean': float(df['prop_extinct'].mean()),
-                'prop_extinct_std': float(df['prop_extinct'].std(ddof=1)) if len(df) > 1 else 0.0,
-                'prop_overgrown_mean': float(df['prop_overgrown'].mean()),
-                'prop_overgrown_std': float(df['prop_overgrown'].std(ddof=1)) if len(df) > 1 else 0.0,
-                'prop_overflow_mean': float(df['prop_overflow'].mean()),
-                'prop_overflow_std': float(df['prop_overflow'].std(ddof=1)) if len(df) > 1 else 0.0,
-                'avg_diam_mean': float(df['avg_tussock_diameter'].mean()),
-                'avg_diam_std': float(df['avg_tussock_diameter'].std(ddof=1)) if len(df) > 1 else 0.0,
-            })
-
-    files = list(hypothesis_dir.rglob("final_population_results.csv"))
+    # Use the same robust search pattern as find_final_population_result_files
+    files = []
+    for p in sorted(hypothesis_dir.rglob("*.csv")):
+        name = p.name.lower()
+        if name.startswith("final_population_results"):
+            files.append(p)
+    
     if not files:
         return None
 

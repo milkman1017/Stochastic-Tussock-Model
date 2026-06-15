@@ -77,6 +77,11 @@ SCATTER_ALPHA = 0.5
 OUT_SELECTION = os.path.join(OUTDIR, "degree_scalarset_model_selection_sumcoding.csv")
 OUT_CPP_JSON = os.path.join(OUTDIR, "ipm_cpp_functions.json")
 
+# Added summary outputs for paper-style model-selection panels
+OUT_FUNC_ONLY_CSV = os.path.join(OUTDIR, "functional_form_only_best_scores.csv")
+OUT_ECOTYPE_ONLY_CSV = os.path.join(OUTDIR, "ecotype_effect_only_best_scores.csv")
+OUT_COMBINED_TOP10_CSV = os.path.join(OUTDIR, "combined_model_top10_scores.csv")
+
 # For consistent heatmap axes
 SCALARSET_ORDER = [
     "none",
@@ -180,6 +185,46 @@ def make_predict_df(xgrid, ecotype=None):
     if ecotype is not None:
         d["ecotype"] = ecotype
     return d
+
+
+# ----------------------------
+# Readable labels for summary figures
+# ----------------------------
+def nice_vital(v):
+    return {
+        "growth_mean": "Growth",
+        "survival": "Survival",
+        "fecundity": "Fecundity",
+    }.get(v, str(v))
+
+
+def degree_name(degree):
+    d = int(degree)
+    return {1: "linear", 2: "quadratic", 3: "cubic"}.get(d, "degree {}".format(d))
+
+
+def form_label(vital, xform, degree):
+    base = degree_name(degree)
+    xform = str(xform)
+    if xform == "log1p":
+        base = "log-size {}".format(base)
+    if vital in ["survival", "fecundity"]:
+        return "logit({})".format(base)
+    return base
+
+
+def scalar_label(s):
+    s = str(s)
+    if s == "none":
+        return "shared across ecotypes"
+    term_map = {
+        "offset": "ecotype intercept",
+        "slope": "ecotype slope",
+        "curvature": "ecotype curvature",
+    }
+    parts = s.split("+")
+    readable = [term_map.get(p, p) for p in parts]
+    return " + ".join(readable)
 
 
 # ----------------------------
@@ -321,6 +366,15 @@ def lr_test(llf_small, k_small, llf_big, k_big):
 # ----------------------------
 # Plotting helpers
 # ----------------------------
+def save_figure_multi(fig, stem, dpi=200, bbox_inches=None):
+    png = os.path.join(OUTDIR, stem + ".png")
+    svg = os.path.join(OUTDIR, stem + ".svg")
+    pdf = os.path.join(OUTDIR, stem + ".pdf")
+    fig.savefig(png, dpi=dpi, bbox_inches=bbox_inches)
+    fig.savefig(svg, bbox_inches=bbox_inches)
+    fig.savefig(pdf, bbox_inches=bbox_inches)
+    plt.close(fig)
+
 def make_ecotype_colors(ecotypes):
     cmap = plt.get_cmap("tab10")
     return dict((e, cmap(i % 10)) for i, e in enumerate(ecotypes))
@@ -342,12 +396,12 @@ def plot_top_models_curves(vital, ecotypes, fitted_models, top_models, df_points
 
     title_prefix, ylabel, ycol = _vital_plot_meta(vital)
 
-    plt.figure(figsize=(9.2, 6.6))
+    fig, ax = plt.subplots(figsize=(9.2, 6.6))
 
     # scatter
     for e in ecotypes:
         sub = df_points[df_points["ecotype"] == e]
-        plt.scatter(
+        ax.scatter(
             sub["x"].values,
             sub[ycol].values,
             s=SCATTER_S,
@@ -369,7 +423,7 @@ def plot_top_models_curves(vital, ecotypes, fitted_models, top_models, df_points
             yhat = res.predict(pred_df)
             alpha = 0.95 if j == 1 else 0.60
             lw = 2.3 if j == 1 else 1.5
-            plt.plot(xgrid, yhat, color=colors[e], alpha=alpha, linewidth=lw)
+            ax.plot(xgrid, yhat, color=colors[e], alpha=alpha, linewidth=lw)
 
         model_box.append(
             "{} ) xform={}, deg={}, {}  (AIC={:.2f}, w={:.2f}, dAIC_vs_full={:.2f})".format(
@@ -378,31 +432,29 @@ def plot_top_models_curves(vital, ecotypes, fitted_models, top_models, df_points
         )
 
     handles = [Line2D([0], [0], color=colors[e], lw=3) for e in ecotypes]
-    plt.legend(handles, ecotypes, title="Ecotype", fontsize=9, loc="upper left")
+    ax.legend(handles, ecotypes, title="Ecotype", fontsize=9, loc="upper left")
 
-    plt.xlabel("Area at n ({})".format(COL_X))
-    plt.ylabel(ylabel)
-    plt.title("{}: top {} models (xform × degree × scalar set)".format(title_prefix, TOPK_PLOT))
+    ax.set_xlabel("Area at n ({})".format(COL_X))
+    ax.set_ylabel(ylabel)
+    ax.set_title("{}: top {} models (xform × degree × scalar set)".format(title_prefix, TOPK_PLOT))
 
-    plt.gca().text(
+    ax.text(
         0.02, 0.02, "\n".join(model_box),
-        transform=plt.gca().transAxes,
+        transform=ax.transAxes,
         va="bottom", ha="left",
         fontsize=9,
         bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="0.7")
     )
 
-    plt.tight_layout()
-    out = os.path.join(OUTDIR, "best_model_curves_{}_deg_sweep.png".format(vital))
-    plt.savefig(out, dpi=200)
-    plt.close()
+    fig.tight_layout()
+    save_figure_multi(fig, "best_model_curves_{}_deg_sweep".format(vital), dpi=200)
 
 
 def plot_AIC_by_degree(vital, sel_vital):
-    plt.figure(figsize=(9.6, 6.6))
+    fig, ax = plt.subplots(figsize=(9.6, 6.6))
     for (xform, sset), sub in sel_vital.groupby(["xform", "scalar_set"]):
         sub2 = sub.sort_values("degree")
-        plt.plot(
+        ax.plot(
             sub2["degree"].values,
             sub2["AIC"].values,
             marker="o",
@@ -411,15 +463,14 @@ def plot_AIC_by_degree(vital, sel_vital):
             label="{}:{}".format(xform, sset)
         )
 
-    plt.xlabel("Polynomial degree")
-    plt.ylabel("AIC")
-    plt.title("{}: AIC by degree, scalar set, and functional form (Sum coding)".format(vital))
-    plt.legend(title="xform:scalar_set", fontsize=8, ncol=2)
-    plt.tight_layout()
+    ax.set_xlabel("Polynomial degree")
+    ax.set_ylabel("AIC")
+    ax.set_title("{}: AIC by degree, scalar set, and functional form (Sum coding)".format(vital))
+    ax.legend(title="xform:scalar_set", fontsize=8, ncol=2)
+    fig.tight_layout()
 
-    out = os.path.join(OUTDIR, "AIC_by_degree_{}.png".format(vital))
-    plt.savefig(out, dpi=200)
-    plt.close()
+    save_figure_multi(fig, "AIC_by_degree_{}".format(vital), dpi=200)
+
 
 def growth_noise_sigma_from_res(res):
     """
@@ -439,12 +490,12 @@ def plot_pooled_vs_best(vital, ecotypes, res_pooled, res_best, best_xform, best_
 
     title_prefix, ylabel, ycol = _vital_plot_meta(vital)
 
-    plt.figure(figsize=(9.2, 6.6))
+    fig, ax = plt.subplots(figsize=(9.2, 6.6))
 
     # scatter
     for e in ecotypes:
         sub = df_points[df_points["ecotype"] == e]
-        plt.scatter(
+        ax.scatter(
             sub["x"].values,
             sub[ycol].values,
             s=SCATTER_S,
@@ -453,44 +504,27 @@ def plot_pooled_vs_best(vital, ecotypes, res_pooled, res_best, best_xform, best_
             linewidths=0
         )
 
-    # pooled curve
+    # pooled curve (drawn but not included in legend)
     pooled_df = make_predict_df(xgrid, None)
     yhat_pooled = res_pooled.predict(pooled_df)
-    plt.plot(xgrid, yhat_pooled, color="black", linewidth=3.0, alpha=0.95)
+    ax.plot(xgrid, yhat_pooled, color="black", linewidth=3.0, alpha=0.95, linestyle="--")
 
     # best ecotype curves
     for e in ecotypes:
         pred_df = make_predict_df(xgrid, e)
         yhat = res_best.predict(pred_df)
-        plt.plot(xgrid, yhat, color=colors[e], linewidth=2.2, alpha=0.95)
+        ax.plot(xgrid, yhat, color=colors[e], linewidth=2.2, alpha=0.95)
 
-    handles = [Line2D([0], [0], color="black", lw=3)]
-    labels = ["pooled (no ecotype terms)"]
-    for e in ecotypes:
-        handles.append(Line2D([0], [0], color=colors[e], lw=3))
-        labels.append(e)
+    # Only ecotype legend
+    handles = [Line2D([0], [0], color=colors[e], lw=3) for e in ecotypes]
+    ax.legend(handles, ecotypes, title="Ecotype", fontsize=9, loc="upper left")
 
-    plt.legend(handles, labels, title="Curve", fontsize=9, loc="upper left")
+    ax.set_xlabel("Area at n ({})".format(COL_X))
+    ax.set_ylabel(ylabel)
+    ax.set_title("{}: pooled curve vs best ecotype curves".format(title_prefix))
 
-    plt.xlabel("Area at n ({})".format(COL_X))
-    plt.ylabel(ylabel)
-    plt.title("{}: pooled curve vs best ecotype curves".format(title_prefix))
-
-    plt.gca().text(
-        0.02, 0.02,
-        "Best model: xform={}, degree={}, scalar_set={}\nPooled comparison: xform={}, degree={}, scalar_set=none".format(
-            best_xform, best_degree, best_scalar_set, best_xform, best_degree
-        ),
-        transform=plt.gca().transAxes,
-        va="bottom", ha="left",
-        fontsize=9,
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85, edgecolor="0.7")
-    )
-
-    plt.tight_layout()
-    out = os.path.join(OUTDIR, "pooled_vs_best_{}.png".format(vital))
-    plt.savefig(out, dpi=200)
-    plt.close()
+    fig.tight_layout()
+    save_figure_multi(fig, "pooled_vs_best_{}".format(vital), dpi=200)
 
 
 def plot_model_space_heatmap(vital, sel_vital):
@@ -527,9 +561,7 @@ def plot_model_space_heatmap(vital, sel_vital):
     fig.suptitle("Model-space support: deltaAIC grid (xform × degree × scalar set)", y=1.02)
     fig.tight_layout()
 
-    out = os.path.join(OUTDIR, "model_space_heatmap_{}.png".format(vital))
-    plt.savefig(out, dpi=200, bbox_inches="tight")
-    plt.close()
+    save_figure_multi(fig, "model_space_heatmap_{}".format(vital), dpi=200, bbox_inches="tight")
 
 
 def plot_top_model_weights(vital, sel_vital, topn=12):
@@ -537,16 +569,157 @@ def plot_top_model_weights(vital, sel_vital, topn=12):
     labels = ["{}|d{}|{}".format(r.xform, int(r.degree), r.scalar_set) for _, r in sub.iterrows()]
     weights = sub["AIC_weight"].values
 
-    plt.figure(figsize=(10.2, 4.6))
-    plt.bar(np.arange(len(weights)), weights)
-    plt.xticks(np.arange(len(weights)), labels, rotation=45, ha="right", fontsize=8)
-    plt.ylabel("AIC weight")
-    plt.title("{}: top {} models by AIC weight".format(vital, topn))
-    plt.tight_layout()
+    fig, ax = plt.subplots(figsize=(10.2, 4.6))
+    ax.bar(np.arange(len(weights)), weights)
+    ax.set_xticks(np.arange(len(weights)))
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("AIC weight")
+    ax.set_title("{}: top {} models by AIC weight".format(vital, topn))
+    fig.tight_layout()
 
-    out = os.path.join(OUTDIR, "top_model_weights_{}.png".format(vital))
-    plt.savefig(out, dpi=200)
-    plt.close()
+    save_figure_multi(fig, "top_model_weights_{}".format(vital), dpi=200)
+
+
+# ----------------------------
+# Paper-style summary figure panels
+# ----------------------------
+def plot_functional_form_only_profiles(sel):
+    func_rows = []
+    for (vital, ff_label), g in sel.groupby(["vital_rate", "functional_form_label"], dropna=False):
+        best = g.sort_values("AIC").iloc[0]
+        func_rows.append({
+            "vital_rate": vital,
+            "functional_form_label": ff_label,
+            "best_AIC": float(best["AIC"]),
+            "best_deltaAIC": float(best["deltaAIC"]),
+            "best_AIC_weight": float(best["AIC_weight"]),
+            "best_ecotype_terms_label": str(best["ecotype_terms_label"]),
+            "best_scalar_set": str(best["scalar_set"]),
+            "best_xform": str(best["xform"]),
+            "best_degree": int(best["degree"]),
+        })
+    func_df = pd.DataFrame(func_rows)
+    func_df.to_csv(OUT_FUNC_ONLY_CSV, index=False)
+
+    vitals_present = [v for v in ["growth_mean", "survival", "fecundity"] if v in set(func_df["vital_rate"])]
+    fig, axes = plt.subplots(1, len(vitals_present), figsize=(6.2 * len(vitals_present), 5.8), sharex=True)
+    if len(vitals_present) == 1:
+        axes = [axes]
+
+    for ax, vital in zip(axes, vitals_present):
+        sub = func_df[func_df["vital_rate"] == vital].sort_values("best_AIC").copy()
+        sub = sub.sort_values("best_AIC", ascending=False).reset_index(drop=True)
+        y = np.arange(len(sub))
+
+        ax.barh(y, sub["best_AIC_weight"], alpha=0.75)
+        ax.scatter(sub["best_AIC_weight"], y, s=55, marker="D", zorder=3)
+        ax.set_yticks(y)
+        ax.set_yticklabels(sub["functional_form_label"], fontsize=9)
+        ax.set_xlabel("AIC weight of best model using this functional form")
+        ax.set_title(nice_vital(vital))
+        ax.grid(True, axis="x", alpha=0.25)
+
+        for yi, w, d, et in zip(y, sub["best_AIC_weight"], sub["best_deltaAIC"], sub["best_ecotype_terms_label"]):
+            ax.text(float(w) + 0.01, yi, "ΔAIC={:.1f}\n{}".format(float(d), et), va="center", fontsize=7)
+
+    axes[0].set_ylabel("Functional form")
+    fig.suptitle("Functional form only: best-supported model for each form", y=1.02)
+    fig.tight_layout()
+    save_figure_multi(fig, "functional_form_only_score_profiles", dpi=300, bbox_inches="tight")
+
+
+def plot_ecotype_effect_only_profiles(sel):
+    eco_rows = []
+    for (vital, eco_label), g in sel.groupby(["vital_rate", "ecotype_terms_label"], dropna=False):
+        best = g.sort_values("AIC").iloc[0]
+        eco_rows.append({
+            "vital_rate": vital,
+            "ecotype_terms_label": eco_label,
+            "best_AIC": float(best["AIC"]),
+            "best_deltaAIC": float(best["deltaAIC"]),
+            "best_AIC_weight": float(best["AIC_weight"]),
+            "best_functional_form_label": str(best["functional_form_label"]),
+            "best_xform": str(best["xform"]),
+            "best_degree": int(best["degree"]),
+            "best_scalar_set": str(best["scalar_set"]),
+        })
+    eco_df = pd.DataFrame(eco_rows)
+    eco_df.to_csv(OUT_ECOTYPE_ONLY_CSV, index=False)
+
+    vitals_present = [v for v in ["growth_mean", "survival", "fecundity"] if v in set(eco_df["vital_rate"])]
+    fig, axes = plt.subplots(1, len(vitals_present), figsize=(6.4 * len(vitals_present), 7.0), sharex=True)
+    if len(vitals_present) == 1:
+        axes = [axes]
+
+    for ax, vital in zip(axes, vitals_present):
+        sub = eco_df[eco_df["vital_rate"] == vital].sort_values("best_AIC").copy()
+        sub = sub.sort_values("best_AIC", ascending=False).reset_index(drop=True)
+        y = np.arange(len(sub))
+
+        ax.barh(y, sub["best_AIC_weight"], alpha=0.75)
+        ax.scatter(sub["best_AIC_weight"], y, s=55, marker="D", zorder=3)
+        ax.set_yticks(y)
+        ax.set_yticklabels(sub["ecotype_terms_label"], fontsize=8)
+        ax.set_xlabel("AIC weight of best model using this ecotype-effect set")
+        ax.set_title(nice_vital(vital))
+        ax.grid(True, axis="x", alpha=0.25)
+
+        for yi, w, d, ff in zip(y, sub["best_AIC_weight"], sub["best_deltaAIC"], sub["best_functional_form_label"]):
+            ax.text(float(w) + 0.01, yi, "ΔAIC={:.1f}\n{}".format(float(d), ff), va="center", fontsize=7)
+
+    axes[0].set_ylabel("Ecotype-effect set")
+    fig.suptitle("Ecotype effects only: best-supported model for each ecotype-effect set", y=1.02)
+    fig.tight_layout()
+    save_figure_multi(fig, "ecotype_effect_only_score_profiles", dpi=300, bbox_inches="tight")
+
+
+def plot_combined_model_top10_profiles(sel):
+    combined_rows = []
+    vitals_present = [v for v in ["growth_mean", "survival", "fecundity"] if v in set(sel["vital_rate"])]
+    fig, axes = plt.subplots(1, len(vitals_present), figsize=(6.2 * len(vitals_present), 7.4), sharex=True)
+    if len(vitals_present) == 1:
+        axes = [axes]
+
+    for ax, vital in zip(axes, vitals_present):
+        sub_all = sel[sel["vital_rate"] == vital].copy()
+        sub = sub_all.sort_values("AIC").head(10).copy()
+        sub = sub.sort_values("AIC", ascending=False).reset_index(drop=True)
+
+        y = np.arange(len(sub))
+        ax.barh(y, sub["AIC_weight"], alpha=0.75)
+        ax.scatter(sub["AIC_weight"], y, s=55, marker="D", zorder=3)
+
+        labels = []
+        for _, r in sub.iterrows():
+            rank = int((sub_all["AIC"] < r["AIC"]).sum() + 1)
+            labels.append("#{} {}\n{}".format(rank, r["functional_form_label"], r["ecotype_terms_label"]))
+            combined_rows.append({
+                "vital_rate": vital,
+                "rank_within_vital": rank,
+                "functional_form_label": r["functional_form_label"],
+                "ecotype_terms_label": r["ecotype_terms_label"],
+                "AIC": float(r["AIC"]),
+                "deltaAIC": float(r["deltaAIC"]),
+                "AIC_weight": float(r["AIC_weight"]),
+                "xform": r["xform"],
+                "degree": int(r["degree"]),
+                "scalar_set": r["scalar_set"],
+            })
+
+        ax.set_yticks(y)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.set_xlabel("AIC weight (higher is better)")
+        ax.set_title(nice_vital(vital))
+        ax.grid(True, axis="x", alpha=0.25)
+
+        for yi, w, d in zip(y, sub["AIC_weight"], sub["deltaAIC"]):
+            ax.text(float(w) + 0.01, yi, "ΔAIC={:.1f}".format(float(d)), va="center", fontsize=7)
+
+    fig.suptitle("Combined models: top 10 supported models", y=1.02)
+    fig.tight_layout()
+    save_figure_multi(fig, "combined_model_top10_score_profiles", dpi=300, bbox_inches="tight")
+
+    pd.DataFrame(combined_rows).to_csv(OUT_COMBINED_TOP10_CSV, index=False)
 
 
 # ----------------------------
@@ -807,7 +980,11 @@ def run_sweep(df):
 
         plot_pooled_vs_best(vital, ecotypes, res_pooled, res_best, best_xform, best_degree, best_scalar_set, df_points)
 
-    sel = pd.DataFrame(rows).sort_values(["vital_rate", "AIC", "xform", "degree", "scalar_set"])
+    sel = pd.DataFrame(rows).sort_values(["vital_rate", "AIC", "xform", "degree", "scalar_set"]).copy()
+    sel["functional_form_label"] = [
+        form_label(v, x, d) for v, x, d in zip(sel["vital_rate"], sel["xform"], sel["degree"])
+    ]
+    sel["ecotype_terms_label"] = sel["scalar_set"].map(scalar_label)
     sel.to_csv(OUT_SELECTION, index=False)
     return sel
 
@@ -869,12 +1046,22 @@ def main():
 
     print("\nSaved to:", OUTDIR)
     print(" - degree_scalarset_model_selection_sumcoding.csv")
+    print(" - functional_form_only_best_scores.csv")
+    print(" - ecotype_effect_only_best_scores.csv")
+    print(" - combined_model_top10_scores.csv")
+    print(" - functional_form_only_score_profiles.(png/svg/pdf)")
+    print(" - ecotype_effect_only_score_profiles.(png/svg/pdf)")
+    print(" - combined_model_top10_score_profiles.(png/svg/pdf)")
     for vital in ["growth_mean", "survival", "fecundity"]:
-        print(" - best_model_curves_{}_deg_sweep.png".format(vital))
-        print(" - AIC_by_degree_{}.png".format(vital))
-        print(" - pooled_vs_best_{}.png".format(vital))
-        print(" - model_space_heatmap_{}.png".format(vital))
-        print(" - top_model_weights_{}.png".format(vital))
+        print(" - best_model_curves_{}_deg_sweep.(png/svg/pdf)".format(vital))
+        print(" - AIC_by_degree_{}.(png/svg/pdf)".format(vital))
+        print(" - pooled_vs_best_{}.(png/svg/pdf)".format(vital))
+        print(" - model_space_heatmap_{}.(png/svg/pdf)".format(vital))
+        print(" - top_model_weights_{}.(png/svg/pdf)".format(vital))
+
+    plot_functional_form_only_profiles(sel)
+    plot_ecotype_effect_only_profiles(sel)
+    plot_combined_model_top10_profiles(sel)
 
     export_json(df, sel)
 
