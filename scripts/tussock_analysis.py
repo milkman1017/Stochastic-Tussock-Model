@@ -1,894 +1,1331 @@
+#!/usr/bin/env python3
+
+"""
+Streaming deep tussock diagnostics.
+
+Scans a hypothesis directory for model outputs like:
+
+    <hypothesis_dir>/<question>/<site>/set_###/final_sims/
+
+or more generally:
+
+    <hypothesis_dir>/.../set_###/final_sims/
+
+For each set, it tries to read:
+
+    final_sims/summaries/summary_*.csv
+    final_sims/yearly_summaries/yearly_summary_*.csv
+    full per-tiller simulation CSVs inside final_sims/
+
+It writes/appends:
+
+Overall hypothesis-level outputs:
+
+    <hypothesis_dir>/compiled_deep_metrics_per_sim.csv
+    <hypothesis_dir>/compiled_deep_metrics_per_set.csv
+    <hypothesis_dir>/compiled_deep_metrics_per_question_summary.csv
+    <hypothesis_dir>/compiled_deep_metrics_progress_log.csv
+    <hypothesis_dir>/compiled_deep_metrics_error_log.txt
+
+Per-question outputs:
+
+    <hypothesis_dir>/<question>/deep_metrics_per_sim.csv
+    <hypothesis_dir>/<question>/deep_metrics_per_set.csv
+    <hypothesis_dir>/<question>/deep_metrics_per_question_summary.csv
+    <hypothesis_dir>/<question>/deep_metrics_progress_log.csv
+    <hypothesis_dir>/<question>/deep_metrics_error_log.txt
+
+Important:
+    append_df_csv() is schema-safe. If later sets produce extra metric columns,
+    it unions old and new columns and rewrites the CSV rather than raw-appending
+    malformed rows.
+"""
+
 import argparse
-from dataclasses import dataclass
+import math
+import re
+import traceback
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
-# ============================================================
-# Globals / constants (match your C++ model)
-# ============================================================
+# -----------------------------
+# General helpers
+# -----------------------------
 
-SLA_CM2_PER_G = 98.0
-ROOT_TISSUE_DENSITY_G_CM3 = 0.21
-
-ROOT_LENGTH_CM = 50.0
-MM_TO_CM = 0.1
-
-LEAF_NECRO_REMAIN_FRAC = 0.75  # dead_leaf_area = 0.75*dead_leaf_area + prev_leaf_area each year
-G_TO_KG = 1e-3
-
-
-def per_root_cone_volume_cm3(diam_mm: float) -> float:
-    """Matches Tiller::perRootConeVolumeCm3 in the C++ model."""
-    if np.isnan(diam_mm) or diam_mm <= 0:
-        return 0.0
-    r_cm = (diam_mm * MM_TO_CM) * 0.5
-    return (1.0 / 3.0) * np.pi * (r_cm ** 2) * ROOT_LENGTH_CM
-
-
-def live_root_volume_cm3(num_roots: float, diam_mm: float) -> float:
-    if np.isnan(num_roots) or np.isnan(diam_mm):
-        return float("nan")
-    if num_roots <= 0:
-        return 0.0
-    return float(num_roots) * per_root_cone_volume_cm3(float(diam_mm))
-
-
-# ============================================================
-# Config / CLI
-# ============================================================
-
-@dataclass(frozen=True)
-class Config:
-    input_dir: Path
-    output_dir: Path
-    n_timepoints: int
-    seed: int
-    pattern: str
-    use_only_alive_for_radius: bool
-    radius_stat: str  # "max" or "p95"
-
-
-def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="Sample timesteps from sim CSVs and generate plots (PNGs only).")
-    p.add_argument("-i", "--input-dir", required=True, type=Path)
-    p.add_argument("-o", "--output-dir", required=True, type=Path)
-    p.add_argument("--n-timepoints", type=int, default=20)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--pattern", type=str, default="*.csv")
-    p.add_argument("--include-dead", action="store_true",
-                   help="If set, compute tussock radius using all tillers, not just alive.")
-    p.add_argument("--radius-stat", choices=["max", "p95"], default="max")
-
-    a = p.parse_args()
-    if not a.input_dir.exists() or not a.input_dir.is_dir():
-        raise NotADirectoryError(f"Input directory not found or not a directory: {a.input_dir}")
-    a.output_dir.mkdir(parents=True, exist_ok=True)
-
-    return Config(
-        input_dir=a.input_dir,
-        output_dir=a.output_dir,
-        n_timepoints=a.n_timepoints,
-        seed=a.seed,
-        pattern=a.pattern,
-        use_only_alive_for_radius=not a.include_dead,
-        radius_stat=a.radius_stat,
-    )
-
-
-# ============================================================
-# IO / Sampling
-# ============================================================
-
-def list_sim_csvs(input_dir: Path, pattern: str) -> list[Path]:
-    files = sorted(input_dir.glob(pattern))
-    if not files:
-        raise FileNotFoundError(f"No files matched pattern '{pattern}' in {input_dir}")
-    return files
-
-
-def read_sim_csv(path: Path) -> pd.DataFrame:
-    return pd.read_csv(path)
-
-
-def sample_timesteps(timesteps: np.ndarray, n: int, rng: np.random.Generator) -> np.ndarray:
-    timesteps = np.array(timesteps, dtype=int)
-    timesteps = np.unique(timesteps)
-    if timesteps.size == 0:
-        return np.array([], dtype=int)
-    k = min(n, timesteps.size)
-    sampled = rng.choice(timesteps, size=k, replace=False)
-    sampled.sort()
-    return sampled
-
-
-# ============================================================
-# Radius (coords are cm)
-# ============================================================
-
-def radial_distance_xy_cm(sub: pd.DataFrame) -> np.ndarray:
-    if "X" in sub.columns and "Y" in sub.columns:
-        x = sub["X"].to_numpy(dtype=float)
-        y = sub["Y"].to_numpy(dtype=float)
-        return np.sqrt(x * x + y * y)
-    if "X" in sub.columns and "Z" in sub.columns:
-        x = sub["X"].to_numpy(dtype=float)
-        z = sub["Z"].to_numpy(dtype=float)
-        return np.sqrt(x * x + z * z)
-    raise ValueError("Missing coordinate columns: need (X,Y) or (X,Z).")
-
-
-def summarize_radius_cm(r_cm: np.ndarray, stat: str) -> float:
-    if r_cm.size == 0:
-        return float("nan")
-    if stat == "max":
-        return float(np.nanmax(r_cm))
-    if stat == "p95":
-        return float(np.nanpercentile(r_cm, 95))
-    raise ValueError(f"Unknown stat: {stat}")
-
-
-# ============================================================
-# Derived columns (in-memory only)
-# ============================================================
-
-def add_live_root_mass_from_cone(df: pd.DataFrame) -> pd.DataFrame:
-    """Add RootVolLive_cm3 and RootMassLive_g using the cone geometry from your C++ model."""
-    df = df.copy()
-    if {"NumRoots", "RootDiamMM"}.issubset(df.columns):
-        vols = [
-            live_root_volume_cm3(nr, dmm)
-            for nr, dmm in zip(df["NumRoots"].astype(float), df["RootDiamMM"].astype(float))
-        ]
-        df["RootVolLive_cm3"] = np.array(vols, dtype=float)
-        df["RootMassLive_g"] = df["RootVolLive_cm3"] * ROOT_TISSUE_DENSITY_G_CM3
-    else:
-        df["RootVolLive_cm3"] = np.nan
-        df["RootMassLive_g"] = np.nan
+def to_numeric_inplace(
+    df,
+    skip_cols=("_source_file", "full_file", "question", "site", "set", "set_dir"),
+):
+    for c in df.columns:
+        if c not in skip_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
 
-# ============================================================
-# Timestep summary + productivity + decomposition metrics
-# ============================================================
+def cv(x):
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
 
-def compute_packing_metrics_by_timestep(
-    df: pd.DataFrame,
-    use_only_alive_for_radius: bool,
-    radius_stat: str,
-) -> pd.DataFrame:
+    if len(x) == 0:
+        return np.nan
+
+    mu = np.mean(x)
+
+    if not np.isfinite(mu) or mu == 0:
+        return np.nan
+
+    return float(np.std(x) / mu)
+
+
+def safe_slope(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    if len(x) < 2:
+        return np.nan
+
+    if np.nanmax(x) == np.nanmin(x):
+        return np.nan
+
+    return float(np.polyfit(x, y, 1)[0])
+
+
+def wasserstein_1d(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    x = x[np.isfinite(x)]
+    y = y[np.isfinite(y)]
+
+    if len(x) == 0 or len(y) == 0:
+        return np.nan
+
+    x = np.sort(x)
+    y = np.sort(y)
+
+    i = 0
+    j = 0
+    n = len(x)
+    m = len(y)
+
+    cdf_x = 0.0
+    cdf_y = 0.0
+    prev = min(x[0], y[0])
+    w = 0.0
+
+    while i < n or j < m:
+        nx = x[i] if i < n else np.inf
+        ny = y[j] if j < m else np.inf
+        nxt = min(nx, ny)
+
+        w += abs(cdf_x - cdf_y) * (nxt - prev)
+
+        if nx == nxt:
+            val = nxt
+            while i < n and x[i] == val:
+                i += 1
+            cdf_x = i / n
+
+        if ny == nxt:
+            val = nxt
+            while j < m and y[j] == val:
+                j += 1
+            cdf_y = j / m
+
+        prev = nxt
+
+    return float(w)
+
+
+def nearest_neighbor_mean(x, y, max_n=1000):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    pts = np.column_stack([x[mask], y[mask]])
+
+    n = len(pts)
+
+    if n < 2:
+        return np.nan
+
+    if n > max_n:
+        rng = np.random.default_rng(1)
+        keep = rng.choice(n, size=max_n, replace=False)
+        pts = pts[keep]
+        n = len(pts)
+
+    dmins = []
+
+    for i in range(n):
+        d = np.sqrt(np.sum((pts - pts[i]) ** 2, axis=1))
+        d[i] = np.inf
+        dmins.append(np.min(d))
+
+    return float(np.mean(dmins))
+
+
+# -----------------------------
+# Schema-safe CSV writing
+# -----------------------------
+
+def append_df_csv(df, path):
     """
-    Computes (per timestep):
-      - tussock_radius_cm (from coords)
-      - alive_tillers
-      - packing_density_tillers_per_cm2 = N_alive / (pi*R^2)
-      - packing_fraction_area = sum(pi*r_i^2) / (pi*R^2)  (uses per-tiller Radius)
-      - mean_leaf_area_alive_cm2
-      - mean_tiller_radius_alive_cm
-      - newborn_alive_tillers (proxy = Status==1 & Age==1)
+    Append a dataframe to CSV while allowing columns to differ across appends.
+
+    This fixes the ParserError where one set writes 126 columns and the next
+    set writes 186 columns. Instead of raw-appending, this function reads the
+    existing CSV, takes the union of old and new columns, aligns both tables,
+    and rewrites the file.
+
+    This is slower than raw append, but it is much safer for exploratory
+    model diagnostics where available metrics can differ among sets.
     """
-    if "TimeStep" not in df.columns or "Status" not in df.columns:
-        raise ValueError("Missing required columns for packing metrics: TimeStep, Status")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    out_rows = []
-    for t, sub in df.groupby("TimeStep"):
-        t_int = int(t)
+    if df is None or df.empty:
+        return
 
-        sub_alive = sub[sub["Status"] == 1]
-        n_alive = int(sub_alive.shape[0])
+    df = df.copy()
 
-        # newborn proxy: Age == 1 among alive
-        if "Age" in sub_alive.columns:
-            newborn = int((sub_alive["Age"].astype(float) == 1.0).sum())
-        else:
-            newborn = np.nan
+    if not path.exists():
+        df.to_csv(path, index=False)
+        return
 
-        # tussock radius from coordinates
-        sub_for_radius = sub_alive if use_only_alive_for_radius else sub
-        r_cm = radial_distance_xy_cm(sub_for_radius) if sub_for_radius.shape[0] > 0 else np.array([], dtype=float)
-        R = summarize_radius_cm(r_cm, radius_stat) if r_cm.size > 0 else float("nan")
+    try:
+        old = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        df.to_csv(path, index=False)
+        return
+    except pd.errors.ParserError as e:
+        raise RuntimeError(
+            f"Existing CSV is malformed and cannot be safely appended: {path}\n"
+            f"Delete this file or rerun with --fresh.\n"
+            f"Original pandas error: {e}"
+        )
 
-        area = np.pi * (R ** 2) if (np.isfinite(R) and R > 0) else float("nan")
+    all_cols = list(old.columns)
 
-        # count density
-        if np.isfinite(area) and area > 0:
-            count_density = n_alive / area
-        else:
-            count_density = float("nan")
+    for c in df.columns:
+        if c not in all_cols:
+            all_cols.append(c)
 
-        # packing fraction by area of circles
-        if "Radius" in sub_alive.columns and np.isfinite(area) and area > 0:
-            ri = sub_alive["Radius"].astype(float).to_numpy()
-            ri = ri[np.isfinite(ri) & (ri > 0)]
-            sum_area = float(np.sum(np.pi * ri * ri)) if ri.size > 0 else 0.0
-            packing_frac = sum_area / area
-            mean_ri = float(np.mean(ri)) if ri.size > 0 else float("nan")
-        else:
-            packing_frac = float("nan")
-            mean_ri = float("nan")
+    old = old.reindex(columns=all_cols)
+    df = df.reindex(columns=all_cols)
 
-        # mean leaf area among alive
-        if "LeafArea" in sub_alive.columns:
-            la = sub_alive["LeafArea"].astype(float).to_numpy()
-            la = la[np.isfinite(la)]
-            mean_la = float(np.mean(la)) if la.size > 0 else float("nan")
-        else:
-            mean_la = float("nan")
-
-        out_rows.append({
-            "TimeStep": t_int,
-            "tussock_radius_cm": R,
-            "alive_tillers": float(n_alive),
-            "newborn_alive_tillers": float(newborn) if np.isfinite(newborn) else np.nan,
-            "packing_density_tillers_per_cm2": float(count_density),
-            "packing_fraction_area": float(packing_frac),
-            "mean_leaf_area_alive_cm2": float(mean_la),
-            "mean_tiller_radius_alive_cm": float(mean_ri),
-        })
-
-    return pd.DataFrame(out_rows).sort_values("TimeStep")
+    out = pd.concat([old, df], ignore_index=True)
+    out.to_csv(path, index=False)
 
 
-def build_timestep_summary(df: pd.DataFrame, use_only_alive_for_radius: bool, radius_stat: str) -> pd.DataFrame:
-    required = {"TimeStep", "Status", "RootNecroMass", "RootNecroMassCum", "DeadLeafMass", "LeafArea"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing required columns: {sorted(missing)}")
+def append_row_csv(row, path):
+    append_df_csv(pd.DataFrame([row]), path)
 
-    # base metrics that were already in your analysis
-    alive_counts = df.groupby("TimeStep")["Status"].apply(lambda s: int((s == 1).sum())).astype(float)
 
-    radii = {}
-    for t, sub in df.groupby("TimeStep"):
-        sub_for_radius = sub[sub["Status"] == 1] if use_only_alive_for_radius else sub
-        r_cm = radial_distance_xy_cm(sub_for_radius)
-        radii[int(t)] = summarize_radius_cm(r_cm, radius_stat)
+# -----------------------------
+# Directory discovery
+# -----------------------------
 
-    total_root_necro_g = df.groupby("TimeStep")["RootNecroMass"].sum().astype(float)
-    total_root_necro_cum_g = df.groupby("TimeStep")["RootNecroMassCum"].sum().astype(float)
-    total_dead_leaf_mass_g = df.groupby("TimeStep")["DeadLeafMass"].sum().astype(float)
+def find_set_dirs(hypothesis_dir):
+    hypothesis_dir = Path(hypothesis_dir).resolve()
+    pattern = re.compile(r"^set_\d+$")
 
-    # Total live leaf mass (g): sum LeafArea then divide by SLA
-    total_leaf_mass_g = df.groupby("TimeStep")["LeafArea"].sum().astype(float) / SLA_CM2_PER_G
+    set_dirs = []
 
-    if "RootMassLive_g" in df.columns:
-        total_live_root_mass_g = df.groupby("TimeStep")["RootMassLive_g"].sum().astype(float)
-    else:
-        total_live_root_mass_g = pd.Series(index=alive_counts.index, data=np.nan, dtype=float)
+    for p in hypothesis_dir.rglob("set_*"):
+        if p.is_dir() and pattern.match(p.name) and (p / "final_sims").exists():
+            set_dirs.append(p)
 
-    out = pd.DataFrame({
-        "TimeStep": alive_counts.index.astype(int),
-        "alive_tillers": alive_counts.values,
-        "tussock_radius_cm": pd.Series(radii).reindex(alive_counts.index).values,
-        "total_root_necromass_g": total_root_necro_g.reindex(alive_counts.index).values,
-        "total_root_necromass_kg": (total_root_necro_g.reindex(alive_counts.index).values * G_TO_KG),
-        "total_root_necromasscum_g": total_root_necro_cum_g.reindex(alive_counts.index).values,
-        "total_dead_leaf_mass_g": total_dead_leaf_mass_g.reindex(alive_counts.index).values,
-        "total_leaf_mass_g": total_leaf_mass_g.reindex(alive_counts.index).values,
-        "total_live_root_mass_g": total_live_root_mass_g.reindex(alive_counts.index).values,
-    }).sort_values("TimeStep")
+    return sorted(set_dirs)
 
-    out["live_root_mass_per_tiller_g"] = out["total_live_root_mass_g"] / out["alive_tillers"].replace(0, np.nan)
 
-    # merge in packing metrics (count density + packing fraction + newborn proxy, etc.)
-    pm = compute_packing_metrics_by_timestep(df, use_only_alive_for_radius, radius_stat)
-    out = out.merge(pm, on=["TimeStep", "tussock_radius_cm", "alive_tillers"], how="left")
+def question_from_set_dir(hypothesis_dir, set_dir):
+    hypothesis_dir = Path(hypothesis_dir).resolve()
+    set_dir = Path(set_dir).resolve()
+
+    rel = set_dir.relative_to(hypothesis_dir)
+    parts = rel.parts
+
+    if len(parts) >= 2:
+        return parts[0]
+
+    return "UNKNOWN"
+
+
+def site_from_set_dir(hypothesis_dir, set_dir):
+    hypothesis_dir = Path(hypothesis_dir).resolve()
+    set_dir = Path(set_dir).resolve()
+
+    rel = set_dir.relative_to(hypothesis_dir)
+    parts = rel.parts
+
+    # Typical:
+    #   hypothesis_dir / question / site / set_001
+    if len(parts) >= 3:
+        return parts[-2]
+
+    return "UNKNOWN"
+
+
+# -----------------------------
+# CSV readers
+# -----------------------------
+
+def read_many_csvs(paths):
+    dfs = []
+
+    for p in paths:
+        try:
+            df = pd.read_csv(p)
+            df["_source_file"] = str(p)
+            dfs.append(df)
+        except Exception as e:
+            print(f"[WARN] Could not read {p}: {e}", flush=True)
+
+    if not dfs:
+        return pd.DataFrame()
+
+    return pd.concat(dfs, ignore_index=True)
+
+
+def read_summary_tables(final_sims_dir):
+    final_sims_dir = Path(final_sims_dir)
+
+    summary_paths = sorted((final_sims_dir / "summaries").glob("summary_*.csv"))
+    yearly_paths = sorted((final_sims_dir / "yearly_summaries").glob("yearly_summary_*.csv"))
+
+    summaries = read_many_csvs(summary_paths)
+    yearly = read_many_csvs(yearly_paths)
+
+    return summaries, yearly
+
+
+def find_full_tiller_files(final_sims_dir):
+    final_sims_dir = Path(final_sims_dir)
+    all_csvs = sorted(final_sims_dir.rglob("*.csv"))
+
+    out = []
+
+    for p in all_csvs:
+        parts = set(p.parts)
+        name = p.name.lower()
+
+        if "summaries" in parts:
+            continue
+
+        if "yearly_summaries" in parts:
+            continue
+
+        if "summary" in name:
+            continue
+
+        if "population_results" in name:
+            continue
+
+        if "optimization_results" in name:
+            continue
+
+        out.append(p)
 
     return out
 
 
-def add_root_productivity(summary: pd.DataFrame) -> pd.DataFrame:
-    """
-    Turnover-aware productivity proxy (g per tiller per year):
-      RootProd(t) =
-          max(0, LiveRoot_per_tiller(t) - LiveRoot_per_tiller(t-1))
-          + NecromassProduced_per_tiller(t)
-    with NecromassProduced(t) = diff(total RootNecroMassCum).
-    """
-    s = summary.copy()
-    necro_prod_g = s["total_root_necromasscum_g"].diff().clip(lower=0).fillna(0.0)
-    necro_prod_per_tiller_g = necro_prod_g / s["alive_tillers"].replace(0, np.nan)
-    d_live_pos = s["live_root_mass_per_tiller_g"].diff().clip(lower=0)
-    s["root_productivity_g_per_tiller_per_yr"] = d_live_pos + necro_prod_per_tiller_g
-    return s
+# -----------------------------
+# Final summary metrics
+# -----------------------------
+
+def metrics_from_summaries(summaries):
+    if summaries.empty:
+        return pd.DataFrame()
+
+    df = summaries.copy()
+    df = to_numeric_inplace(df)
+
+    if "sim_id" not in df.columns:
+        return pd.DataFrame()
+
+    rows = []
+
+    for sim_id, g in df.groupby("sim_id"):
+        r = g.iloc[-1]
+
+        row = {
+            "sim_id": int(sim_id),
+        }
+
+        for c in [
+            "final_t",
+            "final_diameter",
+            "alive_y",
+            "rmax_y",
+            "overflow_t",
+            "extinct_t",
+            "missing_year",
+            "alive_final",
+            "LeafArea",
+        ]:
+            if c in r.index:
+                row[c] = r[c]
+
+        if "alive_final" in row:
+            row["is_alive_final"] = int(row["alive_final"] > 0)
+            row["is_extinct_final"] = int(row["alive_final"] <= 0)
+
+        if "overflow_t" in row:
+            row["has_overflow"] = int(row["overflow_t"] >= 0)
+
+        if "extinct_t" in row:
+            row["went_extinct_before_end"] = int(row["extinct_t"] >= 0)
+
+        if "missing_year" in row:
+            row["has_missing_year"] = int(row["missing_year"] == 1)
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
-def add_decomposition_metrics_optionA(summary: pd.DataFrame) -> pd.DataFrame:
-    """
-    Option A: match the paper's "rate constant" form (yr^-1) by computing first-order k
-    from pool balance for BOTH:
-      - root necromass pool (M, g): uses RootNecroMassCum diff as input
-      - leaf necromass pool (D, g): uses last year's live leaf mass as input (litterfall proxy)
+# -----------------------------
+# Yearly trajectory metrics
+# -----------------------------
 
-    ROOT:
-      add_root(t) = diff(M_cum) (>=0)
-      loss_root(t) = M(t-1) + add_root(t) - M(t)
-      k_root(t) = loss_root(t) / M(t-1)
+def metrics_from_yearly(yearly):
+    if yearly.empty:
+        return pd.DataFrame()
 
-    LEAF NECROMASS:
-      add_leaf(t) ≈ total_leaf_mass_g(t-1)
-      loss_leaf(t) = D(t-1) + add_leaf(t) - D(t)
-      k_leaf(t) = loss_leaf(t) / D(t-1)
-    """
-    s = summary.copy()
+    df = yearly.copy()
+    df = to_numeric_inplace(df)
 
-    # ---- ROOT ----
-    M = s["total_root_necromass_g"].astype(float)
-    add_root = s["total_root_necromasscum_g"].diff().clip(lower=0).fillna(0.0)
-    loss_root = (M.shift(1) + add_root - M).clip(lower=0)
+    if "sim_id" not in df.columns or "time_step" not in df.columns:
+        return pd.DataFrame()
 
-    s["root_decomp_flux_g_per_yr"] = loss_root
-    denom_M = M.shift(1)
-    s["k_root_per_yr"] = (loss_root / denom_M).where(denom_M > 0)
+    rows = []
 
-    # ---- LEAF NECROMASS ----
-    D = s["total_dead_leaf_mass_g"].astype(float)
-    add_leaf = s["total_leaf_mass_g"].shift(1).fillna(0.0)
-    loss_leaf = (D.shift(1) + add_leaf - D).clip(lower=0)
+    for sim_id, g in df.groupby("sim_id"):
+        g = g.sort_values("time_step").copy()
 
-    s["leaf_decomp_flux_g_per_yr"] = loss_leaf
-    denom_D = D.shift(1)
-    s["k_leaf_per_yr"] = (loss_leaf / denom_D).where(denom_D > 0)
-
-    # sanity reference (constant implied by remain fraction)
-    s["k_leaf_implied_from_remainfrac"] = float(-np.log(LEAF_NECRO_REMAIN_FRAC))
-
-    return s
-
-
-def root_necromass_bulk_density_g_cm3(total_root_necro_g: float, tussock_radius_cm: float) -> float:
-    """
-    Proxy bulk density: total root necromass (g) / cylinder volume (cm^3) with depth ROOT_LENGTH_CM.
-    """
-    if not np.isfinite(total_root_necro_g) or not np.isfinite(tussock_radius_cm):
-        return float("nan")
-    if tussock_radius_cm <= 0:
-        return float("nan")
-    vol_cm3 = np.pi * (tussock_radius_cm ** 2) * ROOT_LENGTH_CM
-    return float(total_root_necro_g) / vol_cm3
-
-
-# ============================================================
-# Plot helpers
-# ============================================================
-
-def save_scatter(x, y, xlabel, ylabel, title, outpath: Path):
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    ok = np.isfinite(x) & np.isfinite(y)
-    x = x[ok]
-    y = y[ok]
-
-    plt.figure()
-    plt.scatter(x, y, s=20)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=300)
-    plt.close()
-
-
-def save_scatter_with_regression(x, y, xlabel, ylabel, title, outpath: Path):
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    ok = np.isfinite(x) & np.isfinite(y)
-    x = x[ok]
-    y = y[ok]
-
-    plt.figure()
-    plt.scatter(x, y, s=20)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-
-    if x.size >= 2:
-        m, b = np.polyfit(x, y, 1)
-        xs = np.linspace(x.min(), x.max(), 100)
-        ys = m * xs + b
-        plt.plot(xs, ys, linestyle="--")
-
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=300)
-    plt.close()
-
-
-def save_hist_density(x, xlabel, ylabel, title, outpath: Path, bins: int = 30):
-    x = np.asarray(x, dtype=float)
-    x = x[np.isfinite(x)]
-    plt.figure()
-    plt.hist(x, bins=bins, density=True)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(outpath, dpi=300)
-    plt.close()
-
-
-def save_hist_panel_one_plot(datasets, titles, xlabels, outpath: Path, bins: int = 30):
-    """
-    Put ALL density histograms (except tussock radius density) on one multi-panel figure.
-    """
-    n = len(datasets)
-    ncols = 3
-    nrows = int(np.ceil(n / ncols))
-
-    fig, axes = plt.subplots(nrows, ncols, figsize=(12, 3.5 * nrows))
-    axes = np.array(axes).ravel()
-
-    for i in range(nrows * ncols):
-        ax = axes[i]
-        if i >= n:
-            ax.axis("off")
+        if g.empty:
             continue
 
-        data = np.asarray(datasets[i], dtype=float)
-        data = data[np.isfinite(data)]
-        ax.hist(data, bins=bins, density=True)
-        ax.set_title(titles[i])
-        ax.set_xlabel(xlabels[i])
-        ax.set_ylabel("Density")
+        tmax = g["time_step"].max()
 
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=300)
-    plt.close(fig)
-
-
-def save_density_dependence_panels(
-    packing_metric: np.ndarray,
-    yseries: list[np.ndarray],
-    titles: list[str],
-    ylabels: list[str],
-    xlabel: str,
-    outpath: Path,
-):
-    """
-    3-panel scatterplots of putatively density-dependent responses vs a packing metric.
-    """
-    x = np.asarray(packing_metric, dtype=float)
-    okx = np.isfinite(x)
-    x = x[okx]
-
-    n = len(yseries)
-    ncols = 3
-    nrows = int(np.ceil(n / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(12, 3.8 * nrows))
-    axes = np.array(axes).ravel()
-
-    for i in range(nrows * ncols):
-        ax = axes[i]
-        if i >= n:
-            ax.axis("off")
-            continue
-
-        y = np.asarray(yseries[i], dtype=float)
-        y = y[okx]
-        ok = np.isfinite(y)
-        xx = x[ok]
-        yy = y[ok]
-
-        ax.scatter(xx, yy, s=18)
-        ax.set_title(titles[i])
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabels[i])
-
-        if xx.size >= 2:
-            m, b = np.polyfit(xx, yy, 1)
-            xs = np.linspace(xx.min(), xx.max(), 100)
-            ys = m * xs + b
-            ax.plot(xs, ys, linestyle="--")
-
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=300)
-    plt.close(fig)
-
-
-def save_spatial_heterogeneity_plot(
-    bin_centers: np.ndarray,
-    mean_annulus_density: np.ndarray,
-    mean_annulus_packing: np.ndarray,
-    mean_leaf_area: np.ndarray,
-    outpath: Path,
-):
-    """
-    Multi-panel plot of spatial heterogeneity vs normalized distance from tussock center.
-    """
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.0))
-    axes = np.array(axes).ravel()
-
-    x = np.asarray(bin_centers, dtype=float)
-
-    axes[0].plot(x, mean_annulus_density)
-    axes[0].set_xlabel("Normalized distance from center (r / R)")
-    axes[0].set_ylabel("Alive tiller density in annulus (tillers cm$^{-2}$)")
-    axes[0].set_title("Annulus tiller density vs distance")
-
-    axes[1].plot(x, mean_annulus_packing)
-    axes[1].set_xlabel("Normalized distance from center (r / R)")
-    axes[1].set_ylabel("Packing fraction in annulus (area/area)")
-    axes[1].set_title("Annulus packing fraction vs distance")
-
-    axes[2].plot(x, mean_leaf_area)
-    axes[2].set_xlabel("Normalized distance from center (r / R)")
-    axes[2].set_ylabel("Mean leaf area (cm$^2$)")
-    axes[2].set_title("Mean leaf area vs distance")
-
-    fig.tight_layout()
-    fig.savefig(outpath, dpi=300)
-    plt.close(fig)
-
-
-# ============================================================
-# Spatial heterogeneity aggregation
-# ============================================================
-
-def accumulate_annulus_stats(
-    df: pd.DataFrame,
-    timesteps: np.ndarray,
-    use_only_alive_for_radius: bool,
-    radius_stat: str,
-    nbins: int = 12,
-):
-    """
-    For each (sim, timestep) sample:
-      - take alive tillers
-      - compute r = sqrt(x^2+y^2), R = tussock radius
-      - bin by normalized r/R into nbins
-      - per annulus compute:
-          density = count / annulus_area
-          packing = sum(pi*ri^2) / annulus_area
-          mean leaf area
-    Aggregate across all samples by averaging (simple mean) within each bin.
-    """
-    # store lists per bin
-    dens_bins = [[] for _ in range(nbins)]
-    pack_bins = [[] for _ in range(nbins)]
-    leaf_bins = [[] for _ in range(nbins)]
-
-    edges = np.linspace(0.0, 1.0, nbins + 1)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-
-    for t in timesteps:
-        sub = df[df["TimeStep"].astype(int) == int(t)]
-        if sub.shape[0] == 0:
-            continue
-
-        alive = sub[sub["Status"] == 1]
-        if alive.shape[0] == 0:
-            continue
-
-        # tussock radius
-        sub_for_radius = alive if use_only_alive_for_radius else sub
-        r_cm_all = radial_distance_xy_cm(sub_for_radius)
-        if r_cm_all.size == 0:
-            continue
-        R = summarize_radius_cm(r_cm_all, radius_stat)
-        if not np.isfinite(R) or R <= 0:
-            continue
-
-        # alive radii from center
-        r_cm = radial_distance_xy_cm(alive)
-        rn = r_cm / R
-        ok = np.isfinite(rn) & (rn >= 0) & (rn <= 1.0)
-        rn = rn[ok]
-        if rn.size == 0:
-            continue
-
-        # per-tiller radius for packing fraction
-        if "Radius" in alive.columns:
-            ri = alive["Radius"].astype(float).to_numpy()[ok]
-            ri = np.where(np.isfinite(ri) & (ri > 0), ri, 0.0)
+        if np.isfinite(tmax):
+            last_half = g[g["time_step"] >= 0.5 * tmax]
+            last_quarter = g[g["time_step"] >= 0.75 * tmax]
         else:
-            ri = np.zeros_like(rn)
+            last_half = g
+            last_quarter = g
 
-        # leaf area
+        row = {
+            "sim_id": int(sim_id),
+            "n_years_recorded": int(len(g)),
+            "final_time_step_yearly": float(g["time_step"].iloc[-1]),
+        }
+
+        if "n_total" in g.columns:
+            row["final_n_total"] = float(g["n_total"].iloc[-1])
+            row["max_n_total"] = float(g["n_total"].max())
+            row["mean_n_total"] = float(g["n_total"].mean())
+            row["cv_n_total"] = cv(g["n_total"])
+            row["slope_n_total_last_half"] = safe_slope(
+                last_half["time_step"],
+                last_half["n_total"],
+            )
+
+        if "n_alive" in g.columns:
+            row["final_n_alive"] = float(g["n_alive"].iloc[-1])
+            row["max_n_alive"] = float(g["n_alive"].max())
+            row["mean_n_alive"] = float(g["n_alive"].mean())
+            row["median_n_alive"] = float(g["n_alive"].median())
+            row["cv_n_alive"] = cv(g["n_alive"])
+            row["slope_n_alive_all"] = safe_slope(g["time_step"], g["n_alive"])
+            row["slope_n_alive_last_half"] = safe_slope(
+                last_half["time_step"],
+                last_half["n_alive"],
+            )
+
+            if np.isfinite(row["max_n_alive"]) and row["max_n_alive"] > 0:
+                row["final_alive_over_peak_alive"] = row["final_n_alive"] / row["max_n_alive"]
+            else:
+                row["final_alive_over_peak_alive"] = np.nan
+
+        if "n_dead" in g.columns:
+            row["final_n_dead"] = float(g["n_dead"].iloc[-1])
+            row["max_n_dead"] = float(g["n_dead"].max())
+            row["mean_n_dead"] = float(g["n_dead"].mean())
+            row["slope_n_dead_last_half"] = safe_slope(
+                last_half["time_step"],
+                last_half["n_dead"],
+            )
+
+        if "n_alive" in g.columns and "n_dead" in g.columns:
+            denom = row.get("final_n_alive", np.nan)
+
+            if np.isfinite(denom) and denom > 0:
+                row["final_dead_to_alive_ratio"] = row.get("final_n_dead", np.nan) / denom
+            else:
+                row["final_dead_to_alive_ratio"] = np.nan
+
+        if "n_newborn" in g.columns:
+            row["total_newborns"] = float(g["n_newborn"].sum())
+            row["late_newborns"] = float(last_quarter["n_newborn"].sum())
+            row["mean_newborns_per_year"] = float(g["n_newborn"].mean())
+            row["max_newborns_one_year"] = float(g["n_newborn"].max())
+            row["slope_newborns_last_half"] = safe_slope(
+                last_half["time_step"],
+                last_half["n_newborn"],
+            )
+
+        if "diameter" in g.columns:
+            row["final_diameter_yearly"] = float(g["diameter"].iloc[-1])
+            row["max_diameter_yearly"] = float(g["diameter"].max())
+            row["mean_diameter_yearly"] = float(g["diameter"].mean())
+            row["cv_diameter"] = cv(g["diameter"])
+            row["slope_diameter_all"] = safe_slope(g["time_step"], g["diameter"])
+            row["slope_diameter_last_half"] = safe_slope(
+                last_half["time_step"],
+                last_half["diameter"],
+            )
+
+            if np.isfinite(row["max_diameter_yearly"]) and row["max_diameter_yearly"] > 0:
+                row["final_diameter_over_peak_diameter"] = (
+                    row["final_diameter_yearly"] / row["max_diameter_yearly"]
+                )
+            else:
+                row["final_diameter_over_peak_diameter"] = np.nan
+
+        if "radius" in g.columns:
+            row["final_radius_yearly"] = float(g["radius"].iloc[-1])
+            row["max_radius_yearly"] = float(g["radius"].max())
+            row["slope_radius_last_half"] = safe_slope(
+                last_half["time_step"],
+                last_half["radius"],
+            )
+
+        if "leaf_area_mean" in g.columns:
+            row["final_leaf_area_mean_yearly"] = float(g["leaf_area_mean"].iloc[-1])
+            row["mean_leaf_area_mean_yearly"] = float(g["leaf_area_mean"].mean())
+            row["slope_leaf_area_mean_last_half"] = safe_slope(
+                last_half["time_step"],
+                last_half["leaf_area_mean"],
+            )
+
+        if "overflow" in g.columns:
+            row["any_overflow_yearly"] = int(np.nanmax(g["overflow"]) > 0)
+            row["overflow_year_fraction"] = float(np.nanmean(g["overflow"] > 0))
+
+        row["late_absolute_alive_slope"] = abs(row.get("slope_n_alive_last_half", np.nan))
+        row["late_absolute_diameter_slope"] = abs(row.get("slope_diameter_last_half", np.nan))
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# -----------------------------
+# Full per-tiller metrics
+# -----------------------------
+
+def infer_sim_id_from_file_or_df(path, df, fallback_sim_id):
+    for c in ["sim_id", "SimID", "simulation_id", "SimulationID"]:
+        if c in df.columns:
+            vals = pd.to_numeric(df[c], errors="coerce").dropna()
+
+            if len(vals):
+                return int(vals.iloc[0])
+
+    nums = re.findall(r"\d+", Path(path).stem)
+
+    if nums:
+        return int(nums[-1])
+
+    return int(fallback_sim_id)
+
+
+def compute_lineage_depths(parent_map):
+    depths = {}
+
+    def depth(tid, stack=None):
+        if stack is None:
+            stack = set()
+
+        if tid in depths:
+            return depths[tid]
+
+        if tid in stack:
+            depths[tid] = np.nan
+            return np.nan
+
+        stack.add(tid)
+        parent = parent_map.get(tid, -1)
+
+        if parent < 0 or parent not in parent_map:
+            depths[tid] = 0
+        else:
+            d_parent = depth(parent, stack)
+            depths[tid] = np.nan if not np.isfinite(d_parent) else d_parent + 1
+
+        stack.remove(tid)
+        return depths[tid]
+
+    for tid in parent_map:
+        depth(tid)
+
+    return depths
+
+
+def metrics_from_full_tiller_file(path, fallback_sim_id):
+    try:
+        df = pd.read_csv(path)
+    except Exception as e:
+        print(f"[WARN] Could not read full tiller file {path}: {e}", flush=True)
+        return None
+
+    required = {"TimeStep", "TillerID", "Radius", "X", "Y", "Status"}
+
+    if not required.issubset(df.columns):
+        return None
+
+    df = to_numeric_inplace(df)
+    sim_id = infer_sim_id_from_file_or_df(path, df, fallback_sim_id)
+
+    if df.empty:
+        return None
+
+    tmax = df["TimeStep"].max()
+
+    if not np.isfinite(tmax):
+        return None
+
+    final = df[df["TimeStep"] == tmax].copy()
+    alive = final[final["Status"] == 1].copy()
+    dead = final[final["Status"] == 0].copy()
+
+    row = {
+        "sim_id": sim_id,
+        "full_file": str(path),
+        "final_time_step_full": float(tmax),
+        "final_total_tillers_full": int(len(final)),
+        "final_live_tillers_full": int(len(alive)),
+        "final_dead_tillers_full": int(len(dead)),
+        "live_fraction_full": float(len(alive) / len(final)) if len(final) else np.nan,
+    }
+
+    if len(alive):
+        cx = alive["X"].mean()
+        cy = alive["Y"].mean()
+        radial = np.sqrt((alive["X"] - cx) ** 2 + (alive["Y"] - cy) ** 2)
+
+        row["live_radial_distance_mean"] = float(radial.mean())
+        row["live_radial_distance_sd"] = float(radial.std())
+        row["live_radial_distance_max"] = float(radial.max())
+        row["live_nearest_neighbor_mean"] = nearest_neighbor_mean(alive["X"], alive["Y"])
+
+        area = math.pi * max(float(radial.max()), 1e-12) ** 2
+        row["live_tiller_density_xy"] = float(len(alive) / area)
+
+        row["live_radius_mean"] = float(alive["Radius"].mean())
+        row["live_radius_median"] = float(alive["Radius"].median())
+        row["live_radius_sd"] = float(alive["Radius"].std())
+
+        if "Age" in alive.columns:
+            row["live_age_mean"] = float(alive["Age"].mean())
+            row["live_age_median"] = float(alive["Age"].median())
+            row["live_age_sd"] = float(alive["Age"].std())
+            row["live_age_max"] = float(alive["Age"].max())
+            row["live_frac_age_le_1"] = float(np.mean(alive["Age"] <= 1))
+            row["live_frac_age_le_2"] = float(np.mean(alive["Age"] <= 2))
+            row["live_frac_age_ge_5"] = float(np.mean(alive["Age"] >= 5))
+            row["live_frac_age_ge_10"] = float(np.mean(alive["Age"] >= 10))
+
         if "LeafArea" in alive.columns:
-            la = alive["LeafArea"].astype(float).to_numpy()[ok]
-        else:
-            la = np.full_like(rn, np.nan)
+            row["live_leaf_area_mean"] = float(alive["LeafArea"].mean())
+            row["live_leaf_area_median"] = float(alive["LeafArea"].median())
+            row["total_live_leaf_area_final"] = float(alive["LeafArea"].sum())
 
-        # assign bins
-        bidx = np.searchsorted(edges, rn, side="right") - 1
-        bidx = np.clip(bidx, 0, nbins - 1)
+        if "NumRoots" in alive.columns:
+            row["live_num_roots_mean"] = float(alive["NumRoots"].mean())
+            row["live_num_roots_median"] = float(alive["NumRoots"].median())
+            row["live_frac_zero_roots"] = float(np.mean(alive["NumRoots"] <= 0))
 
-        # compute per annulus stats
-        for b in range(nbins):
-            mask = (bidx == b)
-            if not np.any(mask):
-                continue
+        if "RootDiamMM" in alive.columns:
+            row["live_root_diam_mean"] = float(alive["RootDiamMM"].mean())
+            row["live_root_diam_median"] = float(alive["RootDiamMM"].median())
 
-            r0n = edges[b]
-            r1n = edges[b + 1]
-            # annulus area in cm^2
-            ann_area = np.pi * ((r1n * R) ** 2 - (r0n * R) ** 2)
-            if not np.isfinite(ann_area) or ann_area <= 0:
-                continue
+    if len(final):
+        live_leaf_area = (
+            final.loc[final["Status"] == 1, "LeafArea"].sum()
+            if "LeafArea" in final.columns
+            else np.nan
+        )
 
-            cnt = int(np.sum(mask))
-            dens = cnt / ann_area
+        for c in [
+            "DeadLeafArea",
+            "DeadLeafMass",
+            "RootNecroVol",
+            "RootNecroVolCum",
+            "RootNecroMass",
+            "RootNecroMassCum",
+        ]:
+            if c in final.columns:
+                row[f"total_{c}_final"] = float(final[c].sum())
 
-            pack = float(np.sum(np.pi * (ri[mask] ** 2))) / ann_area
+        if np.isfinite(live_leaf_area) and live_leaf_area > 0:
+            if "DeadLeafMass" in final.columns:
+                row["dead_leaf_mass_per_live_leaf_area"] = float(
+                    final["DeadLeafMass"].sum() / live_leaf_area
+                )
 
-            la_m = la[mask]
-            la_m = la_m[np.isfinite(la_m)]
-            mean_la = float(np.mean(la_m)) if la_m.size > 0 else float("nan")
+            if "DeadLeafArea" in final.columns:
+                row["dead_leaf_area_per_live_leaf_area"] = float(
+                    final["DeadLeafArea"].sum() / live_leaf_area
+                )
 
-            dens_bins[b].append(dens)
-            pack_bins[b].append(pack)
-            leaf_bins[b].append(mean_la)
+            if "RootNecroMassCum" in final.columns:
+                row["root_necro_mass_cum_per_live_leaf_area"] = float(
+                    final["RootNecroMassCum"].sum() / live_leaf_area
+                )
 
-    def mean_or_nan(xs):
-        xs = np.asarray(xs, dtype=float)
-        xs = xs[np.isfinite(xs)]
-        return float(np.mean(xs)) if xs.size > 0 else float("nan")
+            if "RootNecroVolCum" in final.columns:
+                row["root_necro_vol_cum_per_live_leaf_area"] = float(
+                    final["RootNecroVolCum"].sum() / live_leaf_area
+                )
 
-    mean_dens = np.array([mean_or_nan(dens_bins[b]) for b in range(nbins)], dtype=float)
-    mean_pack = np.array([mean_or_nan(pack_bins[b]) for b in range(nbins)], dtype=float)
-    mean_leaf = np.array([mean_or_nan(leaf_bins[b]) for b in range(nbins)], dtype=float)
+    if "TillerID" in df.columns:
+        row["n_unique_tillers_ever"] = int(df["TillerID"].nunique())
 
-    return centers, mean_dens, mean_pack, mean_leaf
+    if "ParentTillerID" in df.columns and "TillerID" in df.columns:
+        ever = df.drop_duplicates("TillerID").copy()
+        parent_counts = ever[ever["ParentTillerID"] >= 0]["ParentTillerID"].value_counts()
+
+        row["n_reproducing_parents_ever"] = int(len(parent_counts))
+        row["mean_offspring_per_reproducing_parent"] = (
+            float(parent_counts.mean()) if len(parent_counts) else 0.0
+        )
+        row["median_offspring_per_reproducing_parent"] = (
+            float(parent_counts.median()) if len(parent_counts) else 0.0
+        )
+        row["max_offspring_one_parent"] = (
+            float(parent_counts.max()) if len(parent_counts) else 0.0
+        )
+
+        if len(ever):
+            row["frac_tillers_that_reproduced"] = float(
+                ever["TillerID"].isin(parent_counts.index).mean()
+            )
+
+        parent_map = {
+            int(r["TillerID"]): int(r["ParentTillerID"])
+            for _, r in ever[["TillerID", "ParentTillerID"]].dropna().iterrows()
+        }
+
+        depths = compute_lineage_depths(parent_map)
+
+        if depths:
+            depth_values = np.array(list(depths.values()), dtype=float)
+            depth_values = depth_values[np.isfinite(depth_values)]
+
+            row["lineage_depth_mean_ever"] = (
+                float(np.mean(depth_values)) if len(depth_values) else np.nan
+            )
+            row["lineage_depth_max_ever"] = (
+                float(np.max(depth_values)) if len(depth_values) else np.nan
+            )
+
+            if len(alive):
+                live_ids = alive["TillerID"].dropna().astype(int).tolist()
+                live_depths = np.array([depths.get(tid, np.nan) for tid in live_ids], dtype=float)
+                live_depths = live_depths[np.isfinite(live_depths)]
+
+                row["lineage_depth_mean_live"] = (
+                    float(np.mean(live_depths)) if len(live_depths) else np.nan
+                )
+                row["lineage_depth_max_live"] = (
+                    float(np.max(live_depths)) if len(live_depths) else np.nan
+                )
+
+    return row
 
 
-# ============================================================
-# Driver
-# ============================================================
+def metrics_from_full_tiller_files(final_sims_dir):
+    paths = find_full_tiller_files(final_sims_dir)
+    rows = []
+
+    for i, p in enumerate(paths):
+        row = metrics_from_full_tiller_file(p, fallback_sim_id=i)
+
+        if row is not None:
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+
+# -----------------------------
+# Set-level aggregation
+# -----------------------------
+
+def aggregate_sim_to_set(sim_metrics):
+    row = {
+        "n_sims": int(sim_metrics["sim_id"].nunique())
+        if "sim_id" in sim_metrics.columns
+        else len(sim_metrics),
+    }
+
+    if "is_alive_final" in sim_metrics.columns:
+        vals = pd.to_numeric(sim_metrics["is_alive_final"], errors="coerce")
+        row["alive_frac_final"] = float(vals.mean())
+        row["extinct_frac_final"] = float(1.0 - vals.mean())
+
+    if "has_overflow" in sim_metrics.columns:
+        vals = pd.to_numeric(sim_metrics["has_overflow"], errors="coerce")
+        row["overflow_frac"] = float(vals.mean())
+
+    if "any_overflow_yearly" in sim_metrics.columns:
+        vals = pd.to_numeric(sim_metrics["any_overflow_yearly"], errors="coerce")
+        row["overflow_frac_yearly"] = float(vals.mean())
+
+    if "has_missing_year" in sim_metrics.columns:
+        vals = pd.to_numeric(sim_metrics["has_missing_year"], errors="coerce")
+        row["missing_year_frac"] = float(vals.mean())
+
+    diam_col = None
+
+    for candidate in ["final_diameter", "final_diameter_yearly"]:
+        if candidate in sim_metrics.columns:
+            diam_col = candidate
+            break
+
+    if diam_col is not None:
+        diam = pd.to_numeric(sim_metrics[diam_col], errors="coerce").dropna().to_numpy(dtype=float)
+
+        row["sim_diameter_mean"] = float(np.mean(diam)) if len(diam) else np.nan
+        row["sim_diameter_median"] = float(np.median(diam)) if len(diam) else np.nan
+        row["sim_diameter_sd"] = float(np.std(diam)) if len(diam) else np.nan
+        row["sim_diameter_cv"] = cv(diam)
+
+    summarize_cols = [
+        "final_n_total",
+        "max_n_total",
+        "cv_n_total",
+        "slope_n_total_last_half",
+        "final_n_alive",
+        "max_n_alive",
+        "mean_n_alive",
+        "cv_n_alive",
+        "slope_n_alive_all",
+        "slope_n_alive_last_half",
+        "late_absolute_alive_slope",
+        "final_alive_over_peak_alive",
+        "final_n_dead",
+        "final_dead_to_alive_ratio",
+        "total_newborns",
+        "late_newborns",
+        "mean_newborns_per_year",
+        "max_newborns_one_year",
+        "slope_newborns_last_half",
+        "final_diameter_yearly",
+        "max_diameter_yearly",
+        "cv_diameter",
+        "slope_diameter_all",
+        "slope_diameter_last_half",
+        "late_absolute_diameter_slope",
+        "final_diameter_over_peak_diameter",
+        "final_total_tillers_full",
+        "final_live_tillers_full",
+        "final_dead_tillers_full",
+        "live_fraction_full",
+        "live_radial_distance_mean",
+        "live_radial_distance_sd",
+        "live_radial_distance_max",
+        "live_nearest_neighbor_mean",
+        "live_tiller_density_xy",
+        "live_radius_mean",
+        "live_age_median",
+        "live_frac_age_le_1",
+        "live_frac_age_ge_5",
+        "live_leaf_area_mean",
+        "total_live_leaf_area_final",
+        "live_num_roots_mean",
+        "live_frac_zero_roots",
+        "live_root_diam_mean",
+        "dead_leaf_mass_per_live_leaf_area",
+        "dead_leaf_area_per_live_leaf_area",
+        "root_necro_mass_cum_per_live_leaf_area",
+        "root_necro_vol_cum_per_live_leaf_area",
+        "n_unique_tillers_ever",
+        "n_reproducing_parents_ever",
+        "mean_offspring_per_reproducing_parent",
+        "max_offspring_one_parent",
+        "frac_tillers_that_reproduced",
+        "lineage_depth_mean_ever",
+        "lineage_depth_max_ever",
+        "lineage_depth_mean_live",
+        "lineage_depth_max_live",
+    ]
+
+    for c in summarize_cols:
+        if c not in sim_metrics.columns:
+            continue
+
+        vals = pd.to_numeric(sim_metrics[c], errors="coerce")
+
+        row[f"{c}_mean"] = float(vals.mean())
+        row[f"{c}_median"] = float(vals.median())
+        row[f"{c}_sd"] = float(vals.std())
+
+    return row
+
+
+def add_training_fit_metrics_to_set_row(set_row, sim_metrics, training_diameters):
+    if training_diameters is None or len(training_diameters) == 0:
+        return set_row
+
+    obs = np.asarray(training_diameters, dtype=float)
+    obs = obs[np.isfinite(obs)]
+
+    if len(obs) == 0:
+        return set_row
+
+    obs_sd = float(np.std(obs)) if len(obs) > 1 else np.nan
+    obs_mean = float(np.mean(obs))
+    obs_median = float(np.median(obs))
+
+    set_row["obs_diameter_mean"] = obs_mean
+    set_row["obs_diameter_median"] = obs_median
+    set_row["obs_diameter_sd"] = obs_sd
+    set_row["n_obs_diameters"] = int(len(obs))
+
+    diam_col = None
+
+    for candidate in ["final_diameter", "final_diameter_yearly"]:
+        if candidate in sim_metrics.columns:
+            diam_col = candidate
+            break
+
+    if diam_col is None:
+        return set_row
+
+    diam = pd.to_numeric(sim_metrics[diam_col], errors="coerce").dropna().to_numpy(dtype=float)
+
+    set_row["diameter_wasserstein_to_training"] = wasserstein_1d(obs, diam)
+
+    sim_sd = float(np.std(diam)) if len(diam) > 1 else np.nan
+
+    if np.isfinite(obs_sd) and obs_sd > 0 and np.isfinite(sim_sd):
+        set_row["diameter_sd_ratio_sim_obs"] = float(sim_sd / obs_sd)
+        set_row["diameter_abs_sd_ratio_error"] = float(abs((sim_sd / obs_sd) - 1.0))
+    else:
+        set_row["diameter_sd_ratio_sim_obs"] = np.nan
+        set_row["diameter_abs_sd_ratio_error"] = np.nan
+
+    if len(diam):
+        set_row["diameter_mean_error_sim_minus_obs"] = float(np.mean(diam) - obs_mean)
+        set_row["diameter_median_error_sim_minus_obs"] = float(np.median(diam) - obs_median)
+
+    return set_row
+
+
+def rough_plausibility_score_for_row(row):
+    """
+    Quick monitoring score. Lower is generally less weird.
+
+    This is intentionally rough, not a final objective function.
+    """
+    terms = []
+
+    def add(name, weight=1.0, default=0.0):
+        val = row.get(name, np.nan)
+
+        if pd.isna(val) or not np.isfinite(val):
+            val = default
+
+        terms.append(weight * float(val))
+
+    add("extinct_frac_final", weight=3.0)
+    add("overflow_frac", weight=3.0)
+    add("missing_year_frac", weight=2.0)
+
+    add("diameter_abs_sd_ratio_error", weight=1.0)
+    add("late_absolute_alive_slope_mean", weight=0.05)
+    add("late_absolute_diameter_slope_mean", weight=0.05)
+    add("cv_n_alive_mean", weight=1.0)
+
+    if not terms:
+        return np.nan
+
+    return float(np.sum(terms))
+
+
+# -----------------------------
+# Question summary
+# -----------------------------
+
+def rewrite_question_summary(per_set_path, summary_path):
+    per_set_path = Path(per_set_path)
+    summary_path = Path(summary_path)
+
+    if not per_set_path.exists():
+        return
+
+    try:
+        df = pd.read_csv(per_set_path)
+    except pd.errors.EmptyDataError:
+        return
+    except pd.errors.ParserError as e:
+        print(
+            f"[WARN] Could not rewrite summary because {per_set_path} is malformed: {e}",
+            flush=True,
+        )
+        return
+
+    if df.empty or "question" not in df.columns:
+        return
+
+    numeric_cols = [
+        c for c in df.columns
+        if c not in ["question", "site", "set", "set_dir"]
+        and pd.api.types.is_numeric_dtype(df[c])
+    ]
+
+    rows = []
+
+    for question, g in df.groupby("question"):
+        row = {
+            "question": question,
+            "n_sets_completed": int(len(g)),
+        }
+
+        for c in numeric_cols:
+            vals = pd.to_numeric(g[c], errors="coerce")
+
+            row[f"{c}_mean"] = float(vals.mean())
+            row[f"{c}_median"] = float(vals.median())
+            row[f"{c}_sd"] = float(vals.std())
+            row[f"{c}_min"] = float(vals.min())
+            row[f"{c}_max"] = float(vals.max())
+
+        rows.append(row)
+
+    out = pd.DataFrame(rows)
+
+    if "rough_plausibility_score_mean" in out.columns:
+        out = out.sort_values("rough_plausibility_score_mean", ascending=True)
+
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(summary_path, index=False)
+
+
+# -----------------------------
+# Per-set processing
+# -----------------------------
+
+def process_one_set(hypothesis_dir, set_dir, training_diameters):
+    final_sims_dir = Path(set_dir) / "final_sims"
+
+    question = question_from_set_dir(hypothesis_dir, set_dir)
+    site = site_from_set_dir(hypothesis_dir, set_dir)
+    set_name = Path(set_dir).name
+
+    summaries, yearly = read_summary_tables(final_sims_dir)
+
+    m_summary = metrics_from_summaries(summaries)
+    m_yearly = metrics_from_yearly(yearly)
+    m_full = metrics_from_full_tiller_files(final_sims_dir)
+
+    dfs = [d for d in [m_summary, m_yearly, m_full] if not d.empty]
+
+    if not dfs:
+        return None, None
+
+    sim_metrics = dfs[0]
+
+    for d in dfs[1:]:
+        sim_metrics = sim_metrics.merge(d, on="sim_id", how="outer")
+
+    sim_metrics.insert(0, "question", question)
+    sim_metrics.insert(1, "site", site)
+    sim_metrics.insert(2, "set", set_name)
+    sim_metrics.insert(3, "set_dir", str(set_dir))
+
+    set_row = aggregate_sim_to_set(sim_metrics)
+
+    set_row["question"] = question
+    set_row["site"] = site
+    set_row["set"] = set_name
+    set_row["set_dir"] = str(set_dir)
+
+    set_row = add_training_fit_metrics_to_set_row(
+        set_row=set_row,
+        sim_metrics=sim_metrics,
+        training_diameters=training_diameters,
+    )
+
+    set_row["rough_plausibility_score"] = rough_plausibility_score_for_row(set_row)
+
+    id_cols = ["question", "site", "set", "set_dir"]
+
+    set_df = pd.DataFrame([set_row])
+    set_df = set_df[id_cols + [c for c in set_df.columns if c not in id_cols]]
+
+    return sim_metrics, set_df
+
+
+# -----------------------------
+# Main
+# -----------------------------
 
 def main():
-    cfg = parse_args()
-    rng = np.random.default_rng(cfg.seed)
+    parser = argparse.ArgumentParser(
+        description="Append deep tussock diagnostics per question and across a full hypothesis directory."
+    )
 
-    sim_paths = list_sim_csvs(cfg.input_dir, cfg.pattern)
+    parser.add_argument(
+        "hypothesis_dir",
+        help="Top-level hypothesis directory containing question folders and set_### outputs.",
+    )
 
-    # Scatter plots (sampled points across sims)
-    alive_x, alive_y = [], []
-    necro_x, necro_y = [], []
-    radius_vals = []
-    prod_x, prod_y = [], []
+    parser.add_argument(
+        "--training-csv",
+        default=None,
+        help="Optional observed training CSV used for diameter Wasserstein and SD-ratio metrics.",
+    )
 
-    # Density datasets (sampled)
-    k_root_rates = []
-    k_leaf_rates = []
-    tiller_radii = []
-    leaf_sizes = []
-    root_necro_bulk_dens = []
+    parser.add_argument(
+        "--diam-col",
+        default="diam",
+        help="Observed diameter column in training CSV. Default: diam",
+    )
 
-    # Density dependence data (sampled points across sims)
-    dd_x_packdens = []
-    dd_x_packfrac = []
-    dd_newborn = []
-    dd_alive = []
-    dd_mean_leaf_area = []
-    dd_root_prod = []
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip set directories already present in compiled_deep_metrics_per_set.csv.",
+    )
 
-    # Spatial heterogeneity aggregation across sims/timesteps
-    # We'll aggregate using the sampled timesteps per sim
-    hetero_centers_accum = None
-    hetero_dens_accum = []
-    hetero_pack_accum = []
-    hetero_leaf_accum = []
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Delete previous compiled and per-question metric CSVs before starting.",
+    )
 
-    for fp in sim_paths:
-        df = read_sim_csv(fp)
-        df = add_live_root_mass_from_cone(df)
+    args = parser.parse_args()
 
-        summary = build_timestep_summary(df, cfg.use_only_alive_for_radius, cfg.radius_stat)
-        summary = add_root_productivity(summary)
-        summary = add_decomposition_metrics_optionA(summary)
+    hypothesis_dir = Path(args.hypothesis_dir).resolve()
 
-        sampled_ts = sample_timesteps(summary["TimeStep"].values, cfg.n_timepoints, rng)
-        if sampled_ts.size == 0:
+    if not hypothesis_dir.exists():
+        raise FileNotFoundError(f"Hypothesis directory not found: {hypothesis_dir}")
+
+    overall_per_sim_path = hypothesis_dir / "compiled_deep_metrics_per_sim.csv"
+    overall_per_set_path = hypothesis_dir / "compiled_deep_metrics_per_set.csv"
+    overall_per_question_path = hypothesis_dir / "compiled_deep_metrics_per_question_summary.csv"
+    overall_progress_path = hypothesis_dir / "compiled_deep_metrics_progress_log.csv"
+    overall_error_path = hypothesis_dir / "compiled_deep_metrics_error_log.txt"
+
+    if args.fresh:
+        for p in [
+            overall_per_sim_path,
+            overall_per_set_path,
+            overall_per_question_path,
+            overall_progress_path,
+            overall_error_path,
+        ]:
+            if p.exists():
+                p.unlink()
+
+        for question_dir in hypothesis_dir.iterdir():
+            if not question_dir.is_dir():
+                continue
+
+            for p in [
+                question_dir / "deep_metrics_per_sim.csv",
+                question_dir / "deep_metrics_per_set.csv",
+                question_dir / "deep_metrics_per_question_summary.csv",
+                question_dir / "deep_metrics_progress_log.csv",
+                question_dir / "deep_metrics_error_log.txt",
+            ]:
+                if p.exists():
+                    p.unlink()
+
+    training_diameters = None
+
+    if args.training_csv:
+        training_csv = Path(args.training_csv).resolve()
+
+        if not training_csv.exists():
+            raise FileNotFoundError(f"Training CSV not found: {training_csv}")
+
+        obs = pd.read_csv(training_csv)
+
+        if args.diam_col not in obs.columns:
+            raise ValueError(
+                f"{args.diam_col} not found in training CSV. "
+                f"Available columns: {list(obs.columns)}"
+            )
+
+        training_diameters = (
+            pd.to_numeric(obs[args.diam_col], errors="coerce")
+            .dropna()
+            .to_numpy(dtype=float)
+        )
+
+        print(f"[INFO] Loaded {len(training_diameters)} observed diameters.", flush=True)
+
+    set_dirs = find_set_dirs(hypothesis_dir)
+
+    if not set_dirs:
+        raise RuntimeError(f"No set_### directories with final_sims found under: {hypothesis_dir}")
+
+    print(f"[INFO] Found {len(set_dirs)} set dirs.", flush=True)
+
+    completed = set()
+
+    if args.resume and overall_per_set_path.exists():
+        try:
+            old = pd.read_csv(overall_per_set_path)
+            if "set_dir" in old.columns:
+                completed = set(old["set_dir"].astype(str))
+            print(f"[INFO] Resume mode: found {len(completed)} completed set dirs.", flush=True)
+        except pd.errors.ParserError as e:
+            raise RuntimeError(
+                f"Cannot resume because compiled output is malformed: {overall_per_set_path}\n"
+                f"Rerun with --fresh after patching the script.\n"
+                f"Original pandas error: {e}"
+            )
+
+    for i, set_dir in enumerate(set_dirs, start=1):
+        set_dir = Path(set_dir).resolve()
+        set_dir_str = str(set_dir)
+
+        question = question_from_set_dir(hypothesis_dir, set_dir)
+        site = site_from_set_dir(hypothesis_dir, set_dir)
+        set_name = set_dir.name
+
+        question_dir = hypothesis_dir / question
+
+        question_per_sim_path = question_dir / "deep_metrics_per_sim.csv"
+        question_per_set_path = question_dir / "deep_metrics_per_set.csv"
+        question_summary_path = question_dir / "deep_metrics_per_question_summary.csv"
+        question_progress_path = question_dir / "deep_metrics_progress_log.csv"
+        question_error_path = question_dir / "deep_metrics_error_log.txt"
+
+        if args.resume and set_dir_str in completed:
+            print(f"[SKIP] {i}/{len(set_dirs)} already done: {set_dir}", flush=True)
             continue
 
-        ss = summary[summary["TimeStep"].isin(sampled_ts)]
+        print(
+            f"[RUN] {i}/{len(set_dirs)} question={question} site={site} set={set_name}",
+            flush=True,
+        )
 
-        # --- original scatter plots ---
-        alive_x.append(ss["tussock_radius_cm"].to_numpy(float))
-        alive_y.append(ss["alive_tillers"].to_numpy(float))
-
-        necro_x.append(ss["total_root_necromass_kg"].to_numpy(float))
-        necro_y.append(ss["tussock_radius_cm"].to_numpy(float))
-
-        radius_vals.append(ss["tussock_radius_cm"].to_numpy(float))
-
-        ss_prod = ss.dropna(subset=["root_productivity_g_per_tiller_per_yr", "tussock_radius_cm"])
-        prod_x.append(ss_prod["root_productivity_g_per_tiller_per_yr"].to_numpy(float))
-        prod_y.append(ss_prod["tussock_radius_cm"].to_numpy(float))
-
-        # --- decomposition densities (k, yr^-1) ---
-        k_root_rates.append(ss["k_root_per_yr"].to_numpy(float))
-        k_leaf_rates.append(ss["k_leaf_per_yr"].to_numpy(float))
-
-        # --- density datasets from raw per-tiller values (as before) ---
-        sub = df[df["TimeStep"].isin(sampled_ts)]
-        sub = sub[sub["Status"] == 1] if cfg.use_only_alive_for_radius else sub
-
-        if "Radius" in sub.columns:
-            tiller_radii.append(sub["Radius"].astype(float).to_numpy())
-        if "LeafArea" in sub.columns:
-            leaf_sizes.append(sub["LeafArea"].astype(float).to_numpy())
-
-        for _, row in ss.iterrows():
-            bd = root_necromass_bulk_density_g_cm3(
-                total_root_necro_g=float(row["total_root_necromass_g"]),
-                tussock_radius_cm=float(row["tussock_radius_cm"]),
+        try:
+            sim_metrics, set_df = process_one_set(
+                hypothesis_dir=hypothesis_dir,
+                set_dir=set_dir,
+                training_diameters=training_diameters,
             )
-            root_necro_bulk_dens.append(bd)
 
-        # --- density dependence: packing metrics vs responses ---
-        # use packing fraction (area-based) AND count density as x metrics (both reflect crowding differently)
-        dd_x_packdens.append(ss["packing_density_tillers_per_cm2"].to_numpy(float))
-        dd_x_packfrac.append(ss["packing_fraction_area"].to_numpy(float))
-        dd_newborn.append(ss["newborn_alive_tillers"].to_numpy(float))
-        dd_alive.append(ss["alive_tillers"].to_numpy(float))
-        dd_mean_leaf_area.append(ss["mean_leaf_area_alive_cm2"].to_numpy(float))
-        dd_root_prod.append(ss["root_productivity_g_per_tiller_per_yr"].to_numpy(float))
+            if sim_metrics is None or set_df is None:
+                progress_row = {
+                    "set_dir": set_dir_str,
+                    "question": question,
+                    "site": site,
+                    "set": set_name,
+                    "status": "no_usable_metrics",
+                }
 
-        # --- spatial heterogeneity: annulus stats vs distance from center ---
-        centers, mdens, mpack, mleaf = accumulate_annulus_stats(
-            df=df,
-            timesteps=sampled_ts,
-            use_only_alive_for_radius=cfg.use_only_alive_for_radius,
-            radius_stat=cfg.radius_stat,
-            nbins=12,
-        )
-        hetero_centers_accum = centers
-        hetero_dens_accum.append(mdens)
-        hetero_pack_accum.append(mpack)
-        hetero_leaf_accum.append(mleaf)
+                append_row_csv(progress_row, question_progress_path)
+                append_row_csv(progress_row, overall_progress_path)
 
-    def cat(arrs):
-        return np.concatenate(arrs) if arrs else np.array([], dtype=float)
+                print(f"[WARN] No usable metrics: {set_dir}", flush=True)
+                continue
 
-    x1, y1 = cat(alive_x), cat(alive_y)
-    x2, y2 = cat(necro_x), cat(necro_y)
-    rdist = cat(radius_vals)
-    x4, y4 = cat(prod_x), cat(prod_y)
+            append_df_csv(sim_metrics, question_per_sim_path)
+            append_df_csv(set_df, question_per_set_path)
+            rewrite_question_summary(question_per_set_path, question_summary_path)
 
-    h_k_root = cat(k_root_rates)
-    h_k_leaf = cat(k_leaf_rates)
-    h_tiller_radius = cat(tiller_radii)
-    h_leaf_size = cat(leaf_sizes)
-    h_bulk_density = np.asarray(root_necro_bulk_dens, dtype=float)
-    h_bulk_density = h_bulk_density[np.isfinite(h_bulk_density)]
+            append_df_csv(sim_metrics, overall_per_sim_path)
+            append_df_csv(set_df, overall_per_set_path)
+            rewrite_question_summary(overall_per_set_path, overall_per_question_path)
 
-    if x1.size == 0:
-        raise ValueError("No points generated (check required columns and timesteps).")
+            score = (
+                set_df["rough_plausibility_score"].iloc[0]
+                if "rough_plausibility_score" in set_df.columns
+                else np.nan
+            )
 
-    # -------------------------
-    # Original plots (unchanged filenames)
-    # -------------------------
-    save_scatter(
-        x1, y1,
-        xlabel="Tussock radius (cm)",
-        ylabel="Alive tillers (Status == 1)",
-        title="Alive tillers vs tussock radius (20 random timesteps per sim)",
-        outpath=cfg.output_dir / "alive_vs_tussock_radius.png",
-    )
+            alive = (
+                set_df["alive_frac_final"].iloc[0]
+                if "alive_frac_final" in set_df.columns
+                else np.nan
+            )
 
-    save_scatter(
-        x2, y2,
-        xlabel="Total root necromass (kg)",
-        ylabel="Tussock radius (cm)",
-        title="Standing root necromass pool vs tussock radius (axes switched)",
-        outpath=cfg.output_dir / "root_necromass_vs_tussock_radius.png",
-    )
+            wdist = (
+                set_df["diameter_wasserstein_to_training"].iloc[0]
+                if "diameter_wasserstein_to_training" in set_df.columns
+                else np.nan
+            )
 
-    save_hist_density(
-        rdist,
-        xlabel="Tussock radius (cm)",
-        ylabel="Density",
-        title="Distribution of tussock radii (cm) (20 random timesteps per sim)",
-        outpath=cfg.output_dir / "tussock_radius_density_cm.png",
-        bins=30,
-    )
+            progress_row = {
+                "set_dir": set_dir_str,
+                "question": question,
+                "site": site,
+                "set": set_name,
+                "status": "done",
+                "rough_plausibility_score": score,
+                "alive_frac_final": alive,
+                "diameter_wasserstein_to_training": wdist,
+            }
 
-    save_scatter_with_regression(
-        x4, y4,
-        xlabel="Tiller root productivity (g per tiller yr$^{-1}$)",
-        ylabel="Tussock radius (cm)",
-        title="Root productivity vs tussock radius (20 random timesteps per sim)",
-        outpath=cfg.output_dir / "root_productivity_vs_tussock_radius.png",
-    )
+            append_row_csv(progress_row, question_progress_path)
+            append_row_csv(progress_row, overall_progress_path)
 
-    # Density panels (CHANGED only in first 2 datasets: now k_root and k_leaf, both yr^-1)
-    save_hist_panel_one_plot(
-        datasets=[
-            h_k_root,
-            h_k_leaf,
-            h_tiller_radius,
-            h_leaf_size,
-            h_bulk_density,
-        ],
-        titles=[
-            "Root decomposition rate constant density",
-            "Leaf tissue decomposition rate constant density",
-            "Tiller radius density",
-            "Leaf size density",
-            "Root necromass bulk density",
-        ],
-        xlabels=[
-            "yr$^{-1}$",
-            "yr$^{-1}$",
-            "cm",
-            "cm$^2$",
-            "g cm$^{-3}$ (proxy)",
-        ],
-        outpath=cfg.output_dir / "density_panels.png",
-        bins=30,
-    )
+            print(
+                f"[DONE] {question}/{site}/{set_name} "
+                f"score={score:.4g} alive={alive:.4g} wdist={wdist:.4g}",
+                flush=True,
+            )
 
-    # -------------------------
-    # NEW plot 1: Density dependence panels
-    # -------------------------
-    dd_packdens = cat(dd_x_packdens)
-    dd_packfrac = cat(dd_x_packfrac)
-    dd_new = cat(dd_newborn)
-    dd_alv = cat(dd_alive)
-    dd_meanLA = cat(dd_mean_leaf_area)
-    dd_rootP = cat(dd_root_prod)
+        except Exception as e:
+            msg = traceback.format_exc()
 
-    # Panel set using packing fraction (more sensitive to variable tiller radii)
-    save_density_dependence_panels(
-        packing_metric=dd_packfrac,
-        yseries=[dd_new, dd_alv, dd_meanLA],
-        titles=[
-            "Newborn alive tillers vs packing fraction",
-            "Alive tillers vs packing fraction",
-            "Mean leaf area vs packing fraction",
-        ],
-        ylabels=[
-            "Newborn alive tillers (Age==1)",
-            "Alive tillers",
-            "Mean leaf area (cm$^2$)",
-        ],
-        xlabel="Packing fraction (sum $\\pi r_i^2$ / $\\pi R^2$)",
-        outpath=cfg.output_dir / "density_dependence_packing_fraction_panels.png",
-    )
+            for error_path in [question_error_path, overall_error_path]:
+                with open(error_path, "a") as f:
+                    f.write("\n" + "=" * 80 + "\n")
+                    f.write(f"ERROR in {set_dir}\n")
+                    f.write(msg)
 
-    # Optional second density-dependence panel set using count density
-    save_density_dependence_panels(
-        packing_metric=dd_packdens,
-        yseries=[dd_new, dd_rootP, dd_meanLA],
-        titles=[
-            "Newborn alive tillers vs count density",
-            "Root productivity vs count density",
-            "Mean leaf area vs count density",
-        ],
-        ylabels=[
-            "Newborn alive tillers (Age==1)",
-            "Root productivity (g per tiller yr$^{-1}$)",
-            "Mean leaf area (cm$^2$)",
-        ],
-        xlabel="Alive tiller density (tillers cm$^{-2}$) using $\\pi R^2$",
-        outpath=cfg.output_dir / "density_dependence_count_density_panels.png",
-    )
+            progress_row = {
+                "set_dir": set_dir_str,
+                "question": question,
+                "site": site,
+                "set": set_name,
+                "status": "error",
+                "error": str(e),
+            }
 
-    # -------------------------
-    # NEW plot 2: Spatial heterogeneity vs distance from center
-    # -------------------------
-    if hetero_centers_accum is not None and hetero_dens_accum:
-        dens_mat = np.vstack(hetero_dens_accum)
-        pack_mat = np.vstack(hetero_pack_accum)
-        leaf_mat = np.vstack(hetero_leaf_accum)
+            append_row_csv(progress_row, question_progress_path)
+            append_row_csv(progress_row, overall_progress_path)
 
-        # simple mean across sims (ignores NaNs)
-        mean_dens = np.nanmean(dens_mat, axis=0)
-        mean_pack = np.nanmean(pack_mat, axis=0)
-        mean_leaf = np.nanmean(leaf_mat, axis=0)
+            print(f"[ERROR] {set_dir}: {e}", flush=True)
+            continue
 
-        save_spatial_heterogeneity_plot(
-            bin_centers=hetero_centers_accum,
-            mean_annulus_density=mean_dens,
-            mean_annulus_packing=mean_pack,
-            mean_leaf_area=mean_leaf,
-            outpath=cfg.output_dir / "spatial_heterogeneity_vs_distance.png",
-        )
+    rewrite_question_summary(overall_per_set_path, overall_per_question_path)
 
-    print(f"Wrote PNGs to: {cfg.output_dir}")
+    print("[DONE] Streaming analysis complete.", flush=True)
+    print(f"Overall per-sim: {overall_per_sim_path}", flush=True)
+    print(f"Overall per-set: {overall_per_set_path}", flush=True)
+    print(f"Overall per-question summary: {overall_per_question_path}", flush=True)
+    print(f"Overall progress log: {overall_progress_path}", flush=True)
 
 
 if __name__ == "__main__":

@@ -8,3 +8,7 @@ tussock_model
 *.err
 !input_data/*
 */*/resampled_fits/*
+*/*/resampled_fits/*/*
+*/*/resampled_fits/*/*/*.ini
+*/*/resampled_fits/*/*/*/*
+*.txt
