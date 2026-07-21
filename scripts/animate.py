@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Save TWO GIFs animating tussock growth through time with true Radius (cm) in data coordinates.
+Save TWO GIFs animating tussock growth through time with true EffectiveFootprintRadius (cm) in data coordinates.
 
 CSV columns required:
-TimeStep, Radius, X, Y, Z, Status
+TimeStep, EffectiveFootprintRadius, X, Y, Z, Status
 Status: 1=alive (green), 0=dead (brown)
 
-This renders each tiller as a filled disk in the XY plane at height Z with radius = Radius (cm).
+This renders each tiller as a filled disk in the XY plane at height Z with EffectiveFootprintRadius = EffectiveFootprintRadius (cm).
 
 Outputs:
 1) Original view (keeps matplotlib's default 3D view unless you change it)
@@ -99,7 +99,7 @@ def render_gif(df, timesteps, xlim, ylim, zlim, args, out_path, view_mode):
             x = float(getattr(row, "X"))
             y = float(getattr(row, "Y"))
             z = float(getattr(row, "Z"))
-            r = float(getattr(row, "Radius"))
+            r = float(getattr(row, "EffectiveFootprintRadius"))
             status = int(getattr(row, "Status"))
 
             if r <= 0:
@@ -155,12 +155,12 @@ def main():
 
     df = pd.read_csv(args.csv_path)
 
-    required = {"TimeStep", "Radius", "X", "Y", "Z", "Status"}
+    required = {"TimeStep", "EffectiveFootprintRadius", "X", "Y", "Z", "Status"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
 
-    for c in ["TimeStep", "Radius", "X", "Y", "Z", "Status"]:
+    for c in ["TimeStep", "EffectiveFootprintRadius", "X", "Y", "Z", "Status"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=list(required)).copy()
     df["TimeStep"] = df["TimeStep"].astype(int)

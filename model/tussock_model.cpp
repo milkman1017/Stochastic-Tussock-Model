@@ -29,6 +29,31 @@
 static std::mutex g_print_mutex;
 static constexpr int DISABLE_REPRO = 0;
 
+
+static std::uint64_t splitmix64(std::uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static std::uint64_t read_base_seed() {
+    const char* raw = std::getenv("TUSSOCK_BASE_SEED");
+    if (raw != nullptr && *raw != '\0') {
+        try {
+            std::size_t used = 0;
+            const std::string value_text(raw);
+            const std::uint64_t value = std::stoull(value_text, &used, 10);
+            if (used == value_text.size()) return value;
+        } catch (...) {
+        }
+    }
+
+    return static_cast<std::uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count()
+    );
+}
+
 static inline std::string trim(const std::string& s) {
     size_t a = 0;
     while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) a++;
@@ -40,6 +65,63 @@ static inline std::string trim(const std::string& s) {
 static inline double clamp01(double p) { return std::max(0.0, std::min(1.0, p)); }
 static inline double logistic(double z) { return 1.0 / (1.0 + std::exp(-z)); }
 static inline double clamp(double x, double lo, double hi) { return std::max(lo, std::min(hi, x)); }
+
+
+static double vector_quantile(std::vector<double> values, double q) {
+    if (values.empty()) return 0.0;
+
+    q = std::max(0.0, std::min(1.0, q));
+    std::sort(values.begin(), values.end());
+
+    if (values.size() == 1) return values[0];
+
+    const double index = q * static_cast<double>(values.size() - 1);
+    const std::size_t lo = static_cast<std::size_t>(std::floor(index));
+    const std::size_t hi = static_cast<std::size_t>(std::ceil(index));
+    const double fraction = index - static_cast<double>(lo);
+
+    return values[lo] * (1.0 - fraction) + values[hi] * fraction;
+}
+
+static double calculate_robust_tussock_diameter(
+    const std::vector<Tiller>& tillers,
+    double lower_q = 0.025,
+    double upper_q = 0.975
+) {
+    std::vector<double> x_lower_edges;
+    std::vector<double> x_upper_edges;
+    std::vector<double> y_lower_edges;
+    std::vector<double> y_upper_edges;
+
+    x_lower_edges.reserve(tillers.size());
+    x_upper_edges.reserve(tillers.size());
+    y_lower_edges.reserve(tillers.size());
+    y_upper_edges.reserve(tillers.size());
+
+    for (const auto& t : tillers) {
+        const double r = t.getEffectiveFootprintRadius();
+
+        x_lower_edges.push_back(t.getX() - r);
+        x_upper_edges.push_back(t.getX() + r);
+        y_lower_edges.push_back(t.getY() - r);
+        y_upper_edges.push_back(t.getY() + r);
+    }
+
+    if (tillers.empty()) return 0.0;
+
+    const double width_x =
+        vector_quantile(x_upper_edges, upper_q)
+        - vector_quantile(x_lower_edges, lower_q);
+
+    const double width_y =
+        vector_quantile(y_upper_edges, upper_q)
+        - vector_quantile(y_lower_edges, lower_q);
+
+    return 0.5 * (
+        std::max(0.0, width_x)
+        + std::max(0.0, width_y)
+    );
+}
 
 static std::filesystem::path get_project_root() {
     try {
@@ -153,6 +235,12 @@ struct SimSummary {
     int missing_year = 1;
     int alive_final = 0;
     double leafarea_mean_y = std::nan("");
+    long long cumulative_attempted_daughters = 0;
+    long long cumulative_established_births = 0;
+    long long cumulative_deaths = 0;
+    long long cumulative_tillers_created = 1;
+    double mean_reproduction_probability = std::nan("");
+    double mean_establishment_probability = std::nan("");
 };
 
 struct RuntimeConfig {
@@ -190,8 +278,10 @@ static inline bool should_prune_dead(const Tiller& t) {
     constexpr double EPS_R = 1e-6;
     constexpr double EPS_A = 1e-6;
     constexpr double EPS_M = 1e-8;
+
     if (t.getStatus() == 1) return false;
-    const double r = t.getRadius();
+
+    const double r = t.getEffectiveFootprintRadius();
     const double la = t.getLeafArea();
     const double dla = t.getDeadLeafArea();
     const double dlm = t.getDeadLeafMass();
@@ -199,9 +289,15 @@ static inline bool should_prune_dead(const Tiller& t) {
     const double rnvc = t.getRootNecroVolCum();
     const double rnm = t.getRootNecroMass();
     const double rnmc = t.getRootNecroMassCum();
-    return (std::abs(r) <= EPS_R) && (std::abs(la) <= EPS_A) && (std::abs(dla) <= EPS_M) &&
-           (std::abs(dlm) <= EPS_M) && (std::abs(rnv) <= EPS_M) && (std::abs(rnm) <= EPS_M) &&
-           (std::abs(rnvc) <= EPS_M) && (std::abs(rnmc) <= EPS_M);
+
+    return (std::abs(r) <= EPS_R)
+        && (std::abs(la) <= EPS_A)
+        && (std::abs(dla) <= EPS_M)
+        && (std::abs(dlm) <= EPS_M)
+        && (std::abs(rnv) <= EPS_M)
+        && (std::abs(rnm) <= EPS_M)
+        && (std::abs(rnvc) <= EPS_M)
+        && (std::abs(rnmc) <= EPS_M);
 }
 
 void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
@@ -216,16 +312,16 @@ void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
         return;
     }
 
-    const int MAX_PASSES = 8;
+    const int MAX_PASSES = 40;
     const double PEN_TOL = 1e-7;
     const double SLOP = 1e-4;
-    const double STIFFNESS = 0.7;
-    const double STOP_TOTAL_CORRECTION = 1e-4;
+    const double STIFFNESS = 0.85;
+    const double STOP_TOTAL_CORRECTION = 1e-6;
     const double EPS = 1e-12;
 
     double max_rsum = 0.0;
     for (const auto& t : tillers) {
-        max_rsum = std::max(max_rsum, 2.0 * t.getRadius());
+        max_rsum = std::max(max_rsum, 2.0 * t.getEffectiveFootprintRadius());
     }
 
     const double CELL = std::max(3.5, max_rsum);
@@ -270,7 +366,7 @@ void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
                             double dy = tillers[j].getY() - tillers[i].getY();
 
                             double d2 = dx * dx + dy * dy;
-                            double rsum = tillers[i].getRadius() + tillers[j].getRadius();
+                            double rsum = tillers[i].getEffectiveFootprintRadius() + tillers[j].getEffectiveFootprintRadius();
 
                             if (rsum <= 0.0) continue;
                             if (d2 >= rsum * rsum) continue;
@@ -320,6 +416,23 @@ void resolveOverlaps(std::vector<Tiller>& tillers, OverlapStats& stats) {
 
     auto t1 = std::chrono::high_resolution_clock::now();
     stats.ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+static int count_alive_neighbors_at_position(const std::vector<Tiller>& tillers,
+                                             double x,
+                                             double y,
+                                             double R,
+                                             int excluded_tiller_id = -1) {
+    const double R2 = R * R;
+    int count = 0;
+    for (const auto& other : tillers) {
+        if (other.getStatus() != 1) continue;
+        if (other.getTillerId() == excluded_tiller_id) continue;
+        const double dx = x - other.getX();
+        const double dy = y - other.getY();
+        if (dx * dx + dy * dy <= R2) count++;
+    }
+    return count;
 }
 
 static std::vector<int> compute_local_crowding_alive(const std::vector<Tiller>& tillers, double R) {
@@ -498,6 +611,7 @@ static MechanismConfig read_mechanisms(const std::string& combined_ini_path) {
 
 void simulate(const int max_sim_time,
               const int sim_id,
+              const std::uint64_t base_seed,
               const std::string& outdir,
               const std::string& combined_ini_path,
               const std::string& param_file_path,
@@ -508,11 +622,18 @@ void simulate(const int max_sim_time,
     readFromFile(param_file_path, params);
     MechanismConfig cfg = read_mechanisms(combined_ini_path);
 
-    std::uint64_t t = (std::uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
-    std::uint32_t seed = (std::uint32_t)(t ^ (0x9e3779b97f4a7c15ULL + (std::uint64_t)sim_id * 0xBF58476D1CE4E5B9ULL));
-    std::mt19937 gen(seed);
+    const std::uint64_t seed64 = splitmix64(
+        base_seed + static_cast<std::uint64_t>(sim_id)
+    );
+    std::seed_seq seed_words{
+        static_cast<std::uint32_t>(seed64),
+        static_cast<std::uint32_t>(seed64 >> 32),
+        static_cast<std::uint32_t>(sim_id),
+        static_cast<std::uint32_t>(base_seed),
+        static_cast<std::uint32_t>(base_seed >> 32)
+    };
+    std::mt19937 gen(seed_words);
     std::uniform_real_distribution<double> dis(0.0, 1.0);
-    std::normal_distribution<double> growRadiusDist(0.01, 0.0025);
     std::uniform_int_distribution<int> root_num_dis(1, 4);
     std::uniform_real_distribution<double> root_diam_dis(0.2, 1.5);
     std::normal_distribution<double> leafNoise(0.0, 147.74558691423508);
@@ -521,7 +642,7 @@ void simulate(const int max_sim_time,
     std::string summary_dir = outdir + "/summaries";
     std::filesystem::create_directories(summary_dir);
     std::ofstream summary(summary_dir + "/summary_" + std::to_string(sim_id) + ".csv", std::ios::trunc);
-    summary << "sim_id,final_t,final_diameter,alive_y,rmax_y,overflow_t,extinct_t,missing_year,alive_final,LeafArea\n";
+    summary << "sim_id,final_t,final_diameter,alive_y,rmax_y,overflow_t,extinct_t,missing_year,alive_final,LeafArea,attempted_daughters,established_births,cumulative_deaths,cumulative_tillers_created,mean_reproduction_probability,mean_establishment_probability\n";
 
     // Yearly summaries are written in both SUMMARY and FULL mode so that the
     // Python parameterization script can apply time-series biological priors
@@ -529,7 +650,7 @@ void simulate(const int max_sim_time,
     std::string yearly_dir = outdir + "/yearly_summaries";
     std::filesystem::create_directories(yearly_dir);
     std::ofstream yearly(yearly_dir + "/yearly_summary_" + std::to_string(sim_id) + ".csv", std::ios::trunc);
-    yearly << "sim_id,time_step,n_total,n_alive,n_dead,n_newborn,diameter,radius,leaf_area_mean,overflow\n";
+    yearly << "sim_id,time_step,n_total,n_alive,n_dead,attempted_daughters,established_daughters,mean_reproduction_probability,mean_establishment_probability,cumulative_attempted_daughters,cumulative_established_births,cumulative_deaths,cumulative_tillers_created,diameter,radius,leaf_area_mean,overflow\n";
 
     std::ofstream outputFile, simlog;
     std::vector<char> filebuf;
@@ -537,14 +658,31 @@ void simulate(const int max_sim_time,
         outputFile.open(outdir + "/tiller_data_sim_num_" + std::to_string(sim_id) + ".csv", std::ios::trunc);
         filebuf.resize(8 * 1024 * 1024);
         outputFile.rdbuf()->pubsetbuf(filebuf.data(), (std::streamsize)filebuf.size());
-        outputFile << "TimeStep,TillerID,ParentTillerID,Age,Radius,LeafArea,DeadLeafArea,DeadLeafMass,RootNecroVol,RootNecroVolCum,RootNecroMass,RootNecroMassCum,X,Y,Z,NumRoots,RootDiamMM,Status\n";
+        outputFile << "TimeStep,TillerID,ParentTillerID,Age,ReferenceFootprintRadius,EffectiveFootprintRadius,LeafArea,DeadLeafArea,DeadLeafMass,RootNecroVol,RootNecroVolCum,RootNecroMass,RootNecroMassCum,X,Y,Z,NumRoots,RootDiamMM,Status\n";
         std::filesystem::create_directories(outdir + "/sim_logs");
         simlog.open(outdir + "/sim_logs/sim_" + std::to_string(sim_id) + ".log", std::ios::trunc);
-        simlog << "TimeStep\tN_total\tN_alive\tN_dead\tN_newborn\tDiameter\tOverlap_passes\tCandidates\tOverlapped\tZ_adjusts\tMaxPen\tOverlap_ms\n";
+        simlog << "TimeStep\tN_total\tN_alive\tN_dead\tAttemptedDaughters\tEstablishedDaughters\tMeanPRepro\tMeanPEst\tCumulativeAttemptedDaughters\tCumulativeEstablishedBirths\tCumulativeDeaths\tCumulativeTillersCreated\tDiameter\tOverlap_passes\tCandidates\tOverlapped\tZ_adjusts\tMaxPen\tOverlap_ms\n";
     }
 
     int next_tiller_id = 1;
-    Tiller first_tiller(1, 0.1, 0.0, 0.0, 0.0, 3, 1, 50.0f, 0.0f, 0.0f, 0.0f, 1.0f, next_tiller_id++, -1);
+    const double founder_reference_radius =
+        Tiller::sampleReferenceFootprintRadius(gen);
+    Tiller first_tiller(
+        1,
+        founder_reference_radius,
+        0.0,
+        0.0,
+        0.0,
+        3,
+        true,
+        50.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+        1.0f,
+        next_tiller_id++,
+        -1
+    );
     std::vector<Tiller> previous_step;
     previous_step.reserve(1024);
     previous_step.push_back(first_tiller);
@@ -555,6 +693,15 @@ void simulate(const int max_sim_time,
     const double LEAFAREA_MIN = 0.0;
     const double LEAFAREA_MAX = 2500.0;
 
+    long long cumulative_attempted_daughters = 0;
+    long long cumulative_established_births = 0;
+    long long cumulative_deaths = 0;
+    long long cumulative_tillers_created = 1; // includes the founding tiller
+    double cumulative_repro_probability_sum = 0.0;
+    long long cumulative_repro_probability_n = 0;
+    double cumulative_est_probability_sum = 0.0;
+    long long cumulative_est_probability_n = 0;
+
     for (int time_step = 0; time_step <= max_sim_time; ++time_step) {
         final_t = time_step;
         std::vector<int> crowd_prev = compute_local_crowding_alive(previous_step, cfg.crowding_radius_cm);
@@ -563,13 +710,20 @@ void simulate(const int max_sim_time,
         step_data.reserve(previous_step.size() + 256);
         newTillers.reserve(256);
 
+        int attempted_daughters = 0;
+        int established_daughters = 0;
+        int deaths_this_step = 0;
+        double repro_probability_sum = 0.0;
+        int repro_probability_n = 0;
+        double establishment_probability_sum = 0.0;
+        int establishment_probability_n = 0;
+
         for (int idx = 0; idx < static_cast<int>(previous_step.size()); ++idx) {
             Tiller& tiller = previous_step[idx];
             int local_crowding = (idx >= 0 && idx < static_cast<int>(crowd_prev.size())) ? crowd_prev[idx] : 0;
 
             if (tiller.getStatus() == 1) {
-                double current_area = std::max(0.0, (double)tiller.getLeafArea());
-                double prev_area = current_area;
+                double prev_area = std::max(0.0, (double)tiller.getLeafArea());
                 int prev_roots = tiller.getNumRoots();
                 float prev_root_diam_mm = tiller.getRootDiamMM();
 
@@ -585,6 +739,14 @@ void simulate(const int max_sim_time,
                     tiller.accumulateDeadLeafArea((float)prev_area);
                     tiller.accumulateRootNecroFromPrevRoots(prev_roots, prev_root_diam_mm);
 
+                    // Update growth first, then evaluate reproduction from the current year's size.
+                    tiller.mature(1);
+                    double Aclamp = clamp(prev_area, 0.0, 2000.0);
+                    double A_next = leaf_ipm_next_mean(Aclamp, params.leaf_offset) + leafNoise(gen);
+                    if (!std::isfinite(A_next)) A_next = 0.0;
+                    tiller.setLeafArea((float)clamp(A_next, LEAFAREA_MIN, LEAFAREA_MAX));
+                    tiller.setRoots(root_num_dis(gen), (float)root_diam_dis(gen));
+
                     double p_repro = 0.0;
                     if (!DISABLE_REPRO) {
                         p_repro = baseline_reproduction_ipm(tiller);
@@ -594,34 +756,58 @@ void simulate(const int max_sim_time,
                         if (cfg.use_crowding_reproduction) {
                             p_repro = apply_crowding_penalty(p_repro, local_crowding, params.k_crowd_reproduction);
                         }
+                        repro_probability_sum += p_repro;
+                        repro_probability_n++;
                     }
 
-                    if (!DISABLE_REPRO && (dis(gen) < p_repro)) {
-                        Tiller daughter = tiller.makeDaughter(next_tiller_id++);
-                        double p_est = 1.0; //default 100% success rate if not on
+                    if (!DISABLE_REPRO && dis(gen) < p_repro) {
+                        attempted_daughters++;
+                        cumulative_attempted_daughters++;
+
+                        Tiller daughter = tiller.makeDaughter(next_tiller_id++, gen);
+                        cumulative_tillers_created++;
+
+                        double p_est = params.base_establishment;
                         if (cfg.use_spatial_establishment) {
-                            p_est = spatial_establishment_modifier(daughter, params, cfg.spatial_establishment_form);
+                            p_est = apply_blend(p_est,
+                                                spatial_establishment_modifier(daughter, params, cfg.spatial_establishment_form),
+                                                params.c_space_establishment);
                         }
                         if (cfg.use_crowding_establishment) {
-                            p_est = apply_crowding_penalty(p_est, local_crowding, params.k_crowd_establishment);
+                            // Establishment crowding is evaluated at the daughter's coordinates.
+                            // The parent is excluded while the candidate daughter is age 1 or 2.
+                            const int excluded_parent_id =
+                                (daughter.getAge() <= 2) ? daughter.getParentTillerId() : -1;
+                            int daughter_crowding = count_alive_neighbors_at_position(
+                                previous_step,
+                                daughter.getX(),
+                                daughter.getY(),
+                                cfg.crowding_radius_cm,
+                                excluded_parent_id);
+                            daughter_crowding += count_alive_neighbors_at_position(
+                                newTillers,
+                                daughter.getX(),
+                                daughter.getY(),
+                                cfg.crowding_radius_cm,
+                                -1);
+                            p_est = apply_crowding_penalty(p_est, daughter_crowding, params.k_crowd_establishment);
                         }
-                        if (dis(gen) < p_est) newTillers.push_back(daughter);
+
+                        establishment_probability_sum += p_est;
+                        establishment_probability_n++;
+
+                        if (dis(gen) < p_est) {
+                            newTillers.push_back(daughter);
+                            established_daughters++;
+                            cumulative_established_births++;
+                        }
                     }
-
-                    tiller.mature(1);
-                    double Aclamp = clamp(current_area, 0.0, 2000.0);
-                    double A_next = leaf_ipm_next_mean(Aclamp, params.leaf_offset) + leafNoise(gen);
-                    if (!std::isfinite(A_next)) A_next = 0.0;
-                    tiller.setLeafArea((float)clamp(A_next, LEAFAREA_MIN, LEAFAREA_MAX));
-                    tiller.setRoots(root_num_dis(gen), (float)root_diam_dis(gen));
-
-                    double dr_base = growRadiusDist(gen);
-                    if (!std::isfinite(dr_base) || dr_base < 0.0) dr_base = 0.01;
-                    tiller.growRadius(dr_base);
                 } else {
                     tiller.accumulateDeadLeafArea((float)prev_area);
                     tiller.accumulateRootNecroFromPrevRoots(prev_roots, prev_root_diam_mm);
                     tiller.setStatus(0);
+                    deaths_this_step++;
+                    cumulative_deaths++;
                 }
 
                 step_data.push_back(tiller);
@@ -631,6 +817,15 @@ void simulate(const int max_sim_time,
                 if (!should_prune_dead(tiller)) step_data.push_back(tiller);
             }
         }
+
+        const double mean_p_repro =
+            (repro_probability_n > 0) ? repro_probability_sum / (double)repro_probability_n : std::nan("");
+        const double mean_p_est =
+            (establishment_probability_n > 0) ? establishment_probability_sum / (double)establishment_probability_n : std::nan("");
+        cumulative_repro_probability_sum += repro_probability_sum;
+        cumulative_repro_probability_n += repro_probability_n;
+        cumulative_est_probability_sum += establishment_probability_sum;
+        cumulative_est_probability_n += establishment_probability_n;
 
         step_data.insert(step_data.end(), newTillers.begin(), newTillers.end());
 
@@ -648,39 +843,39 @@ void simulate(const int max_sim_time,
         }
 
         step_data.erase(std::remove_if(step_data.begin(), step_data.end(),
-                                       [](const Tiller& t) { return t.getRadius() <= 1e-6; }),
+                                       [](const Tiller& t) { return t.getEffectiveFootprintRadius() <= 1e-6; }),
                         step_data.end());
 
         OverlapStats ostats;
         resolveOverlaps(step_data, ostats);
 
         // Tussock-level yearly summary used by the Python loss function.
-        // Diameter is measured consistently with the final summary as xmax - xmin.
-        double yearly_diam = 0.0;
-        double yearly_radius = 0.0;
+        // Diameter includes living and retained dead tillers, uses each
+        // tiller's effective footprint edges on both axes, and trims the
+        // outermost 2.5% on each side.
+        const double yearly_diam = calculate_robust_tussock_diameter(step_data);
+        const double yearly_radius = 0.5 * yearly_diam;
         double yearly_leaf_sum = 0.0;
         int yearly_leaf_n = 0;
-        if (!step_data.empty()) {
-            double xmin_y = step_data[0].getX();
-            double xmax_y = step_data[0].getX();
-            for (const auto& tt : step_data) {
-                xmin_y = std::min(xmin_y, tt.getX());
-                xmax_y = std::max(xmax_y, tt.getX());
-                if (tt.getStatus() == 1) {
-                    double la = tt.getLeafArea();
-                    if (std::isfinite(la)) {
-                        yearly_leaf_sum += la;
-                        yearly_leaf_n++;
-                    }
+        for (const auto& tt : step_data) {
+            if (tt.getStatus() == 1) {
+                const double la = tt.getLeafArea();
+                if (std::isfinite(la)) {
+                    yearly_leaf_sum += la;
+                    yearly_leaf_n++;
                 }
             }
-            yearly_diam = xmax_y - xmin_y;
-            yearly_radius = 0.5 * yearly_diam;
         }
         double yearly_leaf_mean = (yearly_leaf_n > 0) ? (yearly_leaf_sum / (double)yearly_leaf_n) : std::nan("");
         int overflow_now = (ss.overflow_t >= 0) ? 1 : 0;
         yearly << sim_id << ',' << time_step << ',' << n_total << ',' << n_alive << ',' << n_dead << ','
-               << (int)newTillers.size() << ',' << yearly_diam << ',' << yearly_radius << ',';
+               << attempted_daughters << ',' << established_daughters << ',';
+        if (std::isfinite(mean_p_repro)) yearly << mean_p_repro;
+        yearly << ',';
+        if (std::isfinite(mean_p_est)) yearly << mean_p_est;
+        yearly << ',' << cumulative_attempted_daughters << ',' << cumulative_established_births << ','
+               << cumulative_deaths << ',' << cumulative_tillers_created << ',' << yearly_diam << ','
+               << yearly_radius << ',';
         if (std::isfinite(yearly_leaf_mean)) yearly << yearly_leaf_mean;
         yearly << ',' << overflow_now << "\n";
 
@@ -691,7 +886,7 @@ void simulate(const int max_sim_time,
             int leaf_n = 0;
             for (const auto& tt : step_data) {
                 if (tt.getStatus() == 1) {
-                    rmax = std::max(rmax, tt.getRadius());
+                    rmax = std::max(rmax, tt.getEffectiveFootprintRadius());
                     double la = tt.getLeafArea();
                     if (std::isfinite(la)) {
                         leaf_sum += la;
@@ -704,24 +899,22 @@ void simulate(const int max_sim_time,
         }
 
         if (mode == OutputMode::FULL) {
-            double diam = 0.0;
-            if (!step_data.empty()) {
-                double xmin = step_data[0].getX(), xmax = step_data[0].getX();
-                for (const auto& tt : step_data) {
-                    xmin = std::min(xmin, tt.getX());
-                    xmax = std::max(xmax, tt.getX());
-                }
-                diam = xmax - xmin;
-            }
+            const double diam = calculate_robust_tussock_diameter(step_data);
 
             simlog << time_step << "\t" << n_total << "\t" << n_alive << "\t" << n_dead << "\t"
-                   << (int)newTillers.size() << "\t" << diam << "\t" << ostats.passes << "\t"
-                   << ostats.candidates << "\t" << ostats.overlapped << "\t" << ostats.z_adjusts
-                   << "\t" << ostats.max_penetration << "\t" << ostats.ms << "\n";
+                   << attempted_daughters << "\t" << established_daughters << "\t";
+            if (std::isfinite(mean_p_repro)) simlog << mean_p_repro;
+            simlog << "\t";
+            if (std::isfinite(mean_p_est)) simlog << mean_p_est;
+            simlog << "\t" << cumulative_attempted_daughters << "\t" << cumulative_established_births
+                   << "\t" << cumulative_deaths << "\t" << cumulative_tillers_created << "\t" << diam
+                   << "\t" << ostats.passes << "\t" << ostats.candidates << "\t" << ostats.overlapped
+                   << "\t" << ostats.z_adjusts << "\t" << ostats.max_penetration << "\t" << ostats.ms << "\n";
 
             for (const Tiller& data : step_data) {
                 outputFile << time_step << ',' << data.getTillerId() << ',' << data.getParentTillerId()
-                           << ',' << data.getAge() << ',' << data.getRadius() << ',' << data.getLeafArea()
+                           << ',' << data.getAge() << ',' << data.getReferenceFootprintRadius()
+                           << ',' << data.getEffectiveFootprintRadius() << ',' << data.getLeafArea()
                            << ',' << data.getDeadLeafArea() << ',' << data.getDeadLeafMass() << ','
                            << data.getRootNecroVol() << ',' << data.getRootNecroVolCum() << ','
                            << data.getRootNecroMass() << ',' << data.getRootNecroMassCum() << ','
@@ -740,21 +933,30 @@ void simulate(const int max_sim_time,
     for (const auto& tt : previous_step) alive_final += (tt.getStatus() == 1);
     ss.alive_final = alive_final;
 
-    double final_diam = 0.0;
-    if (!previous_step.empty()) {
-        double xmin = previous_step[0].getX(), xmax = previous_step[0].getX();
-        for (const auto& tt : previous_step) {
-            xmin = std::min(xmin, tt.getX());
-            xmax = std::max(xmax, tt.getX());
-        }
-        final_diam = xmax - xmin;
-    }
+    const double final_diam = calculate_robust_tussock_diameter(previous_step);
     ss.final_diameter = final_diam;
+    ss.cumulative_attempted_daughters = cumulative_attempted_daughters;
+    ss.cumulative_established_births = cumulative_established_births;
+    ss.cumulative_deaths = cumulative_deaths;
+    ss.cumulative_tillers_created = cumulative_tillers_created;
+    ss.mean_reproduction_probability =
+        (cumulative_repro_probability_n > 0)
+            ? cumulative_repro_probability_sum / (double)cumulative_repro_probability_n
+            : std::nan("");
+    ss.mean_establishment_probability =
+        (cumulative_est_probability_n > 0)
+            ? cumulative_est_probability_sum / (double)cumulative_est_probability_n
+            : std::nan("");
 
     summary << ss.sim_id << ',' << ss.final_t << ',' << ss.final_diameter << ',' << ss.alive_y << ','
             << ss.rmax_y << ',' << ss.overflow_t << ',' << ss.extinct_t << ',' << ss.missing_year
             << ',' << ss.alive_final << ',';
     if (std::isfinite(ss.leafarea_mean_y)) summary << ss.leafarea_mean_y;
+    summary << ',' << ss.cumulative_attempted_daughters << ',' << ss.cumulative_established_births
+            << ',' << ss.cumulative_deaths << ',' << ss.cumulative_tillers_created << ',';
+    if (std::isfinite(ss.mean_reproduction_probability)) summary << ss.mean_reproduction_probability;
+    summary << ',';
+    if (std::isfinite(ss.mean_establishment_probability)) summary << ss.mean_establishment_probability;
     summary << "\n";
 }
 
@@ -769,8 +971,6 @@ static std::string get_arg_value(int argc, char** argv, const std::string& name)
 }
 
 int main(int argc, char** argv) {
-    std::srand((unsigned)std::time(nullptr));
-
     std::string config_arg = get_arg_value(argc, argv, "--config");
     if (config_arg.empty()) {
         std::cerr << "Usage: tussock_model --config path/to/config.ini\n";
@@ -778,6 +978,7 @@ int main(int argc, char** argv) {
     }
 
     RuntimeConfig runtime = load_runtime_config(config_arg);
+    const std::uint64_t base_seed = read_base_seed();
 
     if (!std::filesystem::exists(runtime.config_path)) {
         std::cerr << "Config file does not exist: " << runtime.config_path << "\n";
@@ -802,6 +1003,7 @@ int main(int argc, char** argv) {
         threads.emplace_back(simulate,
                              max_sim_time,
                              sim_id,
+                             base_seed,
                              outdir,
                              runtime.config_path.string(),
                              runtime.param_file_path.string(),
